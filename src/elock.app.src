@@ -1,0 +1,16 @@
+{application, elock,
+ [{description, "erlang library for distributed term locks"},
+  {vsn, git},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+  {included_applications,[
+     erpc
+  ]},
+  {licenses, ["MIT"]},
+  {links, []}
+ ]}.

@@ -24,7 +24,7 @@ API
     The process registers itself as '$mylocks', be carefull.
     
     Ok now you are ready for local locks. If you need distributed locks do the same
-    on your other nodes.
+    at your other nodes.
     
     If you need one more heap of lock start add another one to a supervisor. 
     

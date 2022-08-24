@@ -44,7 +44,9 @@ API
     Nodes is where else you want to lock the Term. If the Nodes is [] the Term
     will be locked only locally
 
-    When you need to unlock the Term call Unlock() from returned to you {ok,Unlock}
+    When you need to unlock the Term call Unlock() from returned to you {ok,Unlock}.
+
+    Avoid setting lock on the term you'v already locked, you will get a deadlock.
 
     that's it.
     

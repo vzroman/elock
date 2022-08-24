@@ -10,11 +10,24 @@ API
 
     elock:start_link( SomeUniqueAtom )
     
-    Call it from an OTP supervisor as a permanent worker. The process
-    registers itself as SomeUniqueAtom.
+    Call it from an OTP supervisor as a permanent worker. Example:
+    
+    MyLockServer = #{
+        id=>'$mylocks',
+        start=>{elock,start_link,[ '$mylocks' ]},
+        restart=>permanent,
+        shutdown=> <It's up to you>
+        type=>worker,
+        modules=>[elock]
+    },
+
+    The process
+    registers itself as '$mylocks'.
     
     Ok now you are ready for local locks. If you need distributed locks do the same
     on your other nodes.
+    
+    If you need one more heap of lock start add another one to a supervisor. 
     
     If you want to lock any erlang term call:
     

@@ -21,8 +21,7 @@ API
         modules=>[elock]
     },
 
-    The process
-    registers itself as '$mylocks'.
+    The process registers itself as '$mylocks', be carefull.
     
     Ok now you are ready for local locks. If you need distributed locks do the same
     on your other nodes.
@@ -33,13 +32,13 @@ API
     
     {ok,Unlock} | {error,timeout} =  elock:lock(Locks, Term, IsShared, Nodes, Timeout )
 
-    Locks is your SomeUniqueAtom
+    Locks is your '$mylocks'
     Term is any erlang term
     Timeout is Milliseconds or infinity
     
     Others are more interesting:
 
-    set IsShared = true if it is enough for to be sure that the term is locked may be
+    set IsShared = true if it is enough for you to be sure that the term is locked may be
     even not by you. 
     
     Nodes is where else you want to lock the Term. If the Nodes is [] the Term

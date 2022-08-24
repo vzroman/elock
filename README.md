@@ -1,2 +1,52 @@
 # elock
-erlang library for distributed term locks 
+Erlang library for distributed term locks.
+
+I tried to keep API as simple as possible.
+
+I appreciate any pull requests for bug fixing, tests or extending the functionality.
+
+API
+-----
+
+    elock:start_link( SomeUniqueAtom )
+    
+    Call it from an OTP supervisor as a permanent worker. The process
+    registers itself as SomeUniqueAtom.
+    
+    Ok now you are ready for local locks. If you need distributed locks do the same
+    on your other nodes.
+    
+    If you want to lock any erlang term call:
+    
+    {ok,Unlock} | {error,timeout} =  elock:lock(Locks, Term, IsShared, Nodes, Timeout )
+
+    Locks is your SomeUniqueAtom
+    Term is any erlang term
+    Timeout is Milliseconds or infinity
+    
+    Others are more interesting:
+
+    set IsShared = true if it is enough for to be sure that the term is locked may be
+    even not by you. 
+    
+    Nodes is where else you want to lock the Term. If the Nodes is [] the Term
+    will be locked only locally
+
+    When you need to unlock the Term call Unlock() from returned to you {ok,Unlock}
+
+    that's it.
+    
+    
+    
+BUILD
+-----
+    Add it as a dependency to your application and you are ready (I use rebar3)
+    {deps, [
+        ......
+        {elock, {git, "git@github.com:vzroman/elock.git", {branch, "main"}}}
+    ]}.
+
+TODO
+-----
+    Tests!!!
+    

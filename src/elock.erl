@@ -225,18 +225,18 @@ wait_lock_unlock(#lock{ lock_ref = LockRef}=Lock)->
       unlock(Lock#lock{g_unlock = GlobalUnlock})
   end.
 
-set_global_lock(_Locks, [], _Term, _Timeout )->
+set_global_lock(_Locks, [Node], _Term, _Timeout ) when Node =:= node()->
   % Global lock not required
-  undefined;
+  {ok,undefined};
 set_global_lock(Locks, Nodes, Term, Timeout )->
   % Tell other nodes to set local lock
-  case ecall:call_all(Nodes,?MODULE,lock,[Locks, Term,Timeout,_IsGlobal = false]) of
+  case ecall:call_all(Nodes -- [node()],?MODULE,lock,[Locks, Term,Timeout,_IsGlobal = false]) of
     {ok,Unlocks}->
       ?LOGINFO("~p global lock acquired"),
       {ok, Unlocks};
     {error, none_is_available}->
       % No other nodes
-      undefined;
+      {ok,undefined};
     {error,Timeouts}->
       % The locker answers either {ok, Unlock} or {error, Timeout}
       ?LOGDEBUG("~p global lock timeout ~p",[Term, Timeouts ]),
@@ -248,3 +248,8 @@ global_unlock(undefined)->
 global_unlock(Unlocks)->
   [Unlock() || {_N,Unlock} <- Unlocks],
   ok.
+
+%%  elock:start_link(test).
+%%{ok, Unlock} = elock:lock(test, test1,_IsShared = false, [node()], infinity ).
+%%
+%%spawn(fun()-> {ok, U} = elock:lock(test, test1,_IsShared = false, [node()], infinity ), io:format("locked\r\n") end).

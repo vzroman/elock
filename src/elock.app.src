@@ -9,7 +9,7 @@
   {env,[]},
   {modules, []},
   {included_applications,[
-     erpc
+     ecall
   ]},
   {licenses, ["MIT"]},
   {links, []}

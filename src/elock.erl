@@ -226,7 +226,7 @@ set_global_lock(_Locks, [], _Term, _Timeout )->
   undefined;
 set_global_lock(Locks, Nodes, Term, Timeout )->
   % Tell other nodes to set local lock
-  case erpc:call_all(Nodes,?MODULE,lock,[Locks, Term,Timeout,_IsGlobal = false]) of
+  case ecall:call_all(Nodes,?MODULE,lock,[Locks, Term,Timeout,_IsGlobal = false]) of
     {ok,Unlocks}->
       ?LOGINFO("~p global lock acquired"),
       {ok, Unlocks};

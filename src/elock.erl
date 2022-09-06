@@ -20,10 +20,14 @@
 
 %------------call it from OTP supervisor as a permanent worker------
 start_link( Name )->
-  % Prepare the storage for subscriptions
+  {ok, spawn_link(fun()->init(Name) end)}.
+
+init( Name )->
+
+  % Prepare the storage for locks
   ets:new(Name,[named_table,public,set]),
 
-  ok.
+  timer:sleep(infinity).
 
 %-----------Lock request------------------------------------------
 lock(Locks, Term, IsShared, Nodes, Timeout )->

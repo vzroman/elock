@@ -22,7 +22,7 @@
 start_link( Name )->
   % Prepare the storage for subscriptions
   ets:new(Name,[named_table,public,set]),
-  register(Name, self()),
+
   ok.
 
 %-----------Lock request------------------------------------------

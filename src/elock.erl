@@ -172,7 +172,7 @@ set_lock(Locks, Holder, Term, IsShared)->
 get_lock_ref( Locks, Lock )->
   case ets:lookup( Locks, Lock ) of
     [ { _Lock, LockRef, _Queue } ] when is_reference(LockRef)-> LockRef;
-    []->
+    _->
       % The locker has not registered the lock yet wait
       receive after 5 -> ok end,
       get_lock_ref(Locks, Lock )

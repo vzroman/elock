@@ -6,8 +6,9 @@
 %%=================================================================
 -export([
   start_link/1,
-  lock/5
+  lock/4, lock/5
 ]).
+
 
 -define(LOGERROR(Text),lager:error(Text)).
 -define(LOGERROR(Text,Params),lager:error(Text,Params)).
@@ -30,12 +31,23 @@ init( Name )->
   timer:sleep(infinity).
 
 %-----------Lock request------------------------------------------
-lock(Locks, Term, IsShared, Nodes, Timeout )->
-  Holder = self(),
-  Locker = spawn(fun()->set_lock(Locks, Holder, Term, IsShared, Nodes, Timeout)  end),
+lock(Locks, Term, IsShared, Timeout )->
+  case lock( Locks, Term, IsShared, Timeout, _Holder = self() ) of
+    {ok, {Locker, LockRef}} ->
+      {ok, fun()->Locker ! {unlock, LockRef}, ok  end};
+    Error -> Error
+  end.
+
+lock( Locks, Term, IsShared, Timeout, Holder) when is_pid(Holder)->
+
+  Locker =
+    spawn(fun()->
+      set_lock(Locks, Holder, Term, IsShared)
+    end),
+
   receive
     {locked, LockRef}->
-      {ok, fun()-> Locker ! {unlock, LockRef}  end}
+      {ok, {Locker, LockRef}}
   after
     Timeout->
       Locker ! {timeout, Holder},
@@ -45,10 +57,25 @@ lock(Locks, Term, IsShared, Nodes, Timeout )->
           % No it's too late already
           {error, timeout}
       after
-        10->
+        0->
           % Ok I tried
           {error, timeout}
       end
+  end;
+
+lock(Locks, Term, IsShared, Timeout, [Node] ) when Node=:=node()->
+  lock( Locks, Term, IsShared, Timeout, _Holder = self() );
+
+lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
+  case ecall:call_all(Nodes, ?MODULE, lock, [ Locks, Term, IsShared, Timeout, _Holder=self() ]) of
+    {ok, Results} ->
+      Unlock =
+        fun() ->
+          [Locker ! {unlock, LockRef} || {_N, {Locker, LockRef} } <- Results], ok
+        end,
+      {ok, Unlock};
+    {error,Error}->
+      {error,Error}
   end.
 
 %-------------------------------------------------------------------
@@ -96,9 +123,9 @@ lock(Locks, Term, IsShared, Nodes, Timeout )->
 -define(lock(T),{lock,T}).
 -define(queue(R,Q),{queue,R,Q}).
 
--record(lock,{locks, term, holder, shared, lock_ref, g_unlock, queue}).
+-record(lock,{locks, term, holder, shared, lock_ref, queue}).
 
-set_lock(Locks, Holder, Term, IsShared, Nodes, Timeout)->
+set_lock(Locks, Holder, Term, IsShared)->
 
   Locker = self(),
   % I want to know if you die
@@ -111,30 +138,15 @@ set_lock(Locks, Holder, Term, IsShared, Nodes, Timeout)->
       LockRef = make_ref(),
       ets:update_element(Locks, ?lock(Term), {2,LockRef}),
 
-      case set_global_lock(Locks, Nodes, Term, Timeout ) of % set global lock
-        {ok, GlobalUnlock}->
-          ?LOGDEBUG("~p set global lock: holder ~p, locker ~p",[ Term, Holder, Locker ]),
+      Holder ! {locked, LockRef},
+      wait_unlock(#lock{
+        locks = Locks,
+        term = Term,
+        holder= Holder,
+        lock_ref=LockRef,
+        queue=1
+      });
 
-          Holder ! {locked, LockRef},
-          wait_unlock(#lock{
-            locks = Locks,
-            term = Term,
-            holder= Holder,
-            lock_ref=LockRef,
-            g_unlock =GlobalUnlock,
-            queue=1
-          });
-        timeout->
-          % Global timeout means that my holder is not waiting either
-          unlock(#lock{
-            locks = Locks,
-            term = Term,
-            holder= Holder,
-            lock_ref=LockRef,
-            g_unlock=undefined,
-            queue=1
-          })
-      end;
     MyQueue-> %------------queued-------------------
 
       LockRef = get_lock_ref(Locks,?lock(Term)),
@@ -153,7 +165,6 @@ set_lock(Locks, Holder, Term, IsShared, Nodes, Timeout)->
         term = Term,
         holder= Holder,
         lock_ref=LockRef,
-        g_unlock=undefined,
         queue= MyQueue
       })
   end.
@@ -183,18 +194,18 @@ wait_unlock(#lock{term = Term, lock_ref = LockRef, holder = Holder }=Lock)->
   end.
 
 %-----------------UNLOCK-----------------------
-unlock(#lock{locks = Locks,term = Term, lock_ref = LockRef, g_unlock = GlobalUnlock, queue = MyQueue})->
+unlock(#lock{locks = Locks,term = Term, lock_ref = LockRef, queue = MyQueue})->
   % try unlock
   ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
   % check unlocked
   case ets:lookup(Locks, ?lock(Term)) of
     []->  % unlocked, nobody is waiting
       ?LOGDEBUG("~p unlocked"),
-      global_unlock(GlobalUnlock);
+      ok;
     [_]-> % not unlocked there is a queue
           % who is the next, he must be there, iterate until
       NextLocker = get_next_locker(Locks,LockRef,MyQueue+1),
-      NextLocker ! {take_it, LockRef, GlobalUnlock}
+      NextLocker ! {take_it, LockRef}
   end.
 
 get_next_locker(Locks, LockRef, Queue )->
@@ -209,9 +220,9 @@ get_next_locker(Locks, LockRef, Queue )->
 %-----------------WAIT LOCK-----------------------
 wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term}=Lock)->
   receive
-    {take_it, LockRef, GlobalUnlock}->
+    {take_it, LockRef}->
       Holder ! {locked, LockRef},
-      wait_unlock(Lock#lock{g_unlock = GlobalUnlock});
+      wait_unlock(Lock);
     {timeout, Holder}->
       % Holder is not waiting anymore, but I can't brake the queue
       wait_lock_unlock( Lock);
@@ -221,35 +232,10 @@ wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term}=Lock)->
   end.
 wait_lock_unlock(#lock{ lock_ref = LockRef}=Lock)->
   receive
-    {take_it, LockRef, GlobalUnlock}->
-      unlock(Lock#lock{g_unlock = GlobalUnlock})
+    {take_it, LockRef}-> unlock(Lock)
   end.
-
-set_global_lock(_Locks, [Node], _Term, _Timeout ) when Node =:= node()->
-  % Global lock not required
-  {ok,undefined};
-set_global_lock(Locks, Nodes, Term, Timeout )->
-  % Tell other nodes to set local lock
-  case ecall:call_all(Nodes -- [node()],?MODULE,lock,[Locks, Term,Timeout,_IsGlobal = false]) of
-    {ok,Unlocks}->
-      ?LOGINFO("~p global lock acquired"),
-      {ok, Unlocks};
-    {error, none_is_available}->
-      % No other nodes
-      {ok,undefined};
-    {error,Timeouts}->
-      % The locker answers either {ok, Unlock} or {error, Timeout}
-      ?LOGDEBUG("~p global lock timeout ~p",[Term, Timeouts ]),
-      timeout
-  end.
-
-global_unlock(undefined)->
-  ok;
-global_unlock(Unlocks)->
-  [Unlock() || {_N,Unlock} <- Unlocks],
-  ok.
 
 %%  elock:start_link(test).
-%%{ok, Unlock} = elock:lock(test, test1,_IsShared = false, [node()], infinity ).
+%%{ok, Unlock} = elock:lock(test, test1,_IsShared = false, infinity ).
 %%
-%%spawn(fun()-> {ok, U} = elock:lock(test, test1,_IsShared = false, [node()], infinity ), io:format("locked\r\n") end).
+%%spawn(fun()-> {ok, U} = elock:lock(test, test1,_IsShared = false, infinity ), io:format("locked\r\n") end).

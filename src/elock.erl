@@ -64,7 +64,12 @@ lock( Locks, Term, IsShared, Timeout, Holder) when is_pid(Holder)->
   end;
 
 lock(Locks, Term, IsShared, Timeout, [Node] ) when Node=:=node()->
-  lock( Locks, Term, IsShared, Timeout, _Holder = self() );
+  case lock( Locks, Term, IsShared, Timeout, _Holder = self() ) of
+    {ok,{Locker,LockRef}}->
+      {ok,fun()-> Locker ! {unlock, LockRef} end};
+    Error->
+      Error
+  end;
 
 lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
   case ecall:call_all(Nodes, ?MODULE, lock, [ Locks, Term, IsShared, Timeout, _Holder=self() ]) of

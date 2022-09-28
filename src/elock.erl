@@ -9,7 +9,6 @@
   lock/4, lock/5
 ]).
 
-
 -define(LOGERROR(Text),lager:error(Text)).
 -define(LOGERROR(Text,Params),lager:error(Text,Params)).
 -define(LOGWARNING(Text),lager:warning(Text)).
@@ -18,6 +17,8 @@
 -define(LOGINFO(Text,Params),lager:info(Text,Params)).
 -define(LOGDEBUG(Text),lager:debug(Text)).
 -define(LOGDEBUG(Text,Params),lager:debug(Text,Params)).
+
+-define(graph(Locks),list_to_atom(atom_to_list(Locks)++"_$graph$")).
 
 %------------call it from OTP supervisor as a permanent worker------
 start_link( Name )->
@@ -28,45 +29,22 @@ init( Name )->
   % Prepare the storage for locks
   ets:new(Name,[named_table,public,set]),
 
+  ets:new(?graph(Name),[named_table,public,bag]),
+
   timer:sleep(infinity).
 
 %-----------Lock request------------------------------------------
 lock(Locks, Term, IsShared, Timeout )->
   case lock( Locks, Term, IsShared, Timeout, _Holder = self() ) of
     {ok, {Locker, LockRef}} ->
-      {ok, fun()->Locker ! {unlock, LockRef}, ok  end};
+      {ok, fun()-> catch Locker ! {unlock, LockRef}, ok  end};
     Error -> Error
   end.
-
-lock( Locks, Term, IsShared, Timeout, Holder) when is_pid(Holder)->
-
-  Locker =
-    spawn(fun()->
-      set_lock(Locks, Holder, Term, IsShared)
-    end),
-
-  receive
-    {locked, LockRef}->
-      {ok, {Locker, LockRef}}
-  after
-    Timeout->
-      Locker ! {timeout, Holder},
-      % Drop tail lock
-      receive
-        {locked, _LockRef}->
-          % No it's too late already
-          {error, timeout}
-      after
-        0->
-          % Ok I tried
-          {error, timeout}
-      end
-  end;
 
 lock(Locks, Term, IsShared, Timeout, [Node] ) when Node=:=node()->
   case lock( Locks, Term, IsShared, Timeout, _Holder = self() ) of
     {ok,{Locker,LockRef}}->
-      {ok,fun()-> Locker ! {unlock, LockRef} end};
+      {ok,fun()-> catch Locker ! {unlock, LockRef} end};
     Error->
       Error
   end;
@@ -76,11 +54,37 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
     {ok, Results} ->
       Unlock =
         fun() ->
-          [Locker ! {unlock, LockRef} || {_N, {Locker, LockRef} } <- Results], ok
+          [catch Locker ! {unlock, LockRef} || {_N, {Locker, LockRef} } <- Results], ok
         end,
       {ok, Unlock};
     {error,Error}->
       {error,Error}
+  end;
+
+lock( Locks, Term, IsShared, Timeout, Holder) when is_pid(Holder)->
+
+  Locker =
+    spawn(fun()->
+      set_lock(Locks, Holder, Term, IsShared)
+    end),
+
+  receive
+    {locked, Locker, LockRef}->
+      {ok, {Locker, LockRef}};
+    {deadlock, Locker}->
+      {error, deadlock}
+  after
+    Timeout->
+      Locker ! {timeout, Holder},
+      % Drop tail lock
+      receive
+        {locked, Locker, _LockRef}->ok;
+        {deadlock,Locker}->ok
+      after
+        0-> ok
+      end,
+      % Ok I tried
+      {error, timeout}
   end.
 
 %-------------------------------------------------------------------
@@ -95,7 +99,7 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
 %     I locked:
 %       LockRef = make_ref()
 %       ets:update_element(?LOCKS, {lock,Term}, {2,LockRef})
-%       Holder ! {locked,LockRef}
+%       Holder ! {locked, self(), LockRef}
 %       go to wait unlock
 %--------------------Not locked---------------------------
 %  MyQueue -> queued, wait
@@ -117,7 +121,7 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
 %         NextLocker ! {take_it, LockRef, GlobalUnlock}
 %-------------------Wait lock--------------------------------
 % receive {take_it, LockRef, GlobalLock}
-%   Holder ! {locked, LockRef}
+%   Holder ! {locked, self(), LockRef}
 %   go to wait unlock
 %-------------------Wait unlock-------------------------
 % receive {unlock,LockRef} or {'DOWN', _Ref, process, Holder, Reason}
@@ -128,10 +132,25 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
 -define(lock(T),{lock,T}).
 -define(queue(R,Q),{queue,R,Q}).
 
--record(lock,{locks, term, holder, shared, lock_ref, queue}).
+-define(holder(H),{holder,H}).
+-define(wait(T),{wait,T}).
+
+-record(lock,{locks, term, holder, shared, lock_ref, queue, held}).
 
 set_lock(Locks, Holder, Term, IsShared)->
 
+  HeldLocks =
+    [ T || {_,T} <- ets:lookup(?graph(Locks),?holder(Holder))],
+  case lists:member(Term,HeldLocks) of
+    true->
+      LockRef = make_ref(),
+      Holder ! {locked, self(), LockRef },
+      already_locked_i_can_die;
+    _->
+      do_lock(Locks, Holder, Term, IsShared, HeldLocks)
+  end.
+
+do_lock(Locks, Holder, Term, IsShared, HeldLocks)->
   Locker = self(),
   % I want to know if you die
   erlang:monitor(process, Holder),
@@ -144,14 +163,15 @@ set_lock(Locks, Holder, Term, IsShared)->
       ets:insert(Locks,{?queue(LockRef,_MyQueue=1), Locker}),
       ets:update_element(Locks, ?lock(Term), {2,LockRef}),
 
-      Holder ! {locked, LockRef},
+      Holder ! {locked, Locker, LockRef},
       wait_unlock(#lock{
         locks = Locks,
         term = Term,
         holder= Holder,
         lock_ref=LockRef,
         shared = IsShared,
-        queue=1
+        queue=1,
+        held = []
       });
 
     MyQueue-> %------------queued-------------------
@@ -165,7 +185,8 @@ set_lock(Locks, Holder, Term, IsShared)->
         holder= Holder,
         lock_ref=LockRef,
         shared = IsShared,
-        queue= MyQueue
+        queue= MyQueue,
+        held = HeldLocks
       },
 
       ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, queue ~p",[Term, Holder, Locker, MyQueue]),
@@ -176,7 +197,7 @@ set_lock(Locks, Holder, Term, IsShared)->
             queued ->
               wait_lock( Lock );
             locked->
-              Holder ! {locked, LockRef},
+              Holder ! {locked, Locker, LockRef},
               wait_unlock( Lock )
           end;
         true ->
@@ -212,9 +233,19 @@ request_share(Locks, LockRef, Queue )->
   end.
 
 %-----------------WAIT UNLOCK-----------------------
-wait_unlock(#lock{term = Term, lock_ref = LockRef, holder = Holder, shared = IsShared }=Lock)->
+wait_unlock(#lock{
+  locks = Locks,
+  term = Term,
+  lock_ref = LockRef,
+  holder = Holder,
+  shared = IsShared
+}=Lock)->
+
   Locker = self(),
-  receive
+  Graph = ?graph(Locks),
+  ets:insert(Graph,{?holder(Holder),Term}),
+
+  try receive
     {unlock, LockRef}->
       ?LOGDEBUG("~p try unlock, holder ~p, locker ~p",[ Term, Holder, Locker ]),
       unlock(Lock);
@@ -227,12 +258,17 @@ wait_unlock(#lock{term = Term, lock_ref = LockRef, holder = Holder, shared = IsS
     {'DOWN', _Ref, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p down, reason ~p locker ~p unlock",[ Term, Holder, Reason, Locker ]),
       unlock(Lock)
+  end after
+    ets:delete_object(Graph,{?holder(Holder),Term})
   end.
 
 %-----------------UNLOCK-----------------------
 unlock(#lock{locks = Locks,term = Term, lock_ref = LockRef, queue = MyQueue})->
-  % try unlock
+
+  % Delete my queue
   ets:delete(Locks,?queue(LockRef,MyQueue)),
+
+  % try unlock
   ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
   % check unlocked
   case ets:lookup(Locks, ?lock(Term)) of
@@ -255,13 +291,32 @@ get_next_locker(Locks, LockRef, Queue )->
   end.
 
 %-----------------WAIT LOCK-----------------------
-wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term,shared = IsShared}=Lock)->
-  receive
+wait_lock(#lock{
+  locks = Locks,
+  lock_ref = LockRef,
+  holder = Holder,
+  term = Term,
+  shared = IsShared,
+  held = HeldLocks
+}=Lock)->
+
+  Graph = ?graph(Locks),
+
+  ets:insert(Graph,[{?wait(Term),T} || T <- HeldLocks]),
+
+  DeadChecker = spawn_link(fun()->
+    check_deadlock(Graph, Term, HeldLocks, Holder)
+  end),
+
+  try receive
     {take_it, LockRef}->
-      Holder ! {locked, LockRef},
+      Holder ! {locked, self(), LockRef},
       wait_unlock(Lock);
     {take_share,LockRef} when IsShared->
-      Holder ! {locked, LockRef},
+      Holder ! {locked, self(), LockRef},
+      wait_lock_unlock(Lock);
+    {deadlock,DeadChecker}->
+      Holder ! {deadlock, self()},
       wait_lock_unlock(Lock);
     {timeout, Holder}->
       % Holder is not waiting anymore, but I can't brake the queue
@@ -269,7 +324,10 @@ wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term,shared = IsShar
     {'DOWN', _, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
       wait_lock_unlock(Lock)
+  end after
+    [ets:delete_object(Graph,{?wait(Term),T}) || T <- HeldLocks]
   end.
+
 wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
   receive
     {take_it, LockRef}->
@@ -278,6 +336,10 @@ wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
       NextLocker ! {take_share,LockRef},
       wait_lock_unlock( Lock )
   end.
+
+check_deadlock(Graph, Term, HeldLocks, Holder)->
+  todo.
+
 
 %%  elock:start_link(test).
 %%{ok, Unlock} = elock:lock(test, test1,_IsShared = false, infinity ).

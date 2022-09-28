@@ -141,6 +141,7 @@ set_lock(Locks, Holder, Term, IsShared)->
       ?LOGDEBUG("~p set local lock: holder ~p, locker ~p",[ Term, Holder, Locker ]),
 
       LockRef = make_ref(),
+      ets:insert(Locks,{?queue(LockRef,_MyQueue=1), Locker}),
       ets:update_element(Locks, ?lock(Term), {2,LockRef}),
 
       Holder ! {locked, LockRef},
@@ -149,6 +150,7 @@ set_lock(Locks, Holder, Term, IsShared)->
         term = Term,
         holder= Holder,
         lock_ref=LockRef,
+        shared = IsShared,
         queue=1
       });
 
@@ -156,22 +158,31 @@ set_lock(Locks, Holder, Term, IsShared)->
 
       LockRef = get_lock_ref(Locks,?lock(Term)),
       ets:insert(Locks,{?queue(LockRef,MyQueue), Locker}),
-      if
-        IsShared ->
-          % Shared locks, the holder can be sure that it's locked
-          Holder ! {locked, LockRef};
-        true ->
-          % Need exclusive?
-          wait
-      end,
-      ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, queue ~p",[Term, Holder, Locker, MyQueue]),
-      wait_lock(#lock{
+
+      Lock = #lock{
         locks = Locks,
         term = Term,
         holder= Holder,
         lock_ref=LockRef,
+        shared = IsShared,
         queue= MyQueue
-      })
+      },
+
+      ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, queue ~p",[Term, Holder, Locker, MyQueue]),
+
+      if
+        IsShared ->
+          case request_share(Locks, LockRef, MyQueue-1 ) of
+            queued ->
+              wait_lock( Lock );
+            locked->
+              Holder ! {locked, LockRef},
+              wait_unlock( Lock )
+          end;
+        true ->
+          % Need exclusive?
+          wait_lock( Lock )
+      end
   end.
 
 get_lock_ref( Locks, Lock )->
@@ -183,13 +194,33 @@ get_lock_ref( Locks, Lock )->
       get_lock_ref(Locks, Lock )
   end.
 
+request_share(Locks, LockRef, Queue )->
+  case ets:lookup(Locks,?queue(LockRef,Queue)) of
+    [{_, Locker}]->
+      Locker ! {wait_share, LockRef, self()},
+      queued;
+    _->
+      % The locker either not registered yet or already deleted it's queue
+      receive
+        {take_it, LockRef}->
+          % The locker removed it's queue. The lock is mine
+          locked
+      after
+        5->
+          request_share( Locks, LockRef, Queue )
+      end
+  end.
+
 %-----------------WAIT UNLOCK-----------------------
-wait_unlock(#lock{term = Term, lock_ref = LockRef, holder = Holder }=Lock)->
+wait_unlock(#lock{term = Term, lock_ref = LockRef, holder = Holder, shared = IsShared }=Lock)->
   Locker = self(),
   receive
     {unlock, LockRef}->
       ?LOGDEBUG("~p try unlock, holder ~p, locker ~p",[ Term, Holder, Locker ]),
       unlock(Lock);
+    {wait_share, LockRef, NextLocker} when IsShared->
+      NextLocker ! {take_share,LockRef},
+      wait_unlock( Lock );
     {timeout, Holder}->
       ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
       unlock(Lock);
@@ -201,6 +232,7 @@ wait_unlock(#lock{term = Term, lock_ref = LockRef, holder = Holder }=Lock)->
 %-----------------UNLOCK-----------------------
 unlock(#lock{locks = Locks,term = Term, lock_ref = LockRef, queue = MyQueue})->
   % try unlock
+  ets:delete(Locks,?queue(LockRef,MyQueue)),
   ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
   % check unlocked
   case ets:lookup(Locks, ?lock(Term)) of
@@ -214,7 +246,7 @@ unlock(#lock{locks = Locks,term = Term, lock_ref = LockRef, queue = MyQueue})->
   end.
 
 get_next_locker(Locks, LockRef, Queue )->
-  case ets:take(Locks,?queue(LockRef,Queue)) of
+  case ets:lookup(Locks,?queue(LockRef,Queue)) of
     [{_,NextLocker}]->
       NextLocker;
     []-> % He is not registered himself yet, wait
@@ -223,11 +255,14 @@ get_next_locker(Locks, LockRef, Queue )->
   end.
 
 %-----------------WAIT LOCK-----------------------
-wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term}=Lock)->
+wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term,shared = IsShared}=Lock)->
   receive
     {take_it, LockRef}->
       Holder ! {locked, LockRef},
       wait_unlock(Lock);
+    {take_share,LockRef} when IsShared->
+      Holder ! {locked, LockRef},
+      wait_lock_unlock(Lock);
     {timeout, Holder}->
       % Holder is not waiting anymore, but I can't brake the queue
       wait_lock_unlock( Lock);
@@ -235,9 +270,13 @@ wait_lock(#lock{lock_ref = LockRef, holder = Holder, term = Term}=Lock)->
       ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
       wait_lock_unlock(Lock)
   end.
-wait_lock_unlock(#lock{ lock_ref = LockRef}=Lock)->
+wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
   receive
-    {take_it, LockRef}-> unlock(Lock)
+    {take_it, LockRef}->
+      unlock(Lock);
+    {wait_share, LockRef, NextLocker} when IsShared->
+      NextLocker ! {take_share,LockRef},
+      wait_lock_unlock( Lock )
   end.
 
 %%  elock:start_link(test).

@@ -142,7 +142,7 @@ do_lock( Locks, Term, IsShared, Timeout, Holder, Nodes) when is_pid(Holder)->
 -define(holder(H),{holder,H}).
 -define(wait(T),{wait,T}).
 
--record(lock,{locks, term, holder, shared, lock_ref, queue, held}).
+-record(lock,{locks, term, holder, shared, lock_ref, queue, held, nodes}).
 
 set_lock(Locks, Holder, Term, IsShared, Nodes)->
 
@@ -157,14 +157,11 @@ set_lock(Locks, Holder, Term, IsShared, Nodes)->
 
       process_flag(trap_exit,true),
 
-      % Cross nodes term deadlocks
-      CrossNodesLock = [{Term,N} || N <- Nodes--[node()]],
-
-      do_set_lock(Locks, Holder, Term, IsShared, HeldLocks++CrossNodesLock)
+      do_set_lock(Locks, Holder, Term, IsShared, HeldLocks, Nodes--[node()])
 
   end.
 
-do_set_lock(Locks, Holder, Term, IsShared, HeldLocks)->
+do_set_lock(Locks, Holder, Term, IsShared, HeldLocks, Nodes)->
   Locker = self(),
 
   % I want to know if you die
@@ -178,7 +175,6 @@ do_set_lock(Locks, Holder, Term, IsShared, HeldLocks)->
       ets:insert(Locks,{?queue(LockRef,_MyQueue=1), Locker}),
       ets:update_element(Locks, ?lock(Term), {2,LockRef}),
 
-      Holder ! {locked, Locker, LockRef},
       wait_unlock(#lock{
         locks = Locks,
         term = Term,
@@ -186,7 +182,8 @@ do_set_lock(Locks, Holder, Term, IsShared, HeldLocks)->
         lock_ref=LockRef,
         shared = IsShared,
         queue=1,
-        held = []
+        held = [],
+        nodes = Nodes
       });
 
     MyQueue-> %------------queued-------------------
@@ -201,24 +198,27 @@ do_set_lock(Locks, Holder, Term, IsShared, HeldLocks)->
         lock_ref=LockRef,
         shared = IsShared,
         queue= MyQueue,
-        held = HeldLocks
+        held = HeldLocks,
+        nodes = Nodes
       },
 
       ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, queue ~p",[Term, Holder, Locker, MyQueue]),
 
-      if
-        IsShared ->
-          case request_share(Locks, LockRef, MyQueue-1 ) of
-            queued ->
-              wait_lock( Lock );
-            locked->
-              Holder ! {locked, Locker, LockRef},
-              wait_unlock( Lock )
-          end;
-        true ->
-          % Need exclusive?
-          wait_lock( Lock )
-      end
+      NextState =
+        if
+          IsShared ->
+            case request_share(Locks, LockRef, MyQueue-1 ) of
+              queued ->
+                fun wait_lock/1;
+              locked->
+                Holder ! {locked, Locker, LockRef},
+                fun wait_unlock/1
+            end;
+          true ->
+            % Need exclusive?
+            fun wait_lock/1
+        end,
+      NextState( Lock )
   end.
 
 get_lock_ref( Locks, Lock )->
@@ -253,28 +253,52 @@ wait_unlock(#lock{
   term = Term,
   lock_ref = LockRef,
   holder = Holder,
-  shared = IsShared
+  shared = IsShared,
+  nodes = Nodes,
+  held = HeldLocks
 }=Lock)->
 
   Locker = self(),
-  Graph = ?graph(Locks),
-  ets:insert(Graph,{?holder(Holder),Term}),
 
-  try receive
+  Graph = ?graph(Locks),
+  ets:insert(Graph,{?holder(Holder),Term,IsShared}),
+
+  % Locked
+  Holder ! {locked, Locker, LockRef},
+
+  % Init cross nodes deadlock check process
+  DeadLock = check_deadlock(Graph, [{Term,N} || N <- Nodes], [Term|HeldLocks]),
+
+  NextState = wait_unlock(DeadLock, Lock),
+
+  catch exit(DeadLock,shutdown),
+  catch ets:delete_object(Graph,{?holder(Holder),Term,IsShared}),
+
+  NextState( Lock ).
+
+wait_unlock( DeadLock, #lock{
+  term = Term,
+  lock_ref = LockRef,
+  holder = Holder,
+  shared = IsShared
+}=Lock )->
+  Locker = self(),
+  receive
     {unlock, LockRef}->
       ?LOGDEBUG("~p try unlock, holder ~p, locker ~p",[ Term, Holder, Locker ]),
-      unlock(Lock);
+      fun unlock/1;
     {wait_share, LockRef, NextLocker} when IsShared->
       NextLocker ! {take_share,LockRef},
-      wait_unlock( Lock );
+      wait_unlock(DeadLock, Lock);
+    {'EXIT',DeadLock,deadlock}->
+      Holder ! {deadlock, self()},
+      fun unlock/1;
     {timeout, Holder}->
       ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
-      unlock(Lock);
+      fun unlock/1;
     {'DOWN', _Ref, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p down, reason ~p locker ~p unlock",[ Term, Holder, Reason, Locker ]),
-      unlock(Lock)
-  end after
-    ets:delete_object(Graph,{?holder(Holder),Term})
+      fun unlock/1
   end.
 
 %-----------------UNLOCK-----------------------
@@ -308,36 +332,122 @@ get_next_locker(Locks, LockRef, Queue )->
 %-----------------WAIT LOCK-----------------------
 wait_lock(#lock{
   locks = Locks,
+  term = Term,
+  held = HeldLocks,
+  nodes = Nodes
+}=Lock)->
+
+  % Init deadlock check process
+  DeadLock = check_deadlock(?graph(Locks), [Term], HeldLocks++[{Term,N} || N <- Nodes]),
+
+  NextState= wait_lock(DeadLock, Lock),
+
+  catch exit(DeadLock,shutdown),
+
+  NextState( Lock ).
+
+wait_lock(DeadLock, #lock{
   lock_ref = LockRef,
   holder = Holder,
   term = Term,
-  shared = IsShared,
-  held = HeldLocks
-}=Lock)->
-
-
-  % Init deadlock check process
-  DeadLock = check_deadlock(?graph(Locks), Term, HeldLocks),
-
+  shared = IsShared
+})->
   receive
     {take_it, LockRef}->
-      Holder ! {locked, self(), LockRef},
-      wait_unlock(Lock);
+      fun wait_unlock/1;
     {take_share,LockRef} when IsShared->
-      Holder ! {locked, self(), LockRef},
-      wait_lock_unlock(Lock);
-   {'EXIT',DeadLock,deadlock}->
+      fun shared_lock/1;
+    {'EXIT',DeadLock,deadlock}->
       Holder ! {deadlock, self()},
-      wait_lock_unlock(Lock);
+      fun wait_lock_unlock/1;
     {timeout, Holder}->
       % Holder is not waiting anymore, but I can't brake the queue
-      wait_lock_unlock( Lock);
+      fun wait_lock_unlock/1;
     {'DOWN', _, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
-      wait_lock_unlock(Lock)
+      fun wait_lock_unlock/1
   end.
 
-wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
+%-----------------SHARED LOCK-----------------------
+shared_lock(#lock{
+  locks = Locks,
+  lock_ref = LockRef,
+  term = Term,
+  holder = Holder,
+  shared = IsShared,
+  nodes = Nodes,
+  held = HeldLocks
+} = Lock)->
+
+  Graph = ?graph(Locks),
+  ets:insert(Graph,{?holder(Holder),Term,IsShared}),
+
+  Holder ! {locked, self(), LockRef},
+
+  % Init cross nodes deadlock check process
+  DeadLock = check_deadlock(Graph, [{Term,N} || N <- Nodes], [Term|HeldLocks]),
+
+  NextState = wait_shared_lock(DeadLock, Lock),
+
+  catch ets:delete_object(Graph,{?holder(Holder),Term,IsShared}),
+  catch exit(DeadLock,shutdown),
+
+  NextState( Lock ).
+
+wait_shared_lock(DeadLock, #lock{
+  term = Term,
+  lock_ref = LockRef,
+  holder = Holder
+}=Lock)->
+
+  Locker = self(),
+  receive
+    {unlock, LockRef}->
+      ?LOGDEBUG("~p try unlock, holder ~p, locker ~p",[ Term, Holder, Locker ]),
+      fun wait_lock_unlock/1;
+    {take_it, LockRef}->
+      wait_shared_unlock( Lock );
+    {wait_share, LockRef, NextLocker}->
+      NextLocker ! {take_share,LockRef},
+      wait_shared_lock(DeadLock, Lock );
+    {'EXIT',DeadLock,deadlock}->
+      Holder ! {deadlock, self()},
+      fun wait_lock_unlock/1;
+    {timeout, Holder}->
+      ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
+      fun wait_lock_unlock/1;
+    {'DOWN', _Ref, process, Holder, Reason}->
+      ?LOGDEBUG("~p holder ~p down, reason ~p locker ~p unlock",[ Term, Holder, Reason, Locker ]),
+      fun wait_lock_unlock/1
+  end.
+
+wait_shared_unlock( #lock{
+  term = Term,
+  lock_ref = LockRef,
+  holder = Holder
+} = Lock)->
+  Locker = self(),
+  receive
+    {unlock, LockRef}->
+      ?LOGDEBUG("~p try unlock, holder ~p, locker ~p",[ Term, Holder, Locker ]),
+      fun unlock/1;
+    {wait_share, LockRef, NextLocker}->
+      NextLocker ! {take_share,LockRef},
+      wait_shared_unlock( Lock );
+    {timeout, Holder}->
+      ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
+      fun unlock/1;
+    {'DOWN', _Ref, process, Holder, Reason}->
+      ?LOGDEBUG("~p holder ~p down, reason ~p locker ~p unlock",[ Term, Holder, Reason, Locker ]),
+      fun unlock/1
+  end.
+
+
+%-----------------Keep queue------------------------------------------
+wait_lock_unlock(#lock{
+  lock_ref = LockRef,
+  shared = IsShared
+}=Lock)->
   receive
     {take_it, LockRef}->
       unlock(Lock);
@@ -346,26 +456,29 @@ wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
       wait_lock_unlock( Lock )
   end.
 
-check_deadlock(_Graph, _WaitTerm, [])->
+%-----------------------------------------------------------------------
+% Deadlocks detection
+%-----------------------------------------------------------------------
+check_deadlock(_Graph, WaitTerms, HeldLocks) when WaitTerms=:=[]; HeldLocks=:=[] ->
   can_not_have_deadlocks;
-check_deadlock(Graph, WaitTerm, HeldLocks)->
+check_deadlock(Graph, WaitTerms, HeldLocks)->
   spawn_link(fun()->
     process_flag(trap_exit,true),
 
     Checker = self(),
-    ets:insert(Graph,[{?wait(WaitTerm),T, Checker} || T <- HeldLocks]),
+    [ ets:insert(Graph,[{?wait(Wait),Held, Checker} || Held <- HeldLocks]) || Wait <- WaitTerms ],
 
-    try check_deadlock_loop( Graph, WaitTerm, HeldLocks )
+    try check_deadlock_loop( Graph, WaitTerms, HeldLocks )
     after
-      [ets:delete_object(Graph,{?wait(WaitTerm),T,Checker}) || T <- HeldLocks]
+      [ [ catch ets:delete_object(Graph,{?wait(Wait),Held,Checker}) || Held <- HeldLocks] || Wait <- WaitTerms ]
     end
   end).
 
-check_deadlock_loop( Graph, WaitTerm, HeldLocks )->
+check_deadlock_loop( Graph, WaitTerms, HeldLocks )->
 
-  find_deadlocks(HeldLocks, Graph, WaitTerm, fun( Checker )->
+  [find_deadlocks(HeldLocks, Graph, WaitTerm, fun( Checker )->
     catch Checker ! {compare_locks, self() ,HeldLocks}
-  end),
+  end) || WaitTerm <- WaitTerms ],
 
   receive
     {'EXIT',_,_} ->
@@ -375,12 +488,12 @@ check_deadlock_loop( Graph, WaitTerm, HeldLocks )->
         length( Locks ) > length( HeldLocks ); Locks > HeldLocks->
           exit( deadlock );
         true->
-          From ! { yield }
+          catch From ! { yield }
       end;
     { yield }->
       exit( deadlock )
   after 10->
-    check_deadlock_loop( Graph, WaitTerm, HeldLocks )
+    check_deadlock_loop( Graph, WaitTerms, HeldLocks )
   end.
 
 find_deadlocks([Term|Rest], Graph, WaitTerm, CheckFun )->

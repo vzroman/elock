@@ -152,6 +152,9 @@ set_lock(Locks, Holder, Term, IsShared)->
 
 do_lock(Locks, Holder, Term, IsShared, HeldLocks)->
   Locker = self(),
+
+  process_flag(trap_exit,true),
+
   % I want to know if you die
   erlang:monitor(process, Holder),
 
@@ -300,22 +303,18 @@ wait_lock(#lock{
   held = HeldLocks
 }=Lock)->
 
-  Graph = ?graph(Locks),
 
-  ets:insert(Graph,[{?wait(Term),T} || T <- HeldLocks]),
+  % Init deadlock check process
+  DeadLock = check_deadlock(?graph(Locks), Term, HeldLocks),
 
-  DeadChecker = spawn_link(fun()->
-    check_deadlock(Graph, Term, HeldLocks, Holder)
-  end),
-
-  try receive
+  receive
     {take_it, LockRef}->
       Holder ! {locked, self(), LockRef},
       wait_unlock(Lock);
     {take_share,LockRef} when IsShared->
       Holder ! {locked, self(), LockRef},
       wait_lock_unlock(Lock);
-    {deadlock,DeadChecker}->
+   {'EXIT',DeadLock,deadlock}->
       Holder ! {deadlock, self()},
       wait_lock_unlock(Lock);
     {timeout, Holder}->
@@ -324,8 +323,6 @@ wait_lock(#lock{
     {'DOWN', _, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
       wait_lock_unlock(Lock)
-  end after
-    [ets:delete_object(Graph,{?wait(Term),T}) || T <- HeldLocks]
   end.
 
 wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
@@ -337,8 +334,55 @@ wait_lock_unlock(#lock{ lock_ref = LockRef, shared = IsShared}=Lock)->
       wait_lock_unlock( Lock )
   end.
 
-check_deadlock(Graph, Term, HeldLocks, Holder)->
-  todo.
+check_deadlock(_Graph, _WaitTerm, [])->
+  can_not_have_deadlocks;
+check_deadlock(Graph, WaitTerm, HeldLocks)->
+  spawn_link(fun()->
+    process_flag(trap_exit,true),
+
+    Checker = self(),
+    ets:insert(Graph,[{?wait(WaitTerm),T, Checker} || T <- HeldLocks]),
+
+    try check_deadlock_loop( Graph, WaitTerm, HeldLocks )
+    after
+      [ets:delete_object(Graph,{?wait(WaitTerm),T,Checker}) || T <- HeldLocks]
+    end
+  end).
+
+check_deadlock_loop( Graph, WaitTerm, HeldLocks )->
+
+  find_deadlocks(HeldLocks, Graph, WaitTerm, fun( Checker )->
+    catch Checker ! {compare_locks, self() ,HeldLocks}
+  end),
+
+  receive
+    {'EXIT',_,_} ->
+      unlock;
+    {compare_locks, From ,Locks}->
+      if
+        length( Locks ) > length( HeldLocks ); Locks > HeldLocks->
+          exit( deadlock );
+        true->
+          From ! { yield }
+      end;
+    { yield }->
+      exit( deadlock )
+  after 10->
+    check_deadlock_loop( Graph, WaitTerm, HeldLocks )
+  end.
+
+find_deadlocks([Term|Rest], Graph, WaitTerm, CheckFun )->
+
+  WhoIsWaiting = ets:lookup( Graph, ?wait(Term) ),
+
+  [ CheckFun(Checker) || {_,T, Checker} <- WhoIsWaiting, T=:=WaitTerm ],
+
+  find_deadlocks([ T || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ], Graph, WaitTerm, CheckFun ),
+
+  find_deadlocks( Rest, Graph, WaitTerm, CheckFun );
+find_deadlocks( [], _Graph, _WaitTerm, _CheckFun )->
+  ok.
+
 
 
 %%  elock:start_link(test).

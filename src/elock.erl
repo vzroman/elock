@@ -9,6 +9,13 @@
   lock/4, lock/5
 ]).
 
+%%=================================================================
+%%	Internal API
+%%=================================================================
+-export([
+  do_lock/6
+]).
+
 -define(LOGERROR(Text),lager:error(Text)).
 -define(LOGERROR(Text,Params),lager:error(Text,Params)).
 -define(LOGWARNING(Text),lager:warning(Text)).
@@ -35,14 +42,14 @@ init( Name )->
 
 %-----------Lock request------------------------------------------
 lock(Locks, Term, IsShared, Timeout )->
-  case lock( Locks, Term, IsShared, Timeout, _Holder = self() ) of
+  case do_lock( Locks, Term, IsShared, Timeout, _Holder = self(), _Nodes= [] ) of
     {ok, {Locker, LockRef}} ->
       {ok, fun()-> catch Locker ! {unlock, LockRef}, ok  end};
     Error -> Error
   end.
 
 lock(Locks, Term, IsShared, Timeout, [Node] ) when Node=:=node()->
-  case lock( Locks, Term, IsShared, Timeout, _Holder = self() ) of
+  case do_lock( Locks, Term, IsShared, Timeout, _Holder = self(), _Nodes= [] ) of
     {ok,{Locker,LockRef}}->
       {ok,fun()-> catch Locker ! {unlock, LockRef} end};
     Error->
@@ -50,7 +57,7 @@ lock(Locks, Term, IsShared, Timeout, [Node] ) when Node=:=node()->
   end;
 
 lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
-  case ecall:call_all(Nodes, ?MODULE, lock, [ Locks, Term, IsShared, Timeout, _Holder=self() ]) of
+  case ecall:call_all(Nodes, ?MODULE, do_lock, [ Locks, Term, IsShared, Timeout, _Holder=self(), Nodes ]) of
     {ok, Results} ->
       Unlock =
         fun() ->
@@ -59,13 +66,13 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
       {ok, Unlock};
     {error,Error}->
       {error,Error}
-  end;
+  end.
 
-lock( Locks, Term, IsShared, Timeout, Holder) when is_pid(Holder)->
+do_lock( Locks, Term, IsShared, Timeout, Holder, Nodes) when is_pid(Holder)->
 
   Locker =
     spawn(fun()->
-      set_lock(Locks, Holder, Term, IsShared)
+      set_lock(Locks, Holder, Term, IsShared, Nodes)
     end),
 
   receive
@@ -137,7 +144,7 @@ lock( Locks, Term, IsShared, Timeout, Holder) when is_pid(Holder)->
 
 -record(lock,{locks, term, holder, shared, lock_ref, queue, held}).
 
-set_lock(Locks, Holder, Term, IsShared)->
+set_lock(Locks, Holder, Term, IsShared, Nodes)->
 
   HeldLocks =
     [ T || {_,T} <- ets:lookup(?graph(Locks),?holder(Holder))],
@@ -147,13 +154,18 @@ set_lock(Locks, Holder, Term, IsShared)->
       Holder ! {locked, self(), LockRef },
       already_locked_i_can_die;
     _->
-      do_lock(Locks, Holder, Term, IsShared, HeldLocks)
+
+      process_flag(trap_exit,true),
+
+      % Cross nodes term deadlocks
+      CrossNodesLock = [{Term,N} || N <- Nodes--[node()]],
+
+      do_set_lock(Locks, Holder, Term, IsShared, HeldLocks++CrossNodesLock)
+
   end.
 
-do_lock(Locks, Holder, Term, IsShared, HeldLocks)->
+do_set_lock(Locks, Holder, Term, IsShared, HeldLocks)->
   Locker = self(),
-
-  process_flag(trap_exit,true),
 
   % I want to know if you die
   erlang:monitor(process, Holder),

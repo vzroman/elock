@@ -20,8 +20,6 @@ API
         type=>worker,
         modules=>[elock]
     },
-
-    The process registers itself as '$mylocks', be carefull.
     
     Ok now you are ready for local locks. If you need distributed locks do the same
     at your other nodes.
@@ -30,23 +28,24 @@ API
     
     If you want to lock any erlang term call:
     
-    {ok,Unlock} | {error,timeout} =  elock:lock(Locks, Term, IsShared, Nodes, Timeout )
+    {ok,Unlock} | {error,timeout} | {error, deadlock} =  elock:lock(Locks, Term, IsShared, Timeout )
+
+    Distributed locks is almost the same:
+
+    {ok,Unlock} | {error,timeout} | {error, deadlock} =  elock:lock(Locks, Term, IsShared, Timeout, Nodes )
 
     Locks is your '$mylocks'
     Term is any erlang term
+    IsShared = true | false. Set it true if it is enough for you to be sure that the term is locked may be
+                even not by you and nobody has not shared lock on it.
     Timeout is Milliseconds or infinity
-    
-    Others are more interesting:
-
-    set IsShared = true if it is enough for you to be sure that the term is locked may be
-    even not by you. 
-    
-    Nodes is where else you want to lock the Term. If the Nodes is [] the Term
-    will be locked only locally
+    Nodes is a list of nodes where you want to lock the Term
 
     When you need to unlock the Term call Unlock() from returned to you {ok,Unlock}.
 
-    Avoid setting lock on the term you'v already locked, you will get a deadlock.
+    Deadlocks are detected automatically. If requested lock leads to a deadlock then one of the requests will get:
+        {error, deadlock}
+    Most cases deadlock will get a process which has less locked terms
 
     that's it.
     

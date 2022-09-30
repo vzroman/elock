@@ -73,7 +73,7 @@ do_lock( Locks, Term, IsShared, Timeout, Holder, Nodes) when is_pid(Holder)->
 
   ReplyTo = self(),
   Locker =
-    spawn(fun()-> set_lock(ReplyTo = self(), Locks, Holder, Term, IsShared, Nodes) end),
+    spawn(fun()-> set_lock(ReplyTo, Locks, Holder, Term, IsShared, Nodes) end),
 
   receive
     {locked, Locker, LockRef}->
@@ -365,6 +365,7 @@ wait_lock(#lock{
       locked( Lock ),
       wait_shared_lock( Lock );
     {deadlock, Deadlock}->
+      ?LOGDEBUG("~p hodler ~p deadlock",[Term,Holder]),
       ReplyTo ! {deadlock, self()},
       wait_lock_unlock( Lock );
     {timeout, Holder}->
@@ -463,10 +464,10 @@ check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
       unlock;
     {compare_locks, From ,Locks}->
       if
-        length( Locks ) > length( HeldLocks ); Locks > HeldLocks->
-          Locker ! {deadlock, self()};
+        length( HeldLocks ) > length( Locks ); HeldLocks > Locks->
+          catch From ! { yield };
         true->
-          catch From ! { yield }
+          Locker ! {deadlock, self()}
       end;
     { yield }->
       Locker ! {deadlock, self()}
@@ -493,6 +494,9 @@ find_deadlocks( [], _Graph, _WaitTerm, _CheckFun )->
 
 
 %%  elock:start_link(test).
-%%{ok, Unlock} = elock:lock(test, test1,_IsShared = false, infinity ).
+%%  {ok, U1} = elock:lock(test, t1, false, infinity ).
+%%  {ok, U2} = elock:lock(test, t2, false, infinity ).
 %%
-%%spawn(fun()-> {ok, U} = elock:lock(test, test1,_IsShared = false, infinity ), io:format("locked\r\n") end).
+%%  spawn(fun()-> elock:lock(test, t3, false, infinity ), io:format("t3 locked\r\n"), spawn(fun()->elock:lock(test, t4, false, infinity ), io:format("t4 locked\r\n"), io:format("t1 lock: ~p\r\n",[elock:lock(test, t1, false, infinity )]) end ), timer:sleep(1000), elock:lock(test, t4, false, infinity ), io:format("t4 locked2\r\n"), timer:sleep(10000)  end).
+%%
+%%  {ok, U3} = elock:lock(test, t3, false, infinity ).

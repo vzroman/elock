@@ -474,19 +474,19 @@ check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
     check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
   end.
 
-find_deadlocks([Term|Rest], Graph, WaitTerm, CheckFun )->
+find_deadlocks([Term|Rest], Graph, WaitTerm, Phallometer)->
 
   WhoIsWaiting = ets:lookup( Graph, ?wait(Term) ),
 
   % To reduce message passing
-  [ CheckFun(Checker) || {_,T, Checker} <- WhoIsWaiting,
+  [ Phallometer(Checker) || {_,T, Checker} <- WhoIsWaiting,
     T=:=WaitTerm, % He owns the term that I'm waiting for
     Checker > self() % just to reduce message passing
   ],
 
-  find_deadlocks([ T || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ], Graph, WaitTerm, CheckFun ),
+  find_deadlocks([ T || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ], Graph, WaitTerm, Phallometer),
 
-  find_deadlocks( Rest, Graph, WaitTerm, CheckFun );
+  find_deadlocks( Rest, Graph, WaitTerm, Phallometer);
 find_deadlocks( [], _Graph, _WaitTerm, _CheckFun )->
   ok.
 

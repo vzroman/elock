@@ -24,7 +24,8 @@ API
     Ok now you are ready for local locks. If you need distributed locks do the same
     at your other nodes.
     
-    If you need one more heap of lock start add another one to a supervisor. 
+    If you need one more heap of lock add another one to a supervisor with a 
+    different name. 
     
     If you want to lock any erlang term call:
     

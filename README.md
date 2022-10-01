@@ -24,7 +24,7 @@ API
     Ok now you are ready for local locks. If you need distributed locks do the same
     at your other nodes.
     
-    If you need one more heap of lock add another one to a supervisor with a 
+    If you need one more heap of locks add another one to a supervisor with a 
     different name. 
     
     If you want to lock any erlang term call:
@@ -41,7 +41,7 @@ API
     Term is any erlang term
     IsShared = true | false. Set it true if it is enough for you to be sure 
                 that the term is locked may be even not by you and nobody 
-                has not shared lock on it.
+                has exclusive lock (IsShared = false) on it.
     Timeout is Milliseconds or infinity
     Nodes is a list of nodes where you want to lock the Term
 
@@ -51,11 +51,11 @@ API
     then one of the requests will get:
         {error, deadlock}
     Most cases deadlock will get a process which has less locked terms.
-    If you already have locked a Term and try to lock it with a different IsShared
-    type then the previous lock is automatically released and the new request
-    is queued in the end.
+    If you already have locked the Term and try to lock it with a different 
+    IsShared type then the previous lock is automatically released and 
+    the new request is queued.
 
-    that's it.
+    That's it.
     
     
     

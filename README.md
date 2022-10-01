@@ -37,13 +37,14 @@ API
     {ok,Unlock} | {error,timeout} | {error, deadlock} 
         =  elock:lock(Locks, Term, IsShared, Timeout, Nodes )
 
-    Locks is your '$mylocks'
-    Term is any erlang term
-    IsShared = true | false. Set it true if it is enough for you to be sure 
-                that the term is locked may be even not by you and nobody 
-                has exclusive lock (IsShared = false) on it.
-    Timeout is Milliseconds or infinity
-    Nodes is a list of nodes where you want to lock the Term
+    * Locks is your '$mylocks'
+    * Term is any erlang term
+    * IsShared = true | false. 
+    Set it true if it is enough for you to be sure that the term 
+    is locked may be even not by you and nobody has exclusive 
+    lock (IsShared = false) on it.
+    * Timeout is Milliseconds or infinity
+    * Nodes is a list of nodes where you want to lock the Term
 
     When you need to unlock the Term call Unlock() from returned to you {ok,Unlock}.
 

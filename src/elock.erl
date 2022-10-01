@@ -13,7 +13,7 @@
 %%	Internal API
 %%=================================================================
 -export([
-  do_lock/6
+  do_lock/2
 ]).
 
 
@@ -42,38 +42,92 @@ start_link( Name )->
 
 %-----------Lock request------------------------------------------
 lock(Locks, Term, IsShared, Timeout )->
-  case do_lock( Locks, Term, IsShared, Timeout, _Holder = self(), _Nodes= [] ) of
-    {ok, {Locker, LockRef}} ->
-      {ok, fun()-> catch Locker ! {unlock, LockRef}, ok  end};
-    Error -> Error
-  end.
+  lock(Locks, Term, IsShared, Timeout, [node()]).
 
-lock(Locks, Term, IsShared, Timeout, [Node] ) when Node=:=node()->
-  case do_lock( Locks, Term, IsShared, Timeout, _Holder = self(), _Nodes= [] ) of
-    {ok,{Locker,LockRef}}->
-      {ok,fun()-> catch Locker ! {unlock, LockRef} end};
-    Error->
-      Error
-  end;
+lock(_Locks, _Term, _IsShared, _Timeout, [] )->
+  {ok,fun()->ok end};
+
+lock(Locks, Term, IsShared, Timeout, [Node]=Nodes ) when Node=:=node()->
+  in_context(Locks, Term, IsShared, Nodes, fun(Lock)->
+    case do_lock( Lock, Timeout ) of
+      {ok,Unlock}->{ok,[Unlock]};
+      Error->Error
+    end
+  end);
 
 lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
-  case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [ Locks, Term, IsShared, Timeout, _Holder=self(), Nodes ]) of
-    {OKs,[]} ->
-      Unlock =
-        fun() ->
-          [catch Locker ! {unlock, LockRef} || {_N, {Locker, LockRef} } <- OKs], ok
-        end,
-      {ok, Unlock};
-    {OKs,[{_N,Error}|_]}->
-      [catch Locker ! {unlock, LockRef} || {_, {Locker, LockRef} } <- OKs],
-      {error,Error}
+  in_context( Locks, Term, IsShared, Nodes, fun( Lock )->
+    case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [Lock, Timeout ]) of
+      {OKs,[]}->
+        {ok,[ Unlock || {_N, Unlock} <- OKs ]};
+      {OKs,[{_N,Error}|_]}->
+        [catch Locker ! {unlock, LockRef} || {_, {Locker, LockRef} } <- OKs],
+        {error,Error}
+    end
+  end).
+
+
+-record(lock,{locks, graph, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock}).
+
+in_context(Locks, Term, IsShared, Nodes, SetLock)->
+
+  HeldLocks =
+    case get('$elock$') of
+      _Held when is_list(_Held)-> _Held;
+      _->[]
+    end,
+
+  NodesToLock =
+    Nodes -- [N || {L,T,N,S} <-  HeldLocks,
+      (L=:=Locks)
+      andalso T=:=Term
+      andalso (S=:=IsShared) % If the holder already holds the term but the lock is of different type the Locker will receive {upgrade, Holder}
+    ],
+  if
+    length(NodesToLock)=:=0->
+      % The term is already locked
+      {ok,fun()-> ok end};
+    true->
+      Lock = #lock{
+        locks = Locks,
+        graph = ?graph(Locks),
+        term = Term,
+        holder = self(),
+        shared = IsShared,
+        held = [{T,N} || {_L,T,N,_S} <- HeldLocks] ,
+        nodes = NodesToLock
+      },
+      case SetLock( Lock ) of
+        {ok, Lockers}->
+          AddedLocks = [{Locks,Term,N,IsShared} || N <- NodesToLock],
+          put('$elock$', HeldLocks ++ AddedLocks),
+
+          Unlock =
+            fun()->
+              [ catch Locker ! {unlock, LockRef} || {Locker, LockRef} <- Lockers ],
+              case erase('$elock$') of
+                UnlockHeldLocks when is_list(UnlockHeldLocks)->
+                  case UnlockHeldLocks -- AddedLocks of
+                    []->ok;
+                    RestLocks->
+                      put('$elock$',RestLocks)
+                  end;
+                _->
+                  why
+              end,
+              ok
+            end,
+          {ok, Unlock};
+        Error->
+          Error
+      end
   end.
 
-do_lock( Locks, Term, IsShared, Timeout, Holder, Nodes) when is_pid(Holder)->
+do_lock(Lock, Timeout)->
 
   ReplyTo = self(),
   Locker =
-    spawn(fun()-> set_lock(ReplyTo, Locks, Holder, Term, IsShared, Nodes) end),
+    spawn(fun()-> set_lock(Lock#lock{reply_to = ReplyTo}) end),
 
   receive
     {locked, Locker, LockRef}->
@@ -82,15 +136,7 @@ do_lock( Locks, Term, IsShared, Timeout, Holder, Nodes) when is_pid(Holder)->
       {error, deadlock}
   after
     Timeout->
-      Locker ! {timeout, Holder},
-      % Drop tail lock
-      receive
-        {locked, Locker, _LockRef}->ignore;
-        {deadlock,Locker}->ignore
-      after
-        0-> ok
-      end,
-      % Ok I tried
+      Locker ! {timeout, ReplyTo},
       {error, timeout}
   end.
 
@@ -142,37 +188,22 @@ do_lock( Locks, Term, IsShared, Timeout, Holder, Nodes) when is_pid(Holder)->
 -define(holder(H),{holder,H}).
 -define(wait(T),{wait,T}).
 
--record(lock,{locks, graph, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock}).
-
-set_lock(ReplyTo, Locks, Holder, Term, IsShared, Nodes)->
+set_lock(#lock{
+  graph = Graph,
+  term = Term,
+  holder = Holder,
+  nodes = Nodes
+}=Lock)->
 
   process_flag(trap_exit,true),
 
-  HeldLocks =
-    [ T || {_,T,S} <- ets:lookup(?graph(Locks),?holder(Holder)), (S=:=IsShared) or (S=:=false)],
-  case lists:member(Term,HeldLocks) of
-    true->
-      LockRef = make_ref(),
-      ReplyTo ! {locked, self(), LockRef },
-      already_locked;
-    _->
+  % I want to know if you die
+  erlang:monitor(process, Holder),
 
-      % I want to know if you die
-      erlang:monitor(process, Holder),
+  % Upgrade check
+  [ catch Locker ! {upgrade,Holder} || {_,T,Locker} <- ets:lookup(Graph,?holder(Holder)), T=:=Term],
 
-      Lock = #lock{
-        locks = Locks,
-        graph = ?graph(Locks),
-        term = Term,
-        reply_to = ReplyTo,
-        holder = Holder,
-        shared = IsShared,
-        held = HeldLocks,
-        nodes = Nodes--[node()]
-      },
-
-      enqueue( Lock )
-  end.
+  enqueue( Lock#lock{ nodes = Nodes--[node()] }).
 
 enqueue(#lock{
   locks = Locks,
@@ -221,7 +252,7 @@ locked(#lock{
   % Stop deadlock checker (if it was started)
   catch Deadlock ! { stop, self() },
 
-  ets:insert(Graph,{?holder(Holder),Term,IsShared}),
+  ets:insert(Graph,{?holder(Holder),Term,self()}),
 
   % Locked
   ReplyTo ! {locked, self(), LockRef},
@@ -239,7 +270,7 @@ locked(#lock{
   % P1 has Term, waiting {Term,nodeB}
   % P2 has {Term,nodeB}, waiting Term
   % Deadlock
-  check_deadlock(Graph, [{Term,N} || N <- Nodes], [Term|HeldLocks]),
+  check_deadlock(Graph, [{Term,N} || N <- Nodes], [{Term,node()}|HeldLocks]),
 
   % As the Locker has already replied with 'locked' it doesn't listen to 'deadlock'
   % The holder will catch the deadlock at some other nodes and unlock the term everywhere.
@@ -260,6 +291,9 @@ wait_unlock(#lock{
     {wait_share, LockRef, NextLocker} when IsShared->
       NextLocker ! {take_share,LockRef},
       wait_unlock( Lock);
+    {upgrade,Holder}->
+      ?LOGDEBUG("~p holder ~p ugrade, locker ~p unlock",[ Term, Holder, Locker ]),
+      unlock( Lock );
     {timeout, Holder}->
       ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
       unlock( Lock );
@@ -274,13 +308,12 @@ unlock(#lock{
   holder = Holder,
   lock_ref = LockRef,
   graph = Graph,
-  queue = MyQueue,
-  shared = IsShared
+  queue = MyQueue
 })->
 
   ?LOGDEBUG("~p unlocked by ~p",[Term,Holder]),
 
-  catch ets:delete_object(Graph,{?holder(Holder),Term,IsShared}),
+  catch ets:delete_object(Graph,{?holder(Holder),Term,self()}),
 
   % try to remove the lock
   ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
@@ -344,7 +377,7 @@ claim_wait(#lock{
 }=Lock)->
 
   % Init deadlock check process
-  Deadlock = check_deadlock(Graph, [Term], HeldLocks ++ [{Term,N} || N <- Nodes]),
+  Deadlock = check_deadlock(Graph, [{Term,node()}], HeldLocks ++ [{Term,N} || N <- Nodes]),
 
   wait_lock( Lock#lock{ deadlock = Deadlock }).
 

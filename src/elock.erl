@@ -127,13 +127,15 @@ do_lock(Lock, Timeout)->
 
   ReplyTo = self(),
   Locker =
-    spawn(fun()-> set_lock(Lock#lock{reply_to = ReplyTo}) end),
+    spawn_link(fun()-> set_lock(Lock#lock{reply_to = ReplyTo}) end),
 
   receive
     {locked, Locker, LockRef}->
       {ok, {Locker, LockRef}};
     {deadlock, Locker}->
-      {error, deadlock}
+      {error, deadlock};
+    {'EXIT', Locker, Reason}->
+      {error,Reason}
   after
     Timeout->
       Locker ! {timeout, ReplyTo},
@@ -242,8 +244,6 @@ locked(#lock{
   graph = Graph,
   holder = Holder,
   shared = IsShared,
-  held = HeldLocks,
-  nodes = Nodes,
   deadlock = Deadlock
 })->
 
@@ -255,26 +255,9 @@ locked(#lock{
   ets:insert(Graph,{?holder(Holder),Term,self()}),
 
   % Locked
+  unlink(ReplyTo),
   ReplyTo ! {locked, self(), LockRef},
 
-  % Init cross nodes deadlock checker process.
-  % If 2 processes try to lock the same term on the same (or intersecting) nodes
-  % And P1 is successful at node A and the P2 on node B then:
-  % At node A:
-  %   P1 claims that it has the Term and is waiting for term at node B
-  %   P2 is queued but claims that it has the term at node B (may be lies)
-  % At node B:
-  %   P1 is queued but claims that it has the term at node A
-  %   P2 claims that it has the Term and is waiting for term at node A
-  % Then at node A (and the opposite at node B):
-  % P1 has Term, waiting {Term,nodeB}
-  % P2 has {Term,nodeB}, waiting Term
-  % Deadlock
-  check_deadlock(Graph, [{Term,N} || N <- Nodes], [{Term,node()}|HeldLocks]),
-
-  % As the Locker has already replied with 'locked' it doesn't listen to 'deadlock'
-  % The holder will catch the deadlock at some other nodes and unlock the term everywhere.
-  % The deadlock checker will die with the locker after unlocking
   ok.
 
 wait_unlock(#lock{
@@ -410,6 +393,10 @@ wait_lock(#lock{
     {'DOWN', _, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
       catch Deadlock ! { stop, self() },
+      wait_lock_unlock( Lock );
+    {'EXIT', ReplyTo, Reason}->
+      ?LOGDEBUG("~p reply_to ~p died while waiting, reason ~p",[Term,ReplyTo,Reason]),
+      catch Deadlock ! { stop, self() },
       wait_lock_unlock( Lock )
   end.
 
@@ -480,15 +467,13 @@ check_deadlock(Graph, WaitTerms, HeldLocks)->
 
     try check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
     after
-      [ [ catch ets:delete_object(Graph,{?wait(Wait),Held,Checker}) || Held <- HeldLocks] || Wait <- WaitTerms ]
+      [ catch ets:delete_object(Graph,{?wait(Wait),Held,Checker}) || Held <- HeldLocks, Wait <- WaitTerms ]
     end
   end).
 
 check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
 
-  [find_deadlocks(HeldLocks, Graph, WaitTerm, fun( Checker )->
-    catch Checker ! {compare_locks, self() ,HeldLocks}
-  end) || WaitTerm <- WaitTerms ],
+  [ find_deadlocks(HeldTerm, Graph, WaitTerm, HeldLocks, self()) || WaitTerm <- WaitTerms, HeldTerm <- HeldLocks ],
 
   receive
     {stop, Locker} ->
@@ -508,21 +493,21 @@ check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
     check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
   end.
 
-find_deadlocks([Term|Rest], Graph, WaitTerm, Phallometer)->
+find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self) when Node=:=node()->
 
   WhoIsWaiting = ets:lookup( Graph, ?wait(Term) ),
 
   % To reduce message passing
-  [ Phallometer(Checker) || {_,T, Checker} <- WhoIsWaiting,
+  [ catch Checker ! {compare_locks, self() ,HeldLocks} || {_,T, Checker} <- WhoIsWaiting,
     T=:=WaitTerm, % He owns the term that I'm waiting for
     Checker > self() % just to reduce message passing
   ],
 
-  find_deadlocks([ T || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ], Graph, WaitTerm, Phallometer),
+  [ find_deadlocks(T, Graph, WaitTerm, HeldLocks, Self) || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ],
 
-  find_deadlocks( Rest, Graph, WaitTerm, Phallometer);
-find_deadlocks( [], _Graph, _WaitTerm, _CheckFun )->
-  ok.
+  ok;
+find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self)->
+  rpc:cast(Node,?MODULE,?FUNCTION_NAME,[[Term],Graph,WaitTerm,HeldLocks,Self]).
 
 
 

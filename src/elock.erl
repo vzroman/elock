@@ -225,6 +225,8 @@ enqueue(#lock{
 
       Lock1 = Lock#lock{ lock_ref = LockRef, queue = 1 },
 
+      ets:insert(Locks,{?queue(LockRef,1), self()}),
+
       locked( Lock1 ),
       wait_unlock( Lock1 );
 
@@ -303,13 +305,13 @@ unlock(#lock{
   ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
   % check unlocked
   case ets:lookup(Locks, ?lock(Term)) of
-    []->  % unlocked, nobody is waiting
-      ?LOGDEBUG("~p unlocked"),
-      ok;
-    [_]-> % not unlocked there is a queue
+    [{_,LockRef,_}]-> % not unlocked there is a queue
       % who is the next, he must be there, iterate until
       NextLocker = get_next_locker(Locks,LockRef,MyQueue+1),
-      catch NextLocker ! {take_it, LockRef}
+      catch NextLocker ! {take_it, LockRef};
+    _->  % unlocked, nobody is waiting
+      ?LOGDEBUG("~p unlocked"),
+      ok
   end,
 
   catch ets:delete(Locks,?queue(LockRef,MyQueue)),

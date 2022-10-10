@@ -60,9 +60,9 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
   in_context( Locks, Term, IsShared, Nodes, fun( Lock )->
     case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [Lock, Timeout ]) of
       {OKs,[]}->
-        {ok,[ Unlock || {_N, Unlock} <- OKs ]};
+        {ok,[ Unlock || {_N, {ok,Unlock}} <- OKs ]};
       {OKs,[{_N,Error}|_]}->
-        [catch Locker ! {unlock, LockRef} || {_, {Locker, LockRef} } <- OKs],
+        [catch Locker ! {unlock, LockRef} || {_, {ok,{Locker, LockRef}} } <- OKs],
         {error,Error}
     end
   end).

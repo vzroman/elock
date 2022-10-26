@@ -4,13 +4,11 @@
   {registered, []},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    ecall
    ]},
   {env,[]},
   {modules, []},
-  {included_applications,[
-     ecall
-  ]},
   {licenses, ["MIT"]},
   {links, []}
  ]}.

@@ -34,9 +34,21 @@ start_link( Name )->
   {ok, spawn_link(fun()->
 
     % Prepare the storage for locks
-    ets:new(Name,[named_table,public,set,{read_concurrency, true},{write_concurrency,auto}]),
+    ets:new(Name,[
+      named_table,
+      public,
+      set,
+      {read_concurrency, true},
+      {write_concurrency,auto}
+    ]),
 
-    ets:new(?graph(Name),[named_table,public,bag,{read_concurrency, true},{write_concurrency,auto}]),
+    ets:new(?graph(Name),[
+      named_table,
+      public,
+      bag,
+      {read_concurrency, true},
+      {write_concurrency,auto}
+    ]),
 
     timer:sleep(infinity)
   end)}.

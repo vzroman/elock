@@ -39,7 +39,7 @@ start_link( Name )->
       public,
       set,
       {read_concurrency, true},
-      {write_concurrency, auto}
+      {write_concurrency, true}
     ]),
 
     ets:new(?graph(Name),[
@@ -47,7 +47,7 @@ start_link( Name )->
       public,
       bag,
       {read_concurrency, true},
-      {write_concurrency, auto}
+      {write_concurrency, true}
     ]),
 
     timer:sleep(infinity)

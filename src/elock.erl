@@ -522,7 +522,7 @@ find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self) when Node=:=node
 
   ok;
 find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self)->
-  rpc:cast(Node,?MODULE,?FUNCTION_NAME,[[Term],Graph,WaitTerm,HeldLocks,Self]).
+  rpc:cast(Node,?MODULE,?FUNCTION_NAME,[Term,Graph,WaitTerm,HeldLocks,Self]).
 
 
 

@@ -14,7 +14,7 @@
 %%=================================================================
 -export([
   do_lock/2,
-  find_deadlocks/5
+  find_deadlocks/6
 ]).
 
 
@@ -488,7 +488,7 @@ check_deadlock(Graph, WaitTerms, HeldLocks)->
 
 check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
 
-  [ find_deadlocks(HeldTerm, Graph, WaitTerm, HeldLocks, self()) || WaitTerm <- WaitTerms, HeldTerm <- HeldLocks ],
+  [ find_deadlocks(HeldTerm, Graph, WaitTerm, HeldLocks, self(), _Origin = #{}) || WaitTerm <- WaitTerms, HeldTerm <- HeldLocks ],
 
   receive
     {stop, Locker} ->
@@ -508,7 +508,7 @@ check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
     check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
   end.
 
-find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self) when Node=:=node()->
+find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin) when Node=:=node()->
 
   WhoIsWaiting = ets:lookup( Graph, ?wait(Term) ),
 
@@ -518,11 +518,14 @@ find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self) when Node=:=node
     Checker > self() % just to reduce message passing
   ],
 
-  [ find_deadlocks(T, Graph, WaitTerm, HeldLocks, Self) || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ],
+  [ find_deadlocks(T, Graph, WaitTerm, HeldLocks, Self, Origin) || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ],
 
   ok;
-find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self)->
-  rpc:cast(Node,?MODULE,?FUNCTION_NAME,[Term,Graph,WaitTerm,HeldLocks,Self]).
+find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin)->
+  case maps:is_key(Node, Origin) of
+    true -> ignore;
+    _ -> rpc:cast(Node,?MODULE,?FUNCTION_NAME,[Term,Graph,WaitTerm,HeldLocks,Self, Origin#{ node() => true }])
+  end.
 
 
 

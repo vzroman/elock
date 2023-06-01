@@ -524,7 +524,7 @@ find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin) when Nod
 find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin)->
   case maps:is_key(Node, Origin) of
     true -> ignore;
-    _ -> rpc:cast(Node,?MODULE,?FUNCTION_NAME,[Term,Graph,WaitTerm,HeldLocks,Self, Origin#{ node() => true }])
+    _ -> ecall:cast(Node,?MODULE,?FUNCTION_NAME,[Term,Graph,WaitTerm,HeldLocks,Self, Origin#{ node() => true }])
   end.
 
 

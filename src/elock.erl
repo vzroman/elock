@@ -498,7 +498,8 @@ check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
     {compare_locks, From ,Locks}->
       if
         length( HeldLocks ) > length( Locks ); HeldLocks > Locks->
-          catch From ! { yield };
+          catch From ! { yield },
+          check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker );
         true->
           Locker ! {deadlock, self()}
       end;
@@ -513,9 +514,9 @@ find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin) when Nod
   WhoIsWaiting = ets:lookup( Graph, ?wait(Term) ),
 
   % To reduce message passing
-  [ catch Checker ! {compare_locks, self() ,HeldLocks} || {_,T, Checker} <- WhoIsWaiting,
+  [ catch Checker ! {compare_locks, Self ,HeldLocks} || {_,T, Checker} <- WhoIsWaiting,
     T=:=WaitTerm, % He owns the term that I'm waiting for
-    Checker > self() % just to reduce message passing
+    Checker > Self % just to reduce message passing
   ],
 
   [ find_deadlocks(T, Graph, WaitTerm, HeldLocks, Self, Origin) || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ],

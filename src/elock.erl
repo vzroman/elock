@@ -52,7 +52,7 @@ start_link( Name )->
     ]),
 
     {ok,_} = pg:start_link( ?MODULE ),
-    pg:join( ?MODULE, Name ),
+    pg:join( ?MODULE, Name, self() ),
 
     timer:sleep(infinity)
   end)}.

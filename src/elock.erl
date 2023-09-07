@@ -6,7 +6,8 @@
 %%=================================================================
 -export([
   start_link/1,
-  lock/4, lock/5
+  lock/4, lock/5,
+  ready_nodes/1
 ]).
 
 %%=================================================================
@@ -50,6 +51,9 @@ start_link( Name )->
       {write_concurrency, auto}
     ]),
 
+    {ok,_} = pg:start_link( ?MODULE ),
+    pg:join( ?MODULE, Name ),
+
     timer:sleep(infinity)
   end)}.
 
@@ -69,15 +73,22 @@ lock(Locks, Term, IsShared, Timeout, [Node]=Nodes ) when Node=:=node()->
   end);
 
 lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
-  in_context( Locks, Term, IsShared, Nodes, fun( Lock )->
-    case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [Lock, Timeout ]) of
-      {OKs,[]}->
-        {ok,[ Unlock || {_N, {ok,Unlock}} <- OKs ]};
-      {OKs,[{_N,Error}|_]}->
-        [catch Locker ! {unlock, LockRef} || {_, {ok,{Locker, LockRef}} } <- OKs],
-        {error,Error}
-    end
-  end).
+  case Nodes -- (Nodes -- ready_nodes(Locks)) of
+    []->{error, not_available};
+    ReadyNodes->
+      in_context( Locks, Term, IsShared, ReadyNodes, fun( Lock )->
+        case ecall:call_all_wait(ReadyNodes, ?MODULE, do_lock, [Lock, Timeout ]) of
+          {OKs,[]}->
+            {ok,[ Unlock || {_N, {ok,Unlock}} <- OKs ]};
+          {OKs,[{_N,Error}|_]}->
+            [catch Locker ! {unlock, LockRef} || {_, {ok,{Locker, LockRef}} } <- OKs],
+            {error,Error}
+        end
+      end)
+  end.
+
+ready_nodes( Locks )->
+  [ node(PID) ||PID <- pg:get_members(?MODULE, Locks) ].
 
 
 -record(lock,{locks, graph, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock, has_share}).

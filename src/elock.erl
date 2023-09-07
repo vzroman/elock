@@ -51,7 +51,11 @@ start_link( Name )->
       {write_concurrency, auto}
     ]),
 
-    {ok,_} = pg:start_link( ?MODULE ),
+    case pg:start_link( ?MODULE ) of
+      {ok,_} -> ok;
+      {error,{already_started,_}}->ok;
+      {error,Error}-> throw({pg_error, Error})
+    end,
     pg:join( ?MODULE, Name, self() ),
 
     timer:sleep(infinity)

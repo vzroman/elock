@@ -280,6 +280,7 @@ wait_unlock(#lock{
   term = Term,
   lock_ref = LockRef,
   holder = Holder,
+  reply_to = ReplyTo,
   shared = IsShared
 }=Lock )->
   Locker = self(),
@@ -293,7 +294,7 @@ wait_unlock(#lock{
     {upgrade,Holder}->
       ?LOGDEBUG("~p holder ~p ugrade, locker ~p unlock",[ Term, Holder, Locker ]),
       unlock( Lock );
-    {timeout, Holder}->
+    {timeout, ReplyTo}->
       ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
       unlock( Lock );
     {'DOWN', _Ref, process, Holder, Reason}->
@@ -401,7 +402,7 @@ wait_lock(#lock{
       ?LOGDEBUG("~p hodler ~p deadlock",[Term,Holder]),
       ReplyTo ! {deadlock, self()},
       wait_lock_unlock( Lock );
-    {timeout, Holder}->
+    {timeout, ReplyTo}->
       ?LOGDEBUG("~p waiter ~p timeout",[Term,Holder]),
       % Stop deadlock checker
       catch Deadlock ! { stop, self() },
@@ -419,7 +420,9 @@ wait_lock(#lock{
 
 wait_shared_lock(#lock{
   term = Term,
-  lock_ref = LockRef
+  lock_ref = LockRef,
+  reply_to = ReplyTo,
+  holder = Holder
 }=Lock )->
   receive
     {take_it, LockRef}->
@@ -427,7 +430,7 @@ wait_shared_lock(#lock{
     {wait_share, LockRef, NextLocker}->
       NextLocker ! {take_share,LockRef},
       wait_shared_lock( Lock );
-    {timeout, Holder}->
+    {timeout, ReplyTo}->
       ?LOGDEBUG("~p hodler ~p timeout after shared lock",[Term,Holder]),
       wait_lock_unlock( Lock );
     {'DOWN', _, process, Holder, Reason}->

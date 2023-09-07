@@ -80,7 +80,7 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
   end).
 
 
--record(lock,{locks, graph, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock}).
+-record(lock,{locks, graph, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock, has_share}).
 
 in_context(Locks, Term, IsShared, Nodes, SetLock)->
 
@@ -108,7 +108,8 @@ in_context(Locks, Term, IsShared, Nodes, SetLock)->
         holder = self(),
         shared = IsShared,
         held = [{T,N} || {_L,T,N,_S} <- HeldLocks] ,
-        nodes = NodesToLock
+        nodes = NodesToLock,
+        has_share = undefined
       },
       case SetLock( Lock ) of
         {ok, Lockers}->
@@ -338,12 +339,15 @@ claim_queue(#lock{
 
   ets:insert(Locks,{?queue(LockRef,MyQueue), self()}),
 
-  if
-    IsShared->
-      ask_for_share( Lock );
-    true->
-      claim_wait( Lock )
-  end.
+  Lock1 =
+    if
+      IsShared->
+        ask_for_share( Lock ),
+        Lock#lock{ has_share = false };
+      true->
+        Lock
+    end,
+  claim_wait( Lock1 ).
 
 
 ask_for_share(#lock{
@@ -353,15 +357,13 @@ ask_for_share(#lock{
 }=Lock)->
   case ets:lookup(Locks,?queue(LockRef, MyQueue-1)) of
     [{_, Locker}]->
-      Locker ! {wait_share, LockRef, self()},
-      claim_wait( Lock );
+      Locker ! {wait_share, LockRef, self()};
     _->
       % The locker either not registered yet or already deleted it's queue
       receive
         {take_it, LockRef}->
           % The locker removed it's queue. The lock is mine
-          locked( Lock ),
-          wait_unlock( Lock )
+          self() ! {take_it, LockRef}
       after
         5-> ask_for_share( Lock )
       end
@@ -394,7 +396,7 @@ wait_lock(#lock{
       wait_unlock( Lock );
     {take_share,LockRef} when IsShared->
       locked( Lock ),
-      wait_shared_lock( Lock );
+      wait_shared_lock( Lock#lock{ has_share = true } );
     {deadlock, Deadlock}->
       ?LOGDEBUG("~p hodler ~p deadlock",[Term,Holder]),
       ReplyTo ! {deadlock, self()},
@@ -435,13 +437,31 @@ wait_shared_lock(#lock{
 
 %-----------------Keep queue------------------------------------------
 wait_lock_unlock(#lock{
-  lock_ref = LockRef
+  has_share = undefined
+}=Lock)->
+
+  ask_for_share( Lock ),
+
+  wait_lock_unlock( Lock#lock{has_share = false} );
+
+wait_lock_unlock(#lock{
+  lock_ref = LockRef,
+  has_share = false
+}=Lock)->
+  receive
+    {take_it, LockRef}->
+      unlock(Lock);
+    {take_share,LockRef}->
+      wait_lock_unlock( Lock#lock{ has_share = true } )
+  end;
+wait_lock_unlock(#lock{
+  lock_ref = LockRef,
+  has_share = true
 }=Lock)->
   receive
     {take_it, LockRef}->
       unlock(Lock);
     {wait_share, LockRef, NextLocker}->
-      % I don't need the lock any more even if it's exclusive
       NextLocker ! {take_share,LockRef},
       wait_lock_unlock( Lock )
   end.

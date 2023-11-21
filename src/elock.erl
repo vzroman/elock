@@ -543,8 +543,8 @@ check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
       end;
     { yield }->
       Locker ! {deadlock, self()}
-  after 10->
-    check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
+  after
+    100-> check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
   end.
 
 find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin) when Node=:=node()->

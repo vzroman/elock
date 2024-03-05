@@ -28,6 +28,9 @@
 -define(LOGDEBUG(Text),lager:debug(Text)).
 -define(LOGDEBUG(Text,Params),lager:debug(Text,Params)).
 
+%%-define(LOGDEBUG(Text),io:format("\r\n ~p: "++Text++"\r\n"),[self()]).
+%%-define(LOGDEBUG(Text,Params),io:format("\r\n ~p: "++Text++"\r\n",[self()|Params])).
+
 -define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
 
 %------------call it from OTP supervisor as a permanent worker------
@@ -330,7 +333,7 @@ unlock(#lock{
       NextLocker = get_next_locker(Locks,LockRef,MyQueue+1),
       catch NextLocker ! {take_it, LockRef};
     _->  % unlocked, nobody is waiting
-      ?LOGDEBUG("~p unlocked"),
+      ?LOGDEBUG("~p unlocked",[Term]),
       ok
   end,
 
@@ -555,17 +558,17 @@ check_deadlock_loop(#deadlock{
       ?LOGDEBUG("~p neighbour check deadlock node ~p",[ WaitTerm, node( _From ) ]),
       check_deadlock_loop( State );
     {check_deadlock, From , _ItsHolder , ItsWaitTerm}->
-      ?LOGDEBUG("~p check deadlock, node ~p, wait term ~p",[ WaitTerm, node( From ), ItsWaitTerm ]),
+      ?LOGDEBUG("~p check deadlock, wait term ~p",[ WaitTerm, ItsWaitTerm ]),
       case ordsets:is_element( ItsWaitTerm, HeldLocks ) of
         true ->
           % THE DEADLOCK DETECTED! I send it my held locks to decide who has to yield
           ?LOGDEBUG("~p deadlock detected, node ~p, wait term ~p",[ WaitTerm, node( From ), ItsWaitTerm ]),
-          catch From ! {deadlock_detected, From , HeldLocks},
+          catch From ! {deadlock_detected, self() , HeldLocks},
           check_deadlock_loop( State );
         _->
           % As it holds the lock I'm waiting for so from now I'm also waiting for it's term
 
-          ?LOGDEBUG("~p join wait term ~p",[ WaitTerm, node( From ), ItsWaitTerm ]),
+          ?LOGDEBUG("~p join wait term ~p",[ WaitTerm, ItsWaitTerm ]),
           pg:join( Scope, ?wait( ItsWaitTerm ), self() ),
 
           check_deadlock_loop( State )
@@ -588,10 +591,10 @@ check_deadlock_loop(#deadlock{
       check_deadlock_loop( State );
 
     {deadlock_detected, From ,Locks}->
-      ?LOGDEBUG("~p deadlock detecetd request ~p",[ WaitTerm, Locks ]),
+      ?LOGDEBUG("~p deadlock detected request ~p",[ WaitTerm, Locks ]),
       if
         length( HeldLocks ) > length( Locks ); HeldLocks > Locks->
-          ?LOGDEBUG("~p deadlock oppenent yield",[ WaitTerm ]),
+          ?LOGDEBUG("~p deadlock opponent ~p yield",[ WaitTerm, From ]),
           % I have heavier held locks, the opponent has to yield
           catch From ! { yield },
           check_deadlock_loop( State );
@@ -623,7 +626,8 @@ send_check_deadlock(PIDs, #deadlock{
   wait_term = WaitTerm,
   holder = Holder
 } )->
-  [ catch P ! { check_deadlock, self(), Holder, WaitTerm } || P <- PIDs ],
+  Self = self(),
+  [ catch P ! { check_deadlock, self(), Holder, WaitTerm } || P <- PIDs, P > Self ],
   ok.
 
 %-----------------------------------------------------------------------
@@ -651,7 +655,7 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
 
   [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
 
-  ets:delete_object(Locks, { Group , self() }),
+  catch ets:delete_object(Locks, { Group , self() }),
 
   ok.
 

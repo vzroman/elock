@@ -15,7 +15,7 @@
 %%=================================================================
 -export([
   do_lock/2,
-  find_deadlocks/6
+  registered_locks/3
 ]).
 
 
@@ -28,7 +28,7 @@
 -define(LOGDEBUG(Text),lager:debug(Text)).
 -define(LOGDEBUG(Text,Params),lager:debug(Text,Params)).
 
--define(graph(Locks),list_to_atom(atom_to_list(Locks)++"_$graph$")).
+-define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
 
 %------------call it from OTP supervisor as a permanent worker------
 start_link( Name )->
@@ -43,20 +43,13 @@ start_link( Name )->
       {write_concurrency, auto}
     ]),
 
-    ets:new(?graph(Name),[
-      named_table,
-      public,
-      bag,
-      {read_concurrency, true},
-      {write_concurrency, auto}
-    ]),
-
-    case pg:start_link( ?MODULE ) of
+    DeadLockScope = ?deadlock_scope( Name ),
+    case pg:start_link( DeadLockScope ) of
       {ok,_} -> ok;
       {error,{already_started,_}}->ok;
       {error,Error}-> throw({pg_error, Error})
     end,
-    pg:join( ?MODULE, Name, self() ),
+    pg:join(DeadLockScope, {?MODULE,'$members$'}, self() ),
 
     timer:sleep(infinity)
   end)}.
@@ -77,25 +70,21 @@ lock(Locks, Term, IsShared, Timeout, [Node]=Nodes ) when Node=:=node()->
   end);
 
 lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
-  case Nodes -- (Nodes -- ready_nodes(Locks)) of
-    []->{error, not_available};
-    ReadyNodes->
-      in_context( Locks, Term, IsShared, ReadyNodes, fun( Lock )->
-        case ecall:call_all_wait(ReadyNodes, ?MODULE, do_lock, [Lock, Timeout ]) of
-          {OKs,[]}->
-            {ok,[ Unlock || {_N, {ok,Unlock}} <- OKs ]};
-          {OKs,[{_N,Error}|_]}->
-            [catch Locker ! {unlock, LockRef} || {_, {ok,{Locker, LockRef}} } <- OKs],
-            {error,Error}
-        end
-      end)
-  end.
+  in_context( Locks, Term, IsShared, Nodes, fun( Lock )->
+    case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [Lock, Timeout ]) of
+      {OKs,[]}->
+        {ok,[ Unlock || {_N, {ok,Unlock}} <- OKs ]};
+      {OKs,[{_N,Error}|_]}->
+        [catch Locker ! {unlock, LockRef} || {_, {ok,{Locker, LockRef}} } <- OKs],
+        {error,Error}
+    end
+  end).
 
 ready_nodes( Locks )->
-  [ node(PID) ||PID <- pg:get_members(?MODULE, Locks) ].
+  [ node(PID) ||PID <- pg:get_members(?deadlock_scope(Locks), {?MODULE,'$members$'})].
 
 
--record(lock,{locks, graph, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock, has_share}).
+-record(lock,{locks, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock_scope, deadlock, has_share}).
 
 in_context(Locks, Term, IsShared, Nodes, SetLock)->
 
@@ -118,7 +107,7 @@ in_context(Locks, Term, IsShared, Nodes, SetLock)->
     true->
       Lock = #lock{
         locks = Locks,
-        graph = ?graph(Locks),
+        deadlock_scope = ?deadlock_scope(Locks),
         term = Term,
         holder = self(),
         shared = IsShared,
@@ -216,11 +205,12 @@ do_lock(Lock, Timeout)->
 -define(lock(T),{lock,T}).
 -define(queue(R,Q),{queue,R,Q}).
 
--define(holder(H),{holder,H}).
+-define(holder(H,T),{holder,H,T}).
 -define(wait(T),{wait,T}).
 
+
 set_lock(#lock{
-  graph = Graph,
+  locks = Locks,
   term = Term,
   holder = Holder,
   nodes = Nodes
@@ -232,7 +222,7 @@ set_lock(#lock{
   erlang:monitor(process, Holder),
 
   % Upgrade check
-  [ catch Locker ! {upgrade,Holder} || {_,T,Locker} <- ets:lookup(Graph,?holder(Holder)), T=:=Term],
+  [ catch Locker ! {upgrade,Holder} || Locker <- registered_locks( Locks, Term, Holder ) ],
 
   enqueue( Lock#lock{ nodes = Nodes--[node()] }).
 
@@ -269,12 +259,13 @@ enqueue(#lock{
   end.
 
 locked(#lock{
+  locks = Locks,
   reply_to = ReplyTo,
   lock_ref = LockRef,
   term = Term,
-  graph = Graph,
   holder = Holder,
   shared = IsShared,
+  deadlock_scope = DeadLockScope,
   deadlock = Deadlock
 })->
 
@@ -283,7 +274,7 @@ locked(#lock{
   % Stop deadlock checker (if it was started)
   catch Deadlock ! { stop, self() },
 
-  ets:insert(Graph,{?holder(Holder),Term,self()}),
+  register_lock( Locks, DeadLockScope, Term, Holder ),
 
   % Locked
   unlink(ReplyTo),
@@ -322,13 +313,13 @@ unlock(#lock{
   term = Term,
   holder = Holder,
   lock_ref = LockRef,
-  graph = Graph,
+  deadlock_scope = DeadLockScope,
   queue = MyQueue
 })->
 
   ?LOGDEBUG("~p unlocked by ~p",[Term,Holder]),
 
-  catch ets:delete_object(Graph,{?holder(Holder),Term,self()}),
+  unregister_lock( Locks, DeadLockScope, Term, Holder ),
 
   % try to remove the lock
   ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
@@ -386,14 +377,16 @@ ask_for_share(#lock{
   end.
 
 claim_wait(#lock{
+  locks = Locks,
   term = Term,
-  graph = Graph,
+  holder = Holder,
   held = HeldLocks,
-  nodes = Nodes
+  nodes = Nodes,
+  deadlock_scope = DeadLockScope
 }=Lock)->
 
   % Init deadlock check process
-  Deadlock = check_deadlock(Graph, [{Term,node()}], HeldLocks ++ [{Term,N} || N <- Nodes]),
+  Deadlock = check_deadlock(Locks, DeadLockScope, Holder ,Term, Nodes, HeldLocks ),
 
   wait_lock( Lock#lock{ deadlock = Deadlock }).
 
@@ -508,63 +501,154 @@ get_next_locker(Locks, LockRef, Queue )->
 %-----------------------------------------------------------------------
 % Deadlocks detection
 %-----------------------------------------------------------------------
-check_deadlock(_Graph, WaitTerms, HeldLocks) when WaitTerms=:=[]; HeldLocks=:=[] ->
+-record(deadlock,{ scope, holder, wait_term, held_locks, locker }).
+
+check_deadlock(_Locks, _Scope, _Holder, _Term, _Nodes = [], _HeldLocks = []) ->
   can_not_have_deadlocks;
-check_deadlock(Graph, WaitTerms, HeldLocks)->
+check_deadlock(Locks, Scope, Holder, Term, Nodes, HeldLocks)->
   Locker = self(),
   spawn(fun()->
     erlang:monitor(process, Locker),
 
-    Checker = self(),
-    [ ets:insert(Graph,[{?wait(Wait),Held, Checker} || Held <- HeldLocks]) || Wait <- WaitTerms ],
+    % Register the term that I wait
+    WaitTerm = { Term, node() },
+    pg:join( Scope, ?wait(WaitTerm), self() ),
 
-    try check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
-    after
-      [ catch ets:delete_object(Graph,{?wait(Wait),Held,Checker}) || Held <- HeldLocks, Wait <- WaitTerms ]
-    end
+    % Check for lock success on neighbour nodes
+    NeighbourLocks = check_neighbours(Locks, Scope, Holder, Term, Nodes),
+
+    % Subscribe to lock success on neighbour nodes
+    AllHeldLocks = ordsets:from_list( HeldLocks ++ NeighbourLocks ),
+
+
+    InitState = lists:foldl(fun add_held_lock/2, #deadlock{
+      scope = Scope,
+      holder = Holder,
+      wait_term = WaitTerm,
+      held_locks = [],
+      locker = Locker
+    }, AllHeldLocks ),
+
+    check_deadlock_loop( InitState )
+
   end).
 
-check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )->
-
-  [ find_deadlocks(HeldTerm, Graph, WaitTerm, HeldLocks, self(), _Origin = #{}) || WaitTerm <- WaitTerms, HeldTerm <- HeldLocks ],
-
+check_deadlock_loop(#deadlock{
+  scope = Scope,
+  holder = Holder,
+  locker = Locker,
+  held_locks = HeldLocks
+} = State )->
   receive
     {stop, Locker} ->
       stop;
     {'DOWN', _Ref, process, Locker, _Reason} ->
       unlock;
-    {compare_locks, From ,Locks}->
+
+    {check_deadlock, _From, ItsHolder, _ItsWaitTerm} when ItsHolder =:= Holder->
+      % This is the request from the remote agent of the same lock. We are doing a common work
+      % so we can't have deadlocks
+      check_deadlock_loop( State );
+    {check_deadlock, From , _ItsHolder , ItsWaitTerm}->
+
+      case ordsets:is_element( ItsWaitTerm, HeldLocks ) of
+        true ->
+          % THE DEADLOCK DETECTED! I send it my held locks to decide who has to yield
+          catch From ! {deadlock_detected, From , HeldLocks},
+          check_deadlock_loop( State );
+        _->
+          % As it holds the lock I'm waiting for so from now I'm also waiting for it's term
+          pg:join( Scope, ?wait( ItsWaitTerm ), self() ),
+
+          check_deadlock_loop( State )
+      end;
+
+    { add_held_lock, NeighbourTerm }->
+
+      % The neighbour has succeed to get the lock. From now I'm also holding this lock
+      check_deadlock_loop( add_held_lock( NeighbourTerm, State ) );
+
+    {_Ref, join, ?wait( _ItsWaitTerm ), OtherWaiters}->
+
+      % Someone is waiting for one of the locks that I'm holding
+      send_check_deadlock( OtherWaiters, State ),
+
+      check_deadlock_loop( State );
+
+    {deadlock_detected, From ,Locks}->
       if
         length( HeldLocks ) > length( Locks ); HeldLocks > Locks->
+          % I have heavier held locks, the opponent has to yield
           catch From ! { yield },
-          check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker );
+          check_deadlock_loop( State );
         true->
+          % The opponent has heavier held locks, I has to yield
           Locker ! {deadlock, self()}
       end;
     { yield }->
-      Locker ! {deadlock, self()}
-  after
-    100-> check_deadlock_loop( Graph, WaitTerms, HeldLocks, Locker )
+      Locker ! {deadlock, self()};
+    _Other ->
+      check_deadlock_loop( State )
   end.
 
-find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin) when Node=:=node()->
+add_held_lock( LockedTerm, #deadlock{
+  scope = Scope,
+  held_locks = HeldLocks
+} = State)->
 
-  WhoIsWaiting = ets:lookup( Graph, ?wait(Term) ),
+  % Subscribe to who is waiting for the term that I hold
+  {_Ref, WhoIsWaiting} = pg:monitor( Scope, ?wait( LockedTerm ) ),
 
-  % To reduce message passing
-  [ catch Checker ! {compare_locks, Self ,HeldLocks} || {_,T, Checker} <- WhoIsWaiting,
-    T=:=WaitTerm, % He owns the term that I'm waiting for
-    Checker > Self % just to reduce message passing
-  ],
+  send_check_deadlock( WhoIsWaiting, State ),
 
-  [ find_deadlocks(T, Graph, WaitTerm, HeldLocks, Self, Origin) || {_,T,_} <- WhoIsWaiting, T=/=WaitTerm ],
+  State#deadlock{ held_locks = ordsets:add_element( LockedTerm, HeldLocks ) }.
 
-  ok;
-find_deadlocks({_,Node}=Term, Graph, WaitTerm, HeldLocks, Self, Origin)->
-  case maps:is_key(Node, Origin) of
-    true -> ignore;
-    _ -> ecall:cast(Node,?MODULE,?FUNCTION_NAME,[Term,Graph,WaitTerm,HeldLocks,Self, Origin#{ node() => true }])
-  end.
+send_check_deadlock(PIDs, #deadlock{
+  wait_term = WaitTerm,
+  holder = Holder
+} )->
+  [ catch P ! { check_deadlock, self(), Holder, WaitTerm } || P <- PIDs ],
+  ok.
+
+%-----------------------------------------------------------------------
+% Deadlocks cross-nodes API
+%-----------------------------------------------------------------------
+register_lock( Locks, DeadLockScope, Term, Holder )->
+
+  GlobalTerm = {Term, node()},
+  Group = ?holder( Holder, GlobalTerm ),
+
+  [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
+
+  ets:insert(Locks, { Group , self() }),
+
+  ok.
+
+unregister_lock( Locks, DeadLockScope, Term, Holder )->
+
+  GlobalTerm = {Term, node()},
+  Group = ?holder( Holder, GlobalTerm ),
+
+  [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
+
+  ets:delete_object(Locks, { Group , self() }),
+
+  ok.
+
+registered_locks( Locks, Term, Holder )->
+  [ Locker || {_, Locker} <- ets:lookup(Locks, ?holder(Holder, {Term, node()}))].
+
+check_neighbours(Locks, Scope, Holder, Term, Nodes )->
+
+  % Subscribe
+  [ pg:join( Scope, ?holder( Holder, { Term, N } ), self() ) ||  N <- Nodes ],
+
+  {Replies, _Rejects} = ecall:call_all_wait( Nodes, ?MODULE, registered_locks, [Locks, Term, Holder] ),
+
+ [ {Term, Node} || { Node, Lockers } <- Replies, length( Lockers ) > 0 ].
+
+
+
 
 
 

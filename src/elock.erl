@@ -520,6 +520,7 @@ check_deadlock(Locks, Scope, Holder, Term, Nodes, HeldLocks)->
     % Subscribe to lock success on neighbour nodes
     AllHeldLocks = ordsets:from_list( HeldLocks ++ NeighbourLocks ),
 
+    ?LOGDEBUG("~p start deadlock detect, held ~p, neighbour ~p, all ~p", [WaitTerm, HeldLocks, NeighbourLocks, AllHeldLocks ] ),
 
     InitState = lists:foldl(fun add_held_lock/2, #deadlock{
       scope = Scope,
@@ -534,6 +535,7 @@ check_deadlock(Locks, Scope, Holder, Term, Nodes, HeldLocks)->
   end).
 
 check_deadlock_loop(#deadlock{
+  wait_term = WaitTerm,
   scope = Scope,
   holder = Holder,
   locker = Locker,
@@ -541,23 +543,29 @@ check_deadlock_loop(#deadlock{
 } = State )->
   receive
     {stop, Locker} ->
+      ?LOGDEBUG("~p stop deadlock detect",[ WaitTerm ]),
       stop;
     {'DOWN', _Ref, process, Locker, _Reason} ->
+      ?LOGDEBUG("~p down deadlock detect",[ WaitTerm ]),
       unlock;
 
     {check_deadlock, _From, ItsHolder, _ItsWaitTerm} when ItsHolder =:= Holder->
       % This is the request from the remote agent of the same lock. We are doing a common work
       % so we can't have deadlocks
+      ?LOGDEBUG("~p neighbour check deadlock node ~p",[ WaitTerm, node( _From ) ]),
       check_deadlock_loop( State );
     {check_deadlock, From , _ItsHolder , ItsWaitTerm}->
-
+      ?LOGDEBUG("~p check deadlock, node ~p, wait term ~p",[ WaitTerm, node( From ), ItsWaitTerm ]),
       case ordsets:is_element( ItsWaitTerm, HeldLocks ) of
         true ->
           % THE DEADLOCK DETECTED! I send it my held locks to decide who has to yield
+          ?LOGDEBUG("~p deadlock detected, node ~p, wait term ~p",[ WaitTerm, node( From ), ItsWaitTerm ]),
           catch From ! {deadlock_detected, From , HeldLocks},
           check_deadlock_loop( State );
         _->
           % As it holds the lock I'm waiting for so from now I'm also waiting for it's term
+
+          ?LOGDEBUG("~p join wait term ~p",[ WaitTerm, node( From ), ItsWaitTerm ]),
           pg:join( Scope, ?wait( ItsWaitTerm ), self() ),
 
           check_deadlock_loop( State )
@@ -565,10 +573,14 @@ check_deadlock_loop(#deadlock{
 
     { add_held_lock, NeighbourTerm }->
 
+      ?LOGDEBUG("~p add held lock ~p",[ WaitTerm, NeighbourTerm ]),
+
       % The neighbour has succeed to get the lock. From now I'm also holding this lock
       check_deadlock_loop( add_held_lock( NeighbourTerm, State ) );
 
     {_Ref, join, ?wait( _ItsWaitTerm ), OtherWaiters}->
+
+      ?LOGDEBUG("~p wait my held lock ~p",[ WaitTerm, _ItsWaitTerm ]),
 
       % Someone is waiting for one of the locks that I'm holding
       send_check_deadlock( OtherWaiters, State ),
@@ -576,16 +588,20 @@ check_deadlock_loop(#deadlock{
       check_deadlock_loop( State );
 
     {deadlock_detected, From ,Locks}->
+      ?LOGDEBUG("~p deadlock detecetd request ~p",[ WaitTerm, Locks ]),
       if
         length( HeldLocks ) > length( Locks ); HeldLocks > Locks->
+          ?LOGDEBUG("~p deadlock oppenent yield",[ WaitTerm ]),
           % I have heavier held locks, the opponent has to yield
           catch From ! { yield },
           check_deadlock_loop( State );
         true->
+          ?LOGDEBUG("~p deadlock yield",[ WaitTerm ]),
           % The opponent has heavier held locks, I has to yield
           Locker ! {deadlock, self()}
       end;
     { yield }->
+      ?LOGDEBUG("~p deadlock yield request",[ WaitTerm ]),
       Locker ! {deadlock, self()};
     _Other ->
       check_deadlock_loop( State )
@@ -618,6 +634,8 @@ register_lock( Locks, DeadLockScope, Term, Holder )->
   GlobalTerm = {Term, node()},
   Group = ?holder( Holder, GlobalTerm ),
 
+  ?LOGDEBUG("~p register lock, holder ~p",[ GlobalTerm, Holder ]),
+
   [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
 
   ets:insert(Locks, { Group , self() }),
@@ -628,6 +646,8 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
 
   GlobalTerm = {Term, node()},
   Group = ?holder( Holder, GlobalTerm ),
+
+  ?LOGDEBUG("~p unregister lock, holder ~p",[ GlobalTerm, Holder ]),
 
   [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
 

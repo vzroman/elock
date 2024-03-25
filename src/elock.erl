@@ -590,15 +590,22 @@ check_deadlock_loop(#deadlock{
     {deadlock_detected, From ,Locks}->
       ?LOGDEBUG("~p deadlock detected request ~p",[ WaitTerm, Locks ]),
       if
-        length( HeldLocks ) > length( Locks ); HeldLocks > Locks->
+        length( HeldLocks ) > length( Locks )->
           ?LOGDEBUG("~p deadlock opponent ~p yield",[ WaitTerm, From ]),
           % I have heavier held locks, the opponent has to yield
           catch From ! { yield },
           check_deadlock_loop( State );
-        true->
-          ?LOGDEBUG("~p deadlock yield",[ WaitTerm ]),
-          % The opponent has heavier held locks, I has to yield
-          Locker ! {deadlock, self()}
+        true ->
+          HashHeld = erlang:phash2( HeldLocks ),
+          HashLocks = erlang:phash2( Locks ),
+          if
+            HashHeld >= HashLocks ->
+              catch From ! { yield },
+              check_deadlock_loop( State );
+            true ->
+              % The opponent has heavier held locks, I has to yield
+              Locker ! {deadlock, self()}
+          end
       end;
     { yield }->
       ?LOGDEBUG("~p deadlock yield request",[ WaitTerm ]),

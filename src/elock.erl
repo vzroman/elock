@@ -30,7 +30,7 @@ start_link( Name )->
     ets:new(Name,[
       named_table,
       public,
-      set,
+      ordered_set,
       {read_concurrency, true},
       {write_concurrency, auto}
     ]),
@@ -76,7 +76,21 @@ ready_nodes( Locks )->
   [ node(PID) ||PID <- pg:get_members(?deadlock_scope(Locks), {?MODULE,'$members$'})].
 
 
--record(lock,{locks, term, reply_to, holder, shared, held, nodes, lock_ref, queue, deadlock_scope, deadlock, has_share}).
+-record(lock,{
+  locks,
+  term,
+  reply_to,
+  holder,
+  shared,
+  held,
+  nodes,
+  lock_ref,
+  queue,
+  deadlock_scope,
+  deadlock,
+  has_share,
+  prev
+}).
 
 in_context(Locks, Term, IsShared, Nodes, SetLock)->
 
@@ -309,7 +323,7 @@ unlock(#lock{
   queue = MyQueue
 })->
 
-  ?LOGDEBUG("~p unlocked by ~p",[Term,Holder]),
+  ?LOGDEBUG("~p unlocking by ~p",[Term,Holder]),
 
   unregister_lock( Locks, DeadLockScope, Term, Holder ),
 
@@ -318,55 +332,47 @@ unlock(#lock{
   % check unlocked
   case ets:lookup(Locks, ?lock(Term)) of
     [{_,LockRef,_}]-> % not unlocked there is a queue
-      % who is the next, he must be there, iterate until
-      NextLocker = get_next_locker(Locks,LockRef,MyQueue+1),
-      catch NextLocker ! {take_it, LockRef};
+      % wait for the next to claim the queue
+      receive {next, LockRef, _Next} -> ok end;
     _->  % unlocked, nobody is waiting
       ?LOGDEBUG("~p unlocked",[Term]),
       ok
   end,
 
   catch ets:delete(Locks,?queue(LockRef,MyQueue)),
-  ok.
+  exit(normal).
 
 claim_queue(#lock{
+  locks = Locks,
+  lock_ref = LockRef,
+  queue = MyQueue
+}=Lock)->
+
+  % Register the queue
+  ets:insert(Locks,{?queue(LockRef,MyQueue), self()}),
+
+  % Notify the previous
+  Lock1 = claim_next( Lock ),
+
+  % Init waiting
+  claim_wait( Lock1 ).
+
+claim_next(#lock{
   locks = Locks,
   lock_ref = LockRef,
   queue = MyQueue,
   shared = IsShared
 }=Lock)->
-
-  ets:insert(Locks,{?queue(LockRef,MyQueue), self()}),
-
-  Lock1 =
-    if
-      IsShared->
-        ask_for_share( Lock ),
-        Lock#lock{ has_share = false };
-      true->
-        Lock
-    end,
-  claim_wait( Lock1 ).
-
-
-ask_for_share(#lock{
-  locks = Locks,
-  lock_ref = LockRef,
-  queue = MyQueue
-}=Lock)->
-  case ets:lookup(Locks,?queue(LockRef, MyQueue-1)) of
-    [{_, Locker}]->
-      Locker ! {wait_share, LockRef, self()};
-    _->
-      % The locker either not registered yet or already deleted it's queue
-      receive
-        {take_it, LockRef}->
-          % The locker removed it's queue. The lock is mine
-          self() ! {take_it, LockRef}
-      after
-        5-> ask_for_share( Lock )
-      end
-  end.
+  Prev = get_queue_pid(Locks, ?queue(LockRef, MyQueue-1) ),
+  monitor(process, Prev),
+  Prev ! {next, LockRef, self()},
+  if
+    IsShared ->
+      Prev ! {wait_share, LockRef, self()};
+    true ->
+      ignore
+  end,
+  Lock#lock{ prev = Prev }.
 
 claim_wait(#lock{
   locks = Locks,
@@ -389,84 +395,133 @@ wait_lock(#lock{
   reply_to = ReplyTo,
   term = Term,
   shared = IsShared,
-  deadlock = Deadlock
+  deadlock = Deadlock,
+  prev = Prev
 } = Lock)->
   receive
-    {take_it, LockRef}->
-      locked( Lock ),
-      wait_unlock( Lock );
+    {'DOWN', _, process, Prev, _Reason}->
+      case update_prev( Lock ) of
+        undefined ->
+          % The lock is free
+          locked( Lock ),
+          wait_unlock( Lock );
+        NewPrev ->
+          % Keep waiting
+          wait_lock( Lock#lock{ prev = NewPrev })
+      end;
     {take_share,LockRef} when IsShared->
       locked( Lock ),
       wait_shared_lock( Lock#lock{ has_share = true } );
     {deadlock, Deadlock}->
       ?LOGDEBUG("~p hodler ~p deadlock",[Term,Holder]),
       ReplyTo ! {deadlock, self()},
-      wait_lock_unlock( Lock );
+      leave_queue( Lock );
     {timeout, ReplyTo}->
       ?LOGDEBUG("~p waiter ~p timeout",[Term,Holder]),
       % Stop deadlock checker
       catch Deadlock ! { stop, self() },
       % Holder is not waiting anymore, but I can't brake the queue
-      wait_lock_unlock( Lock );
+      leave_queue( Lock );
     {'DOWN', _, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
       catch Deadlock ! { stop, self() },
-      wait_lock_unlock( Lock );
+      leave_queue( Lock );
     {'EXIT', ReplyTo, Reason}->
       ?LOGDEBUG("~p reply_to ~p died while waiting, reason ~p",[Term,ReplyTo,Reason]),
       catch Deadlock ! { stop, self() },
-      wait_lock_unlock( Lock )
+      leave_queue( Lock )
   end.
 
 wait_shared_lock(#lock{
   term = Term,
   lock_ref = LockRef,
   reply_to = ReplyTo,
-  holder = Holder
+  holder = Holder,
+  prev = Prev
 }=Lock )->
   receive
-    {take_it, LockRef}->
-      wait_unlock( Lock );
+    {'DOWN', _, process, Prev, _Reason}->
+      case update_prev( Lock ) of
+        undefined ->
+          wait_unlock( Lock );
+        NewPrev ->
+          wait_shared_lock( Lock#lock{ prev = NewPrev })
+      end;
     {wait_share, LockRef, NextLocker}->
       NextLocker ! {take_share,LockRef},
       wait_shared_lock( Lock );
     {timeout, ReplyTo}->
       ?LOGDEBUG("~p hodler ~p timeout after shared lock",[Term,Holder]),
-      wait_lock_unlock( Lock );
+      leave_queue( Lock );
     {'DOWN', _, process, Holder, Reason}->
       ?LOGDEBUG("~p holder ~p died having shared lock, reason ~p",[Term,Holder,Reason]),
-      wait_lock_unlock( Lock )
+      leave_queue( Lock )
   end.
 
-%-----------------Keep queue------------------------------------------
-wait_lock_unlock(#lock{
-  has_share = undefined
-}=Lock)->
-
-  ask_for_share( Lock ),
-
-  wait_lock_unlock( Lock#lock{has_share = false} );
-
-wait_lock_unlock(#lock{
+update_prev(#lock{
+  locks = Locks,
   lock_ref = LockRef,
+  queue = Queue,
+  shared = IsShared
+})->
+  case find_prev( Locks, LockRef, Queue ) of
+    undefined ->
+      undefined;
+    Prev ->
+      % An intermediate process has left the queue
+      monitor(process, Prev),
+      if
+        IsShared ->
+          Prev ! {wait_share, LockRef, self()};
+        true ->
+          ignore
+      end,
+      Prev
+  end.
+
+%-----------------Leave queue------------------------------------------
+leave_queue(#lock{
+  locks = Locks,
+  lock_ref = LockRef,
+  queue = MyQueue,
+  prev = Prev,
   has_share = false
 }=Lock)->
   receive
-    {take_it, LockRef}->
-      unlock(Lock);
+    {next, LockRef, _Next}->
+      catch ets:delete(Locks,?queue(LockRef,MyQueue)),
+      exit(normal);
+    {'DOWN', _, process, Prev, _Reason}->
+      case update_prev( Lock ) of
+        undefined ->
+          unlock(Lock);
+        NewPrev ->
+          leave_queue( Lock#lock{ prev = NewPrev })
+      end;
     {take_share,LockRef}->
-      wait_lock_unlock( Lock#lock{ has_share = true } )
+      leave_queue( Lock#lock{ has_share = true } )
   end;
-wait_lock_unlock(#lock{
+leave_queue(#lock{
+  locks = Locks,
   lock_ref = LockRef,
-  has_share = true
+  queue = MyQueue,
+  has_share = true,
+  prev = Prev
 }=Lock)->
   receive
-    {take_it, LockRef}->
-      unlock(Lock);
+    {next, LockRef, _Next}->
+      catch ets:delete(Locks,?queue(LockRef,MyQueue)),
+      exit(normal);
+    {'DOWN', _, process, Prev, _Reason}->
+      case update_prev( Lock ) of
+        undefined ->
+          unlock(Lock);
+        NewPrev ->
+          leave_queue( Lock#lock{ prev = NewPrev })
+      end;
     {wait_share, LockRef, NextLocker}->
       NextLocker ! {take_share,LockRef},
-      wait_lock_unlock( Lock )
+      leave_queue( Lock )
   end.
 
 %-----------------------------------------------------------------------
@@ -481,15 +536,27 @@ get_lock_ref( Locks, Lock )->
       get_lock_ref(Locks, Lock )
   end.
 
-get_next_locker(Locks, LockRef, Queue )->
-  case ets:lookup(Locks,?queue(LockRef,Queue)) of
-    [{_,NextLocker}]->
-      NextLocker;
-    []-> % He is not registered himself yet, wait
-      receive after 5 -> ok end,
-      get_next_locker(Locks, LockRef, Queue )
+get_queue_pid(Locks, Queue)->
+  case ets:lookup(Locks, Queue) of
+    [{_, PID}]-> PID;
+    _->
+      % The queue isn't registered yet
+      timer:sleep(5),
+      get_queue_pid( Locks, Queue )
   end.
 
+find_prev( Locks, LockRef, Queue )->
+  case ets:prev(Locks, ?queue(LockRef, Queue)) of
+    ?queue(LockRef, PrevQueue)->
+      case ets:lookup(Locks, ?queue(LockRef, PrevQueue)) of
+        [{_, PID}]->
+          PID;
+        _->
+          find_prev( Locks, LockRef, PrevQueue )
+      end;
+    _->
+      undefined
+  end.
 %-----------------------------------------------------------------------
 % Deadlocks detection
 %-----------------------------------------------------------------------

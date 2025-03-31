@@ -28,8 +28,6 @@ all()->
     test_simple_lock
     ,test_concurrent_lock
     ,test_lock_timeout
-%%    ,test_dirty_operations
-%%    ,test_transactions
   ].
 
 groups()->

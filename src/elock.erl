@@ -208,12 +208,6 @@ do_lock(Lock, Timeout)->
 %-----------------THE END--------------------------------
 
 %-------------------SET LOCK-----------------------------
--define(lock(T),{lock,T}).
--define(queue(R,Q),{queue,R,Q}).
-
--define(holder(H,T),{holder,H,T}).
--define(wait(T),{wait,T}).
-
 
 set_lock(#lock{
   locks = Locks,
@@ -364,6 +358,7 @@ claim_next(#lock{
   shared = IsShared
 }=Lock)->
   Prev = get_queue_pid(Locks, ?queue(LockRef, MyQueue-1) ),
+  ?LOGDEBUG("~p queue:~p prev:~p",[ LockRef, MyQueue, Prev ]),
   monitor(process, Prev),
   Prev ! {next, LockRef, self()},
   if
@@ -400,16 +395,20 @@ wait_lock(#lock{
 } = Lock)->
   receive
     {'DOWN', _, process, Prev, _Reason}->
+      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
       case update_prev( Lock ) of
         undefined ->
           % The lock is free
+          ?LOGDEBUG("~p no previous processes, get the lock",[ LockRef ]),
           locked( Lock ),
           wait_unlock( Lock );
         NewPrev ->
           % Keep waiting
+          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
           wait_lock( Lock#lock{ prev = NewPrev })
       end;
     {take_share,LockRef} when IsShared->
+      ?LOGDEBUG("~p got shared lock",[ LockRef ]),
       locked( Lock ),
       wait_shared_lock( Lock#lock{ has_share = true } );
     {deadlock, Deadlock}->
@@ -441,10 +440,13 @@ wait_shared_lock(#lock{
 }=Lock )->
   receive
     {'DOWN', _, process, Prev, _Reason}->
+      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
       case update_prev( Lock ) of
         undefined ->
+          ?LOGDEBUG("~p no previous processes, wait unlock",[ LockRef ]),
           wait_unlock( Lock );
         NewPrev ->
+          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
           wait_shared_lock( Lock#lock{ prev = NewPrev })
       end;
     {wait_share, LockRef, NextLocker}->
@@ -485,17 +487,22 @@ leave_queue(#lock{
   lock_ref = LockRef,
   queue = MyQueue,
   prev = Prev,
-  has_share = false
-}=Lock)->
+  has_share = HasShare
+}=Lock) when HasShare =/= true->
+  ?LOGDEBUG("~p enter leave queue has share: ~p",[ LockRef, HasShare ]),
   receive
     {next, LockRef, _Next}->
+      ?LOGDEBUG("~p next process has claimed, exit",[ LockRef ]),
       catch ets:delete(Locks,?queue(LockRef,MyQueue)),
       exit(normal);
     {'DOWN', _, process, Prev, _Reason}->
+      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
       case update_prev( Lock ) of
         undefined ->
+          ?LOGDEBUG("~p no previous processes, unlock",[ LockRef ]),
           unlock(Lock);
         NewPrev ->
+          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
           leave_queue( Lock#lock{ prev = NewPrev })
       end;
     {take_share,LockRef}->
@@ -508,15 +515,20 @@ leave_queue(#lock{
   has_share = true,
   prev = Prev
 }=Lock)->
+  ?LOGDEBUG("~p enter leave queue has share: true",[ LockRef ]),
   receive
     {next, LockRef, _Next}->
+      ?LOGDEBUG("~p next process has claimed, exit",[ LockRef ]),
       catch ets:delete(Locks,?queue(LockRef,MyQueue)),
       exit(normal);
     {'DOWN', _, process, Prev, _Reason}->
+      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
       case update_prev( Lock ) of
         undefined ->
+          ?LOGDEBUG("~p no previous processes, unlock",[ LockRef ]),
           unlock(Lock);
         NewPrev ->
+          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
           leave_queue( Lock#lock{ prev = NewPrev })
       end;
     {wait_share, LockRef, NextLocker}->

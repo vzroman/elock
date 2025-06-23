@@ -20,6 +20,11 @@
   registered_locks/3
 ]).
 
+-export([
+  test/0,
+  try_test_lock/3
+]).
+
 -define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
 
 %------------call it from OTP supervisor as a permanent worker------
@@ -65,8 +70,11 @@ lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
   in_context( Locks, Term, IsShared, Nodes, fun( Lock )->
     case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [Lock, Timeout ]) of
       {OKs,[]}->
+        ?LOGDEBUG("lock OKs: ~p",[OKs]),
         {ok,[ Unlock || {_N, {ok,Unlock}} <- OKs ]};
       {OKs,[{_N,Error}|_]}->
+        ?LOGDEBUG("rollback OKs: ~p",[OKs]),
+        ?LOGDEBUG("rollback OKs parsed: ~p",[[{Locker , {unlock, LockRef}} || {_, {ok,{Locker, LockRef}} } <- OKs]]),
         [catch Locker ! {unlock, LockRef} || {_, {ok,{Locker, LockRef}} } <- OKs],
         {error,Error}
     end
@@ -748,10 +756,32 @@ check_neighbours(Locks, Scope, Holder, Term, Nodes )->
 
 
 
+test()->
+  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1'],
+  Scope = test_scope,
+  Term = test_term,
+  spawn(fun()->test_loop(Nodes, Scope, Term) end).
+
+test_loop( Nodes, Scope, Term )->
+  ?LOGINFO("try lock"),
+  try_lock( Nodes, Scope, Term ),
+  timer:sleep( 1000 ),
+  test_loop( Nodes, Scope, Term ).
+
+try_lock( Nodes, Scope, Term )->
+  ecall:call_all_wait( Nodes, ?MODULE, try_test_lock, [Nodes, Scope, Term] ).
+
+try_test_lock( Nodes, Scope, Term )->
+  case elock:lock( Scope, Term, _IsShared=false, _Timeout=infinity, Nodes ) of
+    {ok, Unlock}->
+      ?LOGINFO("locked!"),
+      Unlock();
+    {error, Error}->
+      ?LOGINFO("error: ~p",[Error])
+  end.
 
 
-
-%%  elock:start_link(test).
+%%  elock:start_link(test_scope).
 %%  {ok, U1} = elock:lock(test, t1, false, infinity ).
 %%  {ok, U2} = elock:lock(test, t2, false, infinity ).
 %%

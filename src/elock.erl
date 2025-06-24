@@ -20,6 +20,11 @@
   registered_locks/3
 ]).
 
+%%-export([
+%%  test/0,
+%%  try_test_lock/3
+%%]).
+
 -define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
 
 %------------call it from OTP supervisor as a permanent worker------
@@ -642,7 +647,7 @@ check_deadlock_loop(#deadlock{
           check_deadlock_loop( State )
       end;
 
-    { add_held_lock, NeighbourTerm }->
+    {_Ref, join, ?holder(Holder, NeighbourTerm), _OtherWaiters}->
 
       ?LOGDEBUG("~p add held lock ~p",[ WaitTerm, NeighbourTerm ]),
 
@@ -671,10 +676,12 @@ check_deadlock_loop(#deadlock{
           HashLocks = erlang:phash2( Locks ),
           if
             HashHeld >= HashLocks ->
+              ?LOGDEBUG("~p deadlock opponent ~p yield",[ WaitTerm, From ]),
               catch From ! { yield },
               check_deadlock_loop( State );
             true ->
               % The opponent has heavier held locks, I has to yield
+              ?LOGDEBUG("~p have to yield to ~p",[ WaitTerm, From ]),
               Locker ! {deadlock, self()}
           end
       end;
@@ -702,7 +709,7 @@ send_check_deadlock(PIDs, #deadlock{
   holder = Holder
 } )->
   Self = self(),
-  [ catch P ! { check_deadlock, self(), Holder, WaitTerm } || P <- PIDs, P > Self ],
+  [ catch P ! { check_deadlock, self(), Holder, WaitTerm } || P <- PIDs, P =/= Self ],
   ok.
 
 %-----------------------------------------------------------------------
@@ -714,9 +721,7 @@ register_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p register lock, holder ~p",[ GlobalTerm, Holder ]),
-
-  [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
-
+  pg:join( DeadLockScope, Group, self() ),
   ets:insert(Locks, { Group , self() }),
 
   ok.
@@ -727,9 +732,7 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p unregister lock, holder ~p",[ GlobalTerm, Holder ]),
-
-  [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
-
+  pg:leave( DeadLockScope, Group, self() ),
   catch ets:delete_object(Locks, { Group , self() }),
 
   ok.
@@ -737,21 +740,43 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
 registered_locks( Locks, Term, Holder )->
   [ Locker || {_, Locker} <- ets:lookup(Locks, ?holder(Holder, {Term, node()}))].
 
-check_neighbours(Locks, Scope, Holder, Term, Nodes )->
+check_neighbours(_Locks, Scope, Holder, Term, Nodes )->
 
   % Subscribe
-  [ pg:join( Scope, ?holder( Holder, { Term, N } ), self() ) ||  N <- Nodes ],
+  SuccessLockers =
+    lists:append([ begin
+        {_Ref, WhoIsWaiting} = pg:monitor( Scope, ?holder(Holder, {Term, N})),
+        WhoIsWaiting
+      end ||  N <- Nodes ]),
 
-  {Replies, _Rejects} = ecall:call_all_wait( Nodes, ?MODULE, registered_locks, [Locks, Term, Holder] ),
+  [ {Term, node(P)} || P <- SuccessLockers ].
 
- [ {Term, Node} || { Node, Lockers } <- Replies, length( Lockers ) > 0 ].
+%%test()->
+%%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1'],
+%%  Scope = test_scope,
+%%  Term = test_term,
+%%  spawn(fun()->test_loop(Nodes, Scope, Term) end).
+%%
+%%test_loop( Nodes, Scope, Term )->
+%%  ?LOGINFO("try lock"),
+%%  try_lock( Nodes, Scope, Term ),
+%%  timer:sleep( 1000 ),
+%%  test_loop( Nodes, Scope, Term ).
+%%
+%%try_lock( Nodes, Scope, Term )->
+%%  ecall:call_all_wait( Nodes, ?MODULE, try_test_lock, [Nodes, Scope, Term] ).
+%%
+%%try_test_lock( Nodes, Scope, Term )->
+%%  case elock:lock( Scope, Term, _IsShared=false, _Timeout=infinity, Nodes ) of
+%%    {ok, Unlock}->
+%%      ?LOGINFO("locked!"),
+%%      Unlock();
+%%    {error, Error}->
+%%      ?LOGINFO("error: ~p",[Error])
+%%  end.
 
 
-
-
-
-
-%%  elock:start_link(test).
+%%  elock:start_link(test_scope).
 %%  {ok, U1} = elock:lock(test, t1, false, infinity ).
 %%  {ok, U2} = elock:lock(test, t2, false, infinity ).
 %%

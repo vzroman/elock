@@ -22,12 +22,12 @@
   line => ?LINE
 }).
 
--define(PREFIX, "\r\n"++pid_to_list(self()) ++": "++ atom_to_list(?MODULE) ++":" ++ atom_to_list(?FUNCTION_NAME)++":"++integer_to_list(?LINE)).
+-define(PREFIX, "\r\n"++atom_to_list(node())++":"++pid_to_list(self()) ++": "++ atom_to_list(?MODULE) ++":" ++ atom_to_list(?FUNCTION_NAME)++":"++integer_to_list(?LINE)++": ").
 
--define(LOGERROR(Text),          logger:error(Text, [], ?MFA_METADATA)).
--define(LOGERROR(Text,Params),   logger:error(Text, Params, ?MFA_METADATA)).
--define(LOGWARNING(Text),        logger:warning(Text, [], ?MFA_METADATA)).
--define(LOGWARNING(Text,Params), logger:warning(Text, Params, ?MFA_METADATA)).
+-define(LOGERROR(Text),          io:format(?PREFIX++Text++"\r\n")).
+-define(LOGERROR(Text,Params),   io:format(?PREFIX++Text++"\r\n", Params)).
+-define(LOGWARNING(Text),        io:format(?PREFIX++Text++"\r\n")).
+-define(LOGWARNING(Text,Params), io:format(?PREFIX++Text++"\r\n", Params)).
 -define(LOGINFO(Text),           io:format(?PREFIX ++ Text ++"\r\n")).
 -define(LOGINFO(Text,Params),    io:format(?PREFIX ++Text++"\r\n", Params)).
 -define(LOGDEBUG(Text),          io:format(?PREFIX ++Text++"\r\n")).

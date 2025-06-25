@@ -647,7 +647,7 @@ check_deadlock_loop(#deadlock{
           check_deadlock_loop( State )
       end;
 
-    {_Ref, join, ?holder(Holder, NeighbourTerm), _OtherWaiters}->
+    { add_held_lock, NeighbourTerm }->
 
       ?LOGDEBUG("~p add held lock ~p",[ WaitTerm, NeighbourTerm ]),
 
@@ -721,7 +721,9 @@ register_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p register lock, holder ~p",[ GlobalTerm, Holder ]),
-  pg:join( DeadLockScope, Group, self() ),
+
+  [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
+
   ets:insert(Locks, { Group , self() }),
 
   ok.
@@ -732,7 +734,9 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p unregister lock, holder ~p",[ GlobalTerm, Holder ]),
-  pg:leave( DeadLockScope, Group, self() ),
+
+  [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
+
   catch ets:delete_object(Locks, { Group , self() }),
 
   ok.
@@ -740,16 +744,16 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
 registered_locks( Locks, Term, Holder )->
   [ Locker || {_, Locker} <- ets:lookup(Locks, ?holder(Holder, {Term, node()}))].
 
-check_neighbours(_Locks, Scope, Holder, Term, Nodes )->
+check_neighbours(Locks, Scope, Holder, Term, Nodes )->
 
   % Subscribe
-  SuccessLockers =
-    lists:append([ begin
-        {_Ref, WhoIsWaiting} = pg:monitor( Scope, ?holder(Holder, {Term, N})),
-        WhoIsWaiting
-      end ||  N <- Nodes ]),
+  [ pg:join( Scope, ?holder( Holder, { Term, N } ), self() ) ||  N <- Nodes ],
 
-  [ {Term, node(P)} || P <- SuccessLockers ].
+  {Replies, _Rejects} = ecall:call_all_wait( Nodes, ?MODULE, registered_locks, [Locks, Term, Holder] ),
+
+ [ {Term, Node} || { Node, Lockers } <- Replies, length( Lockers ) > 0 ].
+
+
 
 %%test()->
 %%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1'],

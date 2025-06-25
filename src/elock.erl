@@ -748,6 +748,7 @@ check_neighbours(Locks, Scope, Holder, Term, Nodes )->
 
   % Subscribe
   [ pg:join( Scope, ?holder( Holder, { Term, N } ), self() ) ||  N <- Nodes ],
+  %% TODO. Do we need to check if all the nodes have received the the subscription?
 
   {Replies, _Rejects} = ecall:call_all_wait( Nodes, ?MODULE, registered_locks, [Locks, Term, Holder] ),
 

@@ -17,13 +17,14 @@
 %%=================================================================
 -export([
   do_lock/2,
-  registered_locks/3
+  registered_locks/3,
+  wait_local/3
 ]).
 
-%%-export([
-%%  test/0,
-%%  try_test_lock/3
-%%]).
+-export([
+  test/0,
+  try_test_lock/3
+]).
 
 -define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
 
@@ -721,10 +722,8 @@ register_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p register lock, holder ~p",[ GlobalTerm, Holder ]),
-
-  [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
-
   ets:insert(Locks, { Group , self() }),
+  [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
 
   ok.
 
@@ -734,9 +733,7 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p unregister lock, holder ~p",[ GlobalTerm, Holder ]),
-
   [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
-
   catch ets:delete_object(Locks, { Group , self() }),
 
   ok.
@@ -747,38 +744,71 @@ registered_locks( Locks, Term, Holder )->
 check_neighbours(Locks, Scope, Holder, Term, Nodes )->
 
   % Subscribe
-  [ pg:join( Scope, ?holder( Holder, { Term, N } ), self() ) ||  N <- Nodes ],
-  %% TODO. Do we need to check if all the nodes have received the the subscription?
+  Monitors =
+    [ begin
+        HolderGroup = ?holder( Holder, { Term, N } ),
+        pg:join( Scope, HolderGroup, self() ),
+        spawn_monitor(N, ?MODULE, wait_local, [Scope, HolderGroup, self() ])
+      end ||  N <- Nodes ],
+  wait_consistency( Monitors ),
 
   {Replies, _Rejects} = ecall:call_all_wait( Nodes, ?MODULE, registered_locks, [Locks, Term, Holder] ),
 
  [ {Term, Node} || { Node, Lockers } <- Replies, length( Lockers ) > 0 ].
 
+wait_local(Scope, Group, Member)->
+  {Ref, WhoIsWaiting} = pg:monitor(Scope, Group),
+  case lists:member(Member, WhoIsWaiting) of
+    true->
+      exit(normal);
+    _->
+      wait_local(Ref, Member)
+  end.
 
+wait_local(Ref, Member)->
+  receive
+    {Ref, join, _, WhoIsWaiting}->
+      case lists:member(Member, WhoIsWaiting) of
+        true->
+          exit(normal);
+        _->
+          wait_local(Ref, Member)
+      end
+  end.
 
-%%test()->
-%%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1'],
-%%  Scope = test_scope,
-%%  Term = test_term,
-%%  spawn(fun()->test_loop(Nodes, Scope, Term) end).
-%%
-%%test_loop( Nodes, Scope, Term )->
-%%  ?LOGINFO("try lock"),
-%%  try_lock( Nodes, Scope, Term ),
-%%  timer:sleep( 1000 ),
-%%  test_loop( Nodes, Scope, Term ).
-%%
-%%try_lock( Nodes, Scope, Term )->
-%%  ecall:call_all_wait( Nodes, ?MODULE, try_test_lock, [Nodes, Scope, Term] ).
-%%
-%%try_test_lock( Nodes, Scope, Term )->
-%%  case elock:lock( Scope, Term, _IsShared=false, _Timeout=infinity, Nodes ) of
-%%    {ok, Unlock}->
-%%      ?LOGINFO("locked!"),
-%%      Unlock();
-%%    {error, Error}->
-%%      ?LOGINFO("error: ~p",[Error])
-%%  end.
+wait_consistency([{PID, Ref}|Rest])->
+  receive
+    {'DOWN', Ref, process, PID, _Reason}->
+      ?LOGINFO("wait_consistency ~p",[node(PID)]),
+      wait_consistency( Rest )
+  end;
+wait_consistency([])->
+  ?LOGINFO("wait_consistency finish"),
+  ok.
+
+test()->
+  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1','n4@127.0.0.1','n5@127.0.0.1'],
+  Scope = test_scope,
+  Term = test_term,
+  spawn(fun()->test_loop(Nodes, Scope, Term) end).
+
+test_loop( Nodes, Scope, Term )->
+  ?LOGINFO("try lock"),
+  try_lock( Nodes, Scope, Term ),
+  timer:sleep( 1000 ),
+  test_loop( Nodes, Scope, Term ).
+
+try_lock( Nodes, Scope, Term )->
+  ecall:call_all_wait( Nodes, ?MODULE, try_test_lock, [Nodes, Scope, Term] ).
+
+try_test_lock( Nodes, Scope, Term )->
+  case elock:lock( Scope, Term, _IsShared=false, _Timeout=infinity, Nodes ) of
+    {ok, Unlock}->
+      ?LOGINFO("locked!"),
+      Unlock();
+    {error, Error}->
+      ?LOGINFO("error: ~p",[Error])
+  end.
 
 
 %%  elock:start_link(test_scope).

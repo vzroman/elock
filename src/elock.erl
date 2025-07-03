@@ -779,11 +779,9 @@ wait_local(Ref, Member)->
 wait_consistency([{PID, Ref}|Rest])->
   receive
     {'DOWN', Ref, process, PID, _Reason}->
-      ?LOGINFO("wait_consistency ~p",[node(PID)]),
       wait_consistency( Rest )
   end;
 wait_consistency([])->
-  ?LOGINFO("wait_consistency finish"),
   ok.
 
 test()->

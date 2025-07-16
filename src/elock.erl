@@ -592,7 +592,8 @@ check_deadlock(Locks, Scope, Holder, Term, Nodes, HeldLocks)->
     pg:join( Scope, ?wait(WaitTerm), self() ),
 
     % Check for lock success on neighbour nodes
-    NeighbourLocks = check_neighbours(Locks, Scope, Holder, Term, Nodes),
+    NeighbourLocks = check_neighbours(Locks, Scope, Holder, Locker, Term, Nodes),
+    ?LOGDEBUG("~p neigbour locks: ~p",[ Term, NeighbourLocks ]),
 
     % Subscribe to lock success on neighbour nodes
     AllHeldLocks = ordsets:from_list( HeldLocks ++ NeighbourLocks ),
@@ -640,15 +641,19 @@ check_deadlock_loop(#deadlock{
           catch From ! {deadlock_detected, self() , HeldLocks},
           check_deadlock_loop( State );
         _->
-          % As it holds the lock I'm waiting for so from now I'm also waiting for it's term
-
-          ?LOGDEBUG("~p join wait term ~p",[ WaitTerm, ItsWaitTerm ]),
-          pg:join( Scope, ?wait( ItsWaitTerm ), self() ),
-
+          case lists:member(self(), pg:get_local_members(Scope, ?wait( ItsWaitTerm ))) of
+            true ->
+              ?LOGDEBUG("~p join wait term ~p skip, already exists",[ WaitTerm, ItsWaitTerm ]),
+              ignore;
+            _->
+              % As it holds the lock I'm waiting for so from now I'm also waiting for it's term
+              ?LOGDEBUG("~p join wait term ~p",[ WaitTerm, ItsWaitTerm ]),
+              pg:join( Scope, ?wait( ItsWaitTerm ), self() )
+          end,
           check_deadlock_loop( State )
       end;
 
-    { add_held_lock, NeighbourTerm }->
+    {add_held_lock, NeighbourTerm }->
 
       ?LOGDEBUG("~p add held lock ~p",[ WaitTerm, NeighbourTerm ]),
 
@@ -710,7 +715,7 @@ send_check_deadlock(PIDs, #deadlock{
   holder = Holder
 } )->
   Self = self(),
-  [ catch P ! { check_deadlock, self(), Holder, WaitTerm } || P <- PIDs, P =/= Self ],
+  [ catch P ! {check_deadlock, self(), Holder, WaitTerm } || P <- PIDs, P =/= Self ],
   ok.
 
 %-----------------------------------------------------------------------
@@ -723,7 +728,7 @@ register_lock( Locks, DeadLockScope, Term, Holder )->
 
   ?LOGDEBUG("~p register lock, holder ~p",[ GlobalTerm, Holder ]),
   ets:insert(Locks, { Group , self() }),
-  [ catch P ! { add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
+  [ catch P ! {add_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
 
   ok.
 
@@ -733,7 +738,7 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
   Group = ?holder( Holder, GlobalTerm ),
 
   ?LOGDEBUG("~p unregister lock, holder ~p",[ GlobalTerm, Holder ]),
-  [ catch P ! { remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
+  [ catch P ! {remove_held_lock, GlobalTerm } || P <- pg:get_members( DeadLockScope, Group )],
   catch ets:delete_object(Locks, { Group , self() }),
 
   ok.
@@ -741,7 +746,7 @@ unregister_lock( Locks, DeadLockScope, Term, Holder )->
 registered_locks( Locks, Term, Holder )->
   [ Locker || {_, Locker} <- ets:lookup(Locks, ?holder(Holder, {Term, node()}))].
 
-check_neighbours(Locks, Scope, Holder, Term, Nodes )->
+check_neighbours(Locks, Scope, Holder, Locker, Term, Nodes )->
 
   % Subscribe
   Monitors =
@@ -750,7 +755,8 @@ check_neighbours(Locks, Scope, Holder, Term, Nodes )->
         pg:join( Scope, HolderGroup, self() ),
         spawn_monitor(N, ?MODULE, wait_local, [Scope, HolderGroup, self() ])
       end ||  N <- Nodes ],
-  wait_consistency( Monitors ),
+  wait_consistency( Monitors, Locker ),
+  ?LOGDEBUG("~p holder locks are registered on ~p",[Term, Nodes]),
 
   {Replies, _Rejects} = ecall:call_all_wait( Nodes, ?MODULE, registered_locks, [Locks, Term, Holder] ),
 
@@ -776,12 +782,16 @@ wait_local(Ref, Member)->
       end
   end.
 
-wait_consistency([{PID, Ref}|Rest])->
+wait_consistency([{PID, Ref}|Rest], Locker)->
   receive
     {'DOWN', Ref, process, PID, _Reason}->
-      wait_consistency( Rest )
+      wait_consistency( Rest, Locker );
+    {'DOWN', _Ref, process, Locker, Reason}->
+      exit(Reason);
+    {stop, Locker}->
+      exit(stop)
   end;
-wait_consistency([])->
+wait_consistency([], _Locker)->
   ok.
 
 %%test()->

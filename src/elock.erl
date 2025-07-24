@@ -763,6 +763,7 @@ check_neighbours(Locks, Scope, Holder, Locker, Term, Nodes )->
  [ {Term, Node} || { Node, Lockers } <- Replies, length( Lockers ) > 0 ].
 
 wait_local(Scope, Group, Member)->
+  erlang:monitor(process, Member),
   {Ref, WhoIsWaiting} = pg:monitor(Scope, Group),
   case lists:member(Member, WhoIsWaiting) of
     true->
@@ -779,7 +780,11 @@ wait_local(Ref, Member)->
           exit(normal);
         _->
           wait_local(Ref, Member)
-      end
+      end;
+    {'DOWN', _Ref, process, Member, Reason}->
+      exit(Reason);
+    _->
+      wait_local(Ref, Member)
   end.
 
 wait_consistency([{PID, Ref}|Rest], Locker)->
@@ -798,16 +803,13 @@ wait_consistency([], _Locker)->
 %%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1','n4@127.0.0.1','n5@127.0.0.1'],
 %%  Scope = test_scope,
 %%  Term = test_term,
-%%  spawn(fun()->test_loop(Nodes, Scope, Term) end).
+%%  [spawn(N, ?MODULE, test_loop,[Nodes, Scope, Term]) || N <- Nodes].
 %%
 %%test_loop( Nodes, Scope, Term )->
 %%  ?LOGINFO("try lock"),
-%%  try_lock( Nodes, Scope, Term ),
+%%  try_test_lock( Nodes, Scope, Term ),
 %%  timer:sleep( 1000 ),
 %%  test_loop( Nodes, Scope, Term ).
-%%
-%%try_lock( Nodes, Scope, Term )->
-%%  ecall:call_all_wait( Nodes, ?MODULE, try_test_lock, [Nodes, Scope, Term] ).
 %%
 %%try_test_lock( Nodes, Scope, Term )->
 %%  case elock:lock( Scope, Term, _IsShared=false, _Timeout=infinity, Nodes ) of

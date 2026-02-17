@@ -98,13 +98,14 @@ ready_nodes( Locks )->
   prev
 }).
 
+-record(elock_context, {
+  counter,
+  locks
+}).
+
 in_context(Locks, Term, IsShared, Nodes, SetLock)->
 
-  HeldLocks =
-    case get('$elock$') of
-      _Held when is_list(_Held)-> _Held;
-      _->[]
-    end,
+  #elock_context{counter = Counter, locks = HeldLocks} = get_context(),
 
   NodesToLock =
     Nodes -- [N || {L,T,N,S} <-  HeldLocks,
@@ -114,8 +115,13 @@ in_context(Locks, Term, IsShared, Nodes, SetLock)->
     ],
   if
     length(NodesToLock)=:=0->
-      % The term is already locked
-      {ok,fun()-> ok end};
+      set_context(Counter + 1, HeldLocks),
+      Unlock =
+        fun() ->
+          clear_context(),
+          ok
+        end,
+      {ok, Unlock};
     true->
       Lock = #lock{
         locks = Locks,
@@ -130,21 +136,12 @@ in_context(Locks, Term, IsShared, Nodes, SetLock)->
       case SetLock( Lock ) of
         {ok, Lockers}->
           AddedLocks = [{Locks,Term,N,IsShared} || N <- NodesToLock],
-          put('$elock$', HeldLocks ++ AddedLocks),
+          set_context(Counter + 1, HeldLocks ++ AddedLocks),
 
           Unlock =
             fun()->
               [ catch Locker ! {unlock, LockRef} || {Locker, LockRef} <- Lockers ],
-              case erase('$elock$') of
-                UnlockHeldLocks when is_list(UnlockHeldLocks)->
-                  case UnlockHeldLocks -- AddedLocks of
-                    []->ok;
-                    RestLocks->
-                      put('$elock$',RestLocks)
-                  end;
-                _->
-                  why
-              end,
+              clear_context(AddedLocks),
               ok
             end,
           {ok, Unlock};
@@ -798,6 +795,37 @@ wait_consistency([{PID, Ref}|Rest], Locker)->
   end;
 wait_consistency([], _Locker)->
   ok.
+  
+get_context() ->
+  case get('$elock$') of
+    #elock_context{} = Context ->
+      Context;
+    _Other ->
+      #elock_context{
+        counter = 0,
+        locks = []
+      }
+  end.
+  
+set_context(Counter, Locks) ->
+  put(
+    '$elock$',
+    #elock_context{
+      counter = Counter,
+      locks = Locks
+    }
+  ).
+
+clear_context() ->
+  clear_context([]).
+clear_context(ReleasedLocks) ->
+  case get_context() of
+    #elock_context{counter = Counter, locks = Locks} when Counter > 1 ->
+      set_context(Counter - 1, Locks -- ReleasedLocks);
+    #elock_context{} ->
+      erase('$elock$'),
+      ok
+  end.
 
 %%test()->
 %%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1','n4@127.0.0.1','n5@127.0.0.1'],

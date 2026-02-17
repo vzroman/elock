@@ -95,7 +95,8 @@ ready_nodes( Locks )->
   deadlock_scope,
   deadlock,
   has_share,
-  prev
+  prev,
+  old_lockers = []
 }).
 
 in_context(Locks, Term, IsShared, Nodes, SetLock)->
@@ -227,10 +228,9 @@ set_lock(#lock{
   % I want to know if you die
   erlang:monitor(process, Holder),
 
-  % Upgrade check
-  [ catch Locker ! {upgrade,Holder} || Locker <- registered_locks( Locks, Term, Holder ) ],
+  OldLockers = registered_locks( Locks, Term, Holder ),
 
-  enqueue( Lock#lock{ nodes = Nodes--[node()] }).
+  enqueue( Lock#lock{ nodes = Nodes--[node()], old_lockers = OldLockers }).
 
 enqueue(#lock{
   locks = Locks,
@@ -361,12 +361,18 @@ claim_next(#lock{
   locks = Locks,
   lock_ref = LockRef,
   queue = MyQueue,
-  shared = IsShared
+  shared = IsShared,
+  old_lockers = OldLockers,
+  holder = Holder
 }=Lock)->
   Prev = get_queue_pid(Locks, ?queue(LockRef, MyQueue-1) ),
   ?LOGDEBUG("~p queue:~p prev:~p",[ LockRef, MyQueue, Prev ]),
   monitor(process, Prev),
   Prev ! {next, LockRef, self()},
+  case lists:member(Prev, OldLockers) of
+    true -> catch Prev ! {upgrade, Holder};
+    false -> ok
+  end,
   if
     IsShared ->
       Prev ! {wait_share, LockRef, self()};
@@ -397,6 +403,7 @@ wait_lock(#lock{
   term = Term,
   shared = IsShared,
   deadlock = Deadlock,
+  old_lockers = OldLockers,
   prev = Prev
 } = Lock)->
   receive
@@ -411,6 +418,10 @@ wait_lock(#lock{
         NewPrev ->
           % Keep waiting
           ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
+          case lists:member(Prev, OldLockers) of
+            true -> catch Prev ! {upgrade, Holder};
+            false -> ok
+          end,
           wait_lock( Lock#lock{ prev = NewPrev })
       end;
     {take_share,LockRef} when IsShared->
@@ -798,6 +809,12 @@ wait_consistency([{PID, Ref}|Rest], Locker)->
   end;
 wait_consistency([], _Locker)->
   ok.
+
+send_upgrade(Prev, Lockers, Holder) ->
+  case lists:member(Prev, Lockers) of
+    true -> catch Prev ! {upgrade, Holder};
+    false -> ok
+  end.
 
 %%test()->
 %%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1','n4@127.0.0.1','n5@127.0.0.1'],

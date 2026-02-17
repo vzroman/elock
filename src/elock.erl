@@ -369,10 +369,7 @@ claim_next(#lock{
   ?LOGDEBUG("~p queue:~p prev:~p",[ LockRef, MyQueue, Prev ]),
   monitor(process, Prev),
   Prev ! {next, LockRef, self()},
-  case lists:member(Prev, OldLockers) of
-    true -> catch Prev ! {upgrade, Holder};
-    false -> ok
-  end,
+  send_upgrade(Prev, OldLockers, Holder),
   if
     IsShared ->
       Prev ! {wait_share, LockRef, self()};
@@ -418,10 +415,7 @@ wait_lock(#lock{
         NewPrev ->
           % Keep waiting
           ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
-          case lists:member(Prev, OldLockers) of
-            true -> catch Prev ! {upgrade, Holder};
-            false -> ok
-          end,
+          send_upgrade(Prev, OldLockers, Holder),
           wait_lock( Lock#lock{ prev = NewPrev })
       end;
     {take_share,LockRef} when IsShared->

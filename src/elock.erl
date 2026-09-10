@@ -83,6 +83,7 @@ ready_nodes( Locks )->
 
 
 -record(lock,{
+  ref,
   locks,
   term,
   reply_to,
@@ -106,58 +107,66 @@ in_context(Locks, Term, IsShared, Nodes, SetLock)->
       _->[]
     end,
 
-  NodesToLock =
-    Nodes -- [N || {L,T,N,S} <-  HeldLocks,
-      (L=:=Locks)
-      andalso T=:=Term
-      andalso (S=:=IsShared) % If the holder already holds the term but the lock is of different type the Locker will receive {upgrade, Holder}
-    ],
-  if
-    length(NodesToLock)=:=0->
-      % The term is already locked
-      {ok,fun()-> ok end};
-    true->
-      Lock = #lock{
-        locks = Locks,
-        deadlock_scope = ?deadlock_scope(Locks),
-        term = Term,
-        holder = self(),
-        shared = IsShared,
-        held = [{T,N} || {_L,T,N,_S} <- HeldLocks] ,
-        nodes = NodesToLock,
-        has_share = undefined
-      },
-      case SetLock( Lock ) of
-        {ok, Lockers}->
-          AddedLocks = [{Locks,Term,N,IsShared} || N <- NodesToLock],
-          put('$elock$', HeldLocks ++ AddedLocks),
+  Lock = #lock{
+    locks = Locks,
+    deadlock_scope = ?deadlock_scope(Locks),
+    term = Term,
+    holder = self(),
+    shared = IsShared,
+    held = [{T,N} || {_L,T,N,_S} <- HeldLocks] ,
+    nodes = Nodes,
+    has_share = undefined
+  },
+  case SetLock( Lock ) of
+    {ok, Lockers}->
+      AddedLocks = [{Locks,Term,N,IsShared} || N <- Nodes],
+      put('$elock$', HeldLocks ++ AddedLocks),
 
-          Unlock =
-            fun()->
-              [ catch Locker ! {unlock, LockRef} || {Locker, LockRef} <- Lockers ],
-              case erase('$elock$') of
-                UnlockHeldLocks when is_list(UnlockHeldLocks)->
-                  case UnlockHeldLocks -- AddedLocks of
-                    []->ok;
-                    RestLocks->
-                      put('$elock$',RestLocks)
-                  end;
-                _->
-                  why
-              end,
-              ok
-            end,
-          {ok, Unlock};
-        Error->
-          Error
-      end
+      Unlock =
+        fun()->
+          [ catch Locker ! {unlock, LockRef} || {Locker, LockRef} <- Lockers ],
+          case erase('$elock$') of
+            UnlockHeldLocks when is_list(UnlockHeldLocks)->
+              case UnlockHeldLocks -- AddedLocks of
+                []->ok;
+                RestLocks->
+                  put('$elock$',RestLocks)
+              end;
+            _->
+              why
+          end,
+          ok
+        end,
+      {ok, Unlock};
+    Error->
+      Error
   end.
 
-do_lock(Lock, Timeout)->
+do_lock(
+    #lock{
+      locks = Locks,
+      term = Term,
+      holder = Holder
+    }=Lock0,
+    Timeout
+)->
 
+  Ref = make_ref(),
   ReplyTo = self(),
+  Lock = Lock0#lock{
+    ref = Ref,
+    reply_to = ReplyTo
+  },
+
+  % Upgrade check
   Locker =
-    spawn_link(fun()-> set_lock(Lock#lock{reply_to = ReplyTo}) end),
+    case registered_locks(Locks, Term, Holder ) of
+      [ ExistingLocker ] ->
+        ExistingLocker ! {upgrade,Lock},
+        ExistingLocker;
+      []->
+          spawn_link(fun()-> set_lock(Lock) end)
+    end,
 
   receive
     {locked, Locker, LockRef}->
@@ -168,7 +177,7 @@ do_lock(Lock, Timeout)->
       {error,Reason}
   after
     Timeout->
-      Locker ! {timeout, ReplyTo},
+      Locker ! {timeout, Ref},
       {error, timeout}
   end.
 
@@ -216,8 +225,6 @@ do_lock(Lock, Timeout)->
 %-------------------SET LOCK-----------------------------
 
 set_lock(#lock{
-  locks = Locks,
-  term = Term,
   holder = Holder,
   nodes = Nodes
 }=Lock)->
@@ -226,9 +233,6 @@ set_lock(#lock{
 
   % I want to know if you die
   erlang:monitor(process, Holder),
-
-  % Upgrade check
-  [ catch Locker ! {upgrade,Holder} || Locker <- registered_locks( Locks, Term, Holder ) ],
 
   enqueue( Lock#lock{ nodes = Nodes--[node()] }).
 
@@ -289,10 +293,10 @@ locked(#lock{
   ok.
 
 wait_unlock(#lock{
+  ref = Ref,
   term = Term,
   lock_ref = LockRef,
   holder = Holder,
-  reply_to = ReplyTo,
   shared = IsShared
 }=Lock )->
   Locker = self(),
@@ -306,7 +310,7 @@ wait_unlock(#lock{
     {upgrade,Holder}->
       ?LOGDEBUG("~p holder ~p ugrade, locker ~p unlock",[ Term, Holder, Locker ]),
       unlock( Lock );
-    {timeout, ReplyTo}->
+    {timeout, Ref}->
       ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
       unlock( Lock );
     {'DOWN', _Ref, process, Holder, Reason}->
@@ -391,6 +395,7 @@ claim_wait(#lock{
 
 
 wait_lock(#lock{
+  ref = Ref,
   lock_ref = LockRef,
   holder = Holder,
   reply_to = ReplyTo,
@@ -421,7 +426,7 @@ wait_lock(#lock{
       ?LOGDEBUG("~p hodler ~p deadlock",[Term,Holder]),
       ReplyTo ! {deadlock, self()},
       leave_queue( Lock );
-    {timeout, ReplyTo}->
+    {timeout, Ref}->
       ?LOGDEBUG("~p waiter ~p timeout",[Term,Holder]),
       % Stop deadlock checker
       catch Deadlock ! { stop, self() },
@@ -438,9 +443,9 @@ wait_lock(#lock{
   end.
 
 wait_shared_lock(#lock{
+  ref = Ref,
   term = Term,
   lock_ref = LockRef,
-  reply_to = ReplyTo,
   holder = Holder,
   prev = Prev
 }=Lock )->
@@ -458,7 +463,7 @@ wait_shared_lock(#lock{
     {wait_share, LockRef, NextLocker}->
       NextLocker ! {take_share,LockRef},
       wait_shared_lock( Lock );
-    {timeout, ReplyTo}->
+    {timeout, Ref}->
       ?LOGDEBUG("~p hodler ~p timeout after shared lock",[Term,Holder]),
       leave_queue( Lock );
     {'DOWN', _, process, Holder, Reason}->

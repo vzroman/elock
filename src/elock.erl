@@ -521,8 +521,11 @@ leave_queue(#lock{
   end;
 leave_queue(#lock{
   locks = Locks,
+  term = Term,
+  holder = Holder,
   lock_ref = LockRef,
   queue = MyQueue,
+  deadlock_scope = DeadLockScope,
   has_share = true,
   prev = Prev
 }=Lock)->
@@ -530,6 +533,7 @@ leave_queue(#lock{
   receive
     {next, LockRef, _Next}->
       ?LOGDEBUG("~p next process has claimed, exit",[ LockRef ]),
+      unregister_lock( Locks, DeadLockScope, Term, Holder ),
       catch ets:delete(Locks,?queue(LockRef,MyQueue)),
       exit(normal);
     {'DOWN', _, process, Prev, _Reason}->

@@ -241,12 +241,15 @@ handle_request(
       queue = Queue
     } = Request,
     #state{
-      last = Last0
+      last = Last
     } = State0
-) when Last0+1 =:= Queue->
+) when (Last+1) =:= Queue->
 
   State = add_request(Request, State0),
-  handle_postponed(State);
+
+  handle_postponed(State#state{
+    last = Queue
+  });
 
 handle_request(
     Request,
@@ -258,6 +261,23 @@ handle_request(
     postponed = ordsets:add_element(Request, Postponed)
   }.
 
+handle_postponed(#state{
+  postponed = [#request{
+    queue = Queue
+  } = Request|Rest],
+  last = Last
+} = State0)
+  when Last+1 =:= Queue->
+
+  State = add_request(Request, State0),
+
+  handle_postponed(State#state{
+    postponed = Rest,
+    last = Queue
+  });
+
+handle_postponed(State)->
+  State.
 
 add_request(
     Request,

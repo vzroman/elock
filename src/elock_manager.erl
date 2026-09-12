@@ -7,9 +7,29 @@
 %%	API
 %%=================================================================
 -export([
-  lock/2,
+  lock/1,
   unlock/1
 ]).
+
+
+-record(locked,{
+  ref
+}).
+
+-record(unlock,{
+  manager,
+  ref
+}).
+
+-record(deadlock,{
+  ref
+}).
+
+-record(timeout,{
+  ref
+}).
+
+
 
 %-----------Lock request------------------------------------------
 lock(#request{
@@ -17,8 +37,7 @@ lock(#request{
   scope = Scope,
   term = Term,
   client = Client
-} = Request,
-    Timeout
+} = Request
 )->
   LockKey = ?lock(Term),
   case ets:update_counter(Scope, LockKey, {3,1}, {LockKey,0,0}) of % try to set lock
@@ -27,28 +46,32 @@ lock(#request{
       Manager = start_manager(Request),
       ?LOGDEBUG("~p set local lock: client ~p, manager ~p",[Term, Client, Manager]),
 
-      {ok, {Manager, Ref}};
+      {ok, #unlock{
+        manager = Manager,
+        ref = Ref
+      }};
 
     RequestQueue->
       %------------enqueued-------------------
       Manager = get_manager(Scope, LockKey),
       ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, request queue ~p",[Term, Client, Manager, RequestQueue]),
 
-      Manager ! {lock, Request#request{ queue = RequestQueue }},
+      Manager ! Request#request{ queue = RequestQueue },
       receive
-        {locked, Ref}->
-          {ok, {Manager, Ref}};
-        {deadlock, Ref}->
-          {error, deadlock}
-      after
-        Timeout->
-          Manager ! {timeout, Ref},
+        #locked{ref = Ref}->
+          {ok, #unlock{
+            manager = Manager,
+            ref = Ref
+          }};
+        #deadlock{ref = Ref}->
+          {error, deadlock};
+        #timeout{ref = Ref}->
           {error, timeout}
       end
   end.
 
-unlock({Manager, Ref})->
-  catch Manager ! {unlock, Ref},
+unlock(#unlock{manager = Manager}=Unlock)->
+  catch Manager ! Unlock,
   ok.
 
 get_manager(Scope, LockKey)->
@@ -76,14 +99,18 @@ start_manager(Request)->
   lock_key,
   can_share,
   deadlock_scope,
-  last
+  last,
+  barging
 }).
 
 -record(req,{
   client,
+  ref,
   reply_to,
   shared,
-  has_lock
+  has_lock,
+  deadlock,
+  timer
 }).
 
 -record(client,{
@@ -109,9 +136,12 @@ init(#request{
     requests = #{
       Ref => #req{
         client = Client,
+        ref = Ref,
         reply_to = ReplyTo,
         shared = Shared,
-        has_lock = true
+        has_lock = true,
+        deadlock = undefined,
+        timer = undefined
       }
     },
     clients = #{
@@ -125,7 +155,8 @@ init(#request{
     lock_key = LockKey,
     can_share = Shared,
     deadlock_scope = ?deadlock_scope(Scope),
-    last = 1
+    last = 1,
+    barging = undefined
   },
 
   loop(State).
@@ -134,15 +165,15 @@ init(#request{
 loop(State0)->
   State =
     receive
-      {unlock, Ref}->
+      #unlock{ref = Ref}->
         handle_unlock(Ref, State0);
-      {lock, Request}->
+      #request{} = Request->
         handle_request(Request, State0);
       {timeout, Ref}->
         handle_timeout(State0);
       {'DOWN', _Ref, process, Holder, _Reason}->
         handle_down(Holder, State0);
-      {deadlock, Ref}->
+      #deadlock{ref = Ref}->
         handle_deadlock(Ref, State0);
       Unexpected->
         ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
@@ -197,436 +228,252 @@ handle_unlock(
       requests = Requests
     } = State
 )->
-  if
-    is_map_key(Ref, Requests)->
-      remove_request(Ref, State);
-    true ->
+  case Requests of
+    #{ Ref := Req}->
+      remove_request(Req, State);
+    _->
       % unexpected request ref
       State
   end.
 
+handle_request(
+    #request{
+      queue = Queue
+    } = Request,
+    #state{
+      last = Last0
+    } = State0
+) when Last0+1 =:= Queue->
+
+  State = add_request(Request, State0),
+  handle_postponed(State);
+
+handle_request(
+    Request,
+    #state{
+      postponed = Postponed
+    } = State
+)->
+  State#state{
+    postponed = ordsets:add_element(Request, Postponed)
+  }.
+
+
+add_request(
+    Request,
+    State0
+)->
+  todo.
+
 %---------------------------------------------------------
-%   Remove a holder
+%   Remove a queued request
 %---------------------------------------------------------
 remove_request(
-    Ref,
+    #req{has_lock = false} = Req,
+    State0
+)->
+  State = dequeue(Req, State0),
+  next(State);
+
+%---------------------------------------------------------
+%   Remove a holding request
+%---------------------------------------------------------
+remove_request(
+    #req{has_lock = true} = Req,
+    State0
+)->
+  State = unlocked(Req, State0),
+  next(State).
+
+stop_waiting(#req{
+  deadlock = Deadlock,
+  timer = Timeout
+} = Req)->
+  catch Deadlock ! {stop, Deadlock},
+  catch erlang:cancel_timer(Timeout),
+  Req#req{
+    deadlock = undefined,
+    timer = undefined
+  }.
+
+enqueue(
+    #request{
+      shared = true
+    },
+    #state{
+      can_share = true
+    }
+)->
+  todo.
+
+dequeue(
+    #req{
+      client = ClientPID,
+      ref = Ref
+    } = Req,
+    #state{
+      requests = Requests0,
+      clients = Clients0,
+      queue = Queue0
+    } = State
+)->
+  stop_waiting(Req),
+  Requests = maps:remove(Ref, Requests0),
+  Clients = remove_client_request(ClientPID, Ref, Clients0),
+
+  Queue = Queue0 -- [Ref],
+
+  State#state{
+    queue = Queue,
+    requests = Requests,
+    clients = Clients
+  }.
+
+locked(
+    #req{
+      ref = Ref,
+      reply_to = ReplyTo,
+      shared = Shared
+    } = Req0,
     #state{
       holders = Holders0,
-      queue = [],
-      requests = Requests0,
-      clients = Clients0,
-      can_share = false
-    } = State0
-)->
+      queue = Queue0,
+      requests = Requests0
+    } = State)->
 
+  ReplyTo ! #locked{ref = Ref},
+  Req = stop_waiting(Req0#req{
+    has_lock = true,
+    reply_to = undefined
+  }),
 
-%---------------------------------------------------------
-%   The head holder
-%---------------------------------------------------------
-remove_request(
-    Ref,
+  % TODO. Register lock
+
+  Requests = Requests0#{
+    Ref => Req
+  },
+  Holders = Holders0 ++ [Ref],
+  Queue = Queue0 -- [Ref],
+
+  State#state{
+    holders = Holders,
+    queue = Queue,
+    requests = Requests,
+    can_share = Shared
+  }.
+
+unlocked(
+    #req{
+      client = ClientPID,
+      ref = Ref,
+      shared = Shared
+    },
     #state{
-      holders = [Ref|RestHolders],
-      requests = Requests0,
       clients = Clients0,
-      can_share = CanShare
-    } = State0
+      holders = Holders0,
+      requests = Requests0,
+      can_share = CanShare0
+    } = State
 )->
-  {Req, Requests} = maps:take(Ref, Requests0),
+
+  % TODO. Unregister lock
+
+  Clients = remove_client_request(ClientPID, Ref, Clients0),
+  Holders = Holders0 -- [Ref],
+  Requests = maps:remove(Ref, Requests0),
+  CanShare =
+    if
+      CanShare0; Shared ->
+        CanShare0;
+      true ->
+        can_share(Holders, Requests)
+    end,
+
+  State#state{
+    holders = Holders,
+    requests = Requests,
+    clients = Clients,
+    can_share = CanShare
+  }.
 
 
-  Clients = remove_client_request(Req, Clients0),
+remove_client_request(ClientPID, Ref, Clients0)->
+  Client0 = maps:get(ClientPID, Clients0),
+  #client{
+    requests = Requests0,
+    monitor_ref = MonRef
+  } = Client0,
 
-
-
-
-set_lock(#lock{
-  holder = Holder,
-  nodes = Nodes
-}=Lock)->
-
-  process_flag(trap_exit,true),
-
-  % I want to know if you die
-  erlang:monitor(process, Holder),
-
-  enqueue( Lock#lock{ nodes = Nodes--[node()] }).
-
-enqueue(#lock{
-  locks = Locks,
-  term = Term,
-  holder = Holder
-} = Lock) ->
-
-  Locker = self(),
-
-  case ets:update_counter(Locks, ?lock(Term), {3,1}, {?lock(Term),0,0}) of % try to set lock
-    1-> %------------------locked------------------
-      ?LOGDEBUG("~p set local lock: holder ~p, locker ~p",[ Term, Holder, Locker ]),
-
-      LockRef = make_ref(),
-      ets:update_element(Locks, ?lock(Term), {2,LockRef}),
-
-      Lock1 = Lock#lock{ lock_ref = LockRef, queue = 1 },
-
-      ets:insert(Locks,{?queue(LockRef,1), self()}),
-
-      locked( Lock1 ),
-      wait_unlock( Lock1 );
-
-    MyQueue-> %------------queued-------------------
-
-      ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, queue ~p",[Term, Holder, Locker, MyQueue]),
-
-      LockRef = get_lock_ref(Locks,?lock(Term)),
-
-      claim_queue( Lock#lock{ lock_ref=LockRef, queue= MyQueue } )
-
+  case Requests0 -- [Ref] of
+    [] ->
+      erlang:demonitor(MonRef),
+      maps:remove(ClientPID, Clients0);
+    Requests->
+      Client = Client0#client{
+        requests = Requests
+      },
+      Clients0#{
+        ClientPID => Client
+      }
   end.
 
-locked(#lock{
-  locks = Locks,
-  reply_to = ReplyTo,
-  lock_ref = LockRef,
-  term = Term,
-  holder = Holder,
-  shared = IsShared,
-  deadlock_scope = DeadLockScope,
-  deadlock = Deadlock
-})->
-
-  ?LOGDEBUG("~p locked by ~p shared ~p",[Term,Holder,IsShared]),
-
-  % Stop deadlock checker (if it was started)
-  catch Deadlock ! { stop, self() },
-
-  elock_deadlock:register_lock( Locks, DeadLockScope, Term, Holder ),
-
-  % Locked
-  unlink(ReplyTo),
-  ReplyTo ! {locked, self(), LockRef},
-
-  ok.
-
-wait_unlock(#lock{
-  ref = Ref,
-  term = Term,
-  lock_ref = LockRef,
-  holder = Holder,
-  shared = IsShared
-}=Lock )->
-  Locker = self(),
-  receive
-    {unlock, LockRef}->
-      ?LOGDEBUG("~p try unlock, holder ~p, locker ~p",[ Term, Holder, Locker ]),
-      unlock( Lock );
-    {wait_share, LockRef, NextLocker} when IsShared->
-      NextLocker ! {take_share,LockRef},
-      wait_unlock( Lock);
-    {upgrade,Holder}->
-      ?LOGDEBUG("~p holder ~p ugrade, locker ~p unlock",[ Term, Holder, Locker ]),
-      unlock( Lock );
-    {timeout, Ref}->
-      ?LOGDEBUG("~p holder ~p timeout, locker ~p unlock",[ Term, Holder, Locker ]),
-      unlock( Lock );
-    {'DOWN', _Ref, process, Holder, Reason}->
-      ?LOGDEBUG("~p holder ~p down, reason ~p locker ~p unlock",[ Term, Holder, Reason, Locker ]),
-      unlock( Lock )
-  end.
-
-unlock(#lock{
-  locks = Locks,
-  term = Term,
-  holder = Holder,
-  lock_ref = LockRef,
-  deadlock_scope = DeadLockScope,
-  queue = MyQueue
-})->
-
-  ?LOGDEBUG("~p unlocking by ~p",[Term,Holder]),
-
-  elock_deadlock:unregister_lock( Locks, DeadLockScope, Term, Holder ),
-
-  % try to remove the lock
-  ets:delete_object(Locks, {?lock(Term), LockRef, MyQueue}),
-  % check unlocked
-  case ets:lookup(Locks, ?lock(Term)) of
-    [{_,LockRef,_}]-> % not unlocked there is a queue
-      % wait for the next to claim the queue
-      receive {next, LockRef, _Next} -> ok end;
-    _->  % unlocked, nobody is waiting
-      ?LOGDEBUG("~p unlocked",[Term]),
-      ok
-  end,
-
-  catch ets:delete(Locks,?queue(LockRef,MyQueue)),
-  exit(normal).
-
-claim_queue(#lock{
-  locks = Locks,
-  lock_ref = LockRef,
-  queue = MyQueue
-}=Lock)->
-
-  % Register the queue
-  ets:insert(Locks,{?queue(LockRef,MyQueue), self()}),
-
-  % Notify the previous
-  Lock1 = claim_next( Lock ),
-
-  % Init waiting
-  claim_wait( Lock1 ).
-
-claim_next(#lock{
-  locks = Locks,
-  lock_ref = LockRef,
-  queue = MyQueue,
-  shared = IsShared
-}=Lock)->
-  Prev = get_queue_pid(Locks, ?queue(LockRef, MyQueue-1) ),
-  ?LOGDEBUG("~p queue:~p prev:~p",[ LockRef, MyQueue, Prev ]),
-  monitor(process, Prev),
-  Prev ! {next, LockRef, self()},
-  if
-    IsShared ->
-      Prev ! {wait_share, LockRef, self()};
-    true ->
-      ignore
-  end,
-  Lock#lock{ prev = Prev }.
-
-claim_wait(#lock{
-  locks = Locks,
-  term = Term,
-  holder = Holder,
-  held = HeldLocks,
-  nodes = Nodes,
-  deadlock_scope = DeadLockScope
-}=Lock)->
-
-  % Init deadlock check process
-  Deadlock = elock_deadlock:check_deadlock(Locks, DeadLockScope, Holder ,Term, Nodes, HeldLocks ),
-
-  wait_lock( Lock#lock{ deadlock = Deadlock }).
-
-
-wait_lock(#lock{
-  ref = Ref,
-  lock_ref = LockRef,
-  holder = Holder,
-  reply_to = ReplyTo,
-  term = Term,
-  shared = IsShared,
-  deadlock = Deadlock,
-  prev = Prev
-} = Lock)->
-  receive
-    {'DOWN', _, process, Prev, _Reason}->
-      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
-      case update_prev( Lock ) of
-        undefined ->
-          % The lock is free
-          ?LOGDEBUG("~p no previous processes, get the lock",[ LockRef ]),
-          locked( Lock ),
-          wait_unlock( Lock );
-        NewPrev ->
-          % Keep waiting
-          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
-          wait_lock( Lock#lock{ prev = NewPrev })
-      end;
-    {take_share,LockRef} when IsShared->
-      ?LOGDEBUG("~p got shared lock",[ LockRef ]),
-      locked( Lock ),
-      wait_shared_lock( Lock#lock{ has_share = true } );
-    {deadlock, Deadlock}->
-      ?LOGDEBUG("~p hodler ~p deadlock",[Term,Holder]),
-      ReplyTo ! {deadlock, self()},
-      leave_queue( Lock );
-    {timeout, Ref}->
-      ?LOGDEBUG("~p waiter ~p timeout",[Term,Holder]),
-      % Stop deadlock checker
-      catch Deadlock ! { stop, self() },
-      % Holder is not waiting anymore, but I can't brake the queue
-      leave_queue( Lock );
-    {'DOWN', _, process, Holder, Reason}->
-      ?LOGDEBUG("~p holder ~p died while waiting, reason ~p",[Term,Holder,Reason]),
-      catch Deadlock ! { stop, self() },
-      leave_queue( Lock );
-    {'EXIT', ReplyTo, Reason}->
-      ?LOGDEBUG("~p reply_to ~p died while waiting, reason ~p",[Term,ReplyTo,Reason]),
-      catch Deadlock ! { stop, self() },
-      leave_queue( Lock )
-  end.
-
-wait_shared_lock(#lock{
-  ref = Ref,
-  term = Term,
-  lock_ref = LockRef,
-  holder = Holder,
-  prev = Prev
-}=Lock )->
-  receive
-    {'DOWN', _, process, Prev, _Reason}->
-      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
-      case update_prev( Lock ) of
-        undefined ->
-          ?LOGDEBUG("~p no previous processes, wait unlock",[ LockRef ]),
-          wait_unlock( Lock );
-        NewPrev ->
-          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
-          wait_shared_lock( Lock#lock{ prev = NewPrev })
-      end;
-    {wait_share, LockRef, NextLocker}->
-      NextLocker ! {take_share,LockRef},
-      wait_shared_lock( Lock );
-    {timeout, Ref}->
-      ?LOGDEBUG("~p hodler ~p timeout after shared lock",[Term,Holder]),
-      leave_queue( Lock );
-    {'DOWN', _, process, Holder, Reason}->
-      ?LOGDEBUG("~p holder ~p died having shared lock, reason ~p",[Term,Holder,Reason]),
-      leave_queue( Lock )
-  end.
-
-update_prev(#lock{
-  locks = Locks,
-  lock_ref = LockRef,
-  queue = Queue,
-  shared = IsShared
-})->
-  case find_prev( Locks, LockRef, Queue ) of
-    undefined ->
-      undefined;
-    Prev ->
-      % An intermediate process has left the queue
-      monitor(process, Prev),
-      if
-        IsShared ->
-          Prev ! {wait_share, LockRef, self()};
-        true ->
-          ignore
-      end,
-      Prev
-  end.
-
-%-----------------Leave queue------------------------------------------
-leave_queue(#lock{
-  locks = Locks,
-  lock_ref = LockRef,
-  queue = MyQueue,
-  prev = Prev,
-  has_share = HasShare
-}=Lock) when HasShare =/= true->
-  ?LOGDEBUG("~p enter leave queue has share: ~p",[ LockRef, HasShare ]),
-  receive
-    {next, LockRef, _Next}->
-      ?LOGDEBUG("~p next process has claimed, exit",[ LockRef ]),
-      catch ets:delete(Locks,?queue(LockRef,MyQueue)),
-      exit(normal);
-    {'DOWN', _, process, Prev, _Reason}->
-      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
-      case update_prev( Lock ) of
-        undefined ->
-          ?LOGDEBUG("~p no previous processes, unlock",[ LockRef ]),
-          unlock(Lock);
-        NewPrev ->
-          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
-          leave_queue( Lock#lock{ prev = NewPrev })
-      end;
-    {take_share,LockRef}->
-      leave_queue( Lock#lock{ has_share = true } )
+can_share([Ref|Rest], Requests)->
+  case Requests of
+    #{ Ref := #req{ shared = false }} ->
+      false;
+    _->
+      can_share(Rest, Requests)
   end;
-leave_queue(#lock{
-  locks = Locks,
-  term = Term,
-  holder = Holder,
-  lock_ref = LockRef,
-  queue = MyQueue,
-  deadlock_scope = DeadLockScope,
-  has_share = true,
-  prev = Prev
-}=Lock)->
-  ?LOGDEBUG("~p enter leave queue has share: true",[ LockRef ]),
-  receive
-    {next, LockRef, _Next}->
-      ?LOGDEBUG("~p next process has claimed, exit",[ LockRef ]),
-      elock_deadlock:unregister_lock( Locks, DeadLockScope, Term, Holder ),
-      catch ets:delete(Locks,?queue(LockRef,MyQueue)),
-      exit(normal);
-    {'DOWN', _, process, Prev, _Reason}->
-      ?LOGDEBUG("~p prev ~p is down",[ LockRef, Prev ]),
-      case update_prev( Lock ) of
-        undefined ->
-          ?LOGDEBUG("~p no previous processes, unlock",[ LockRef ]),
-          unlock(Lock);
-        NewPrev ->
-          ?LOGDEBUG("~p update previous process ~p",[ LockRef, NewPrev ]),
-          leave_queue( Lock#lock{ prev = NewPrev })
-      end;
-    {wait_share, LockRef, NextLocker}->
-      NextLocker ! {take_share,LockRef},
-      leave_queue( Lock )
-  end.
+can_share([], _Requests)->
+  true.
 
-%-----------------------------------------------------------------------
-% Queue utilities
-%-----------------------------------------------------------------------
-get_lock_ref( Locks, Lock )->
-  case ets:lookup( Locks, Lock ) of
-    [ { _Lock, LockRef, _Queue } ] when is_reference(LockRef)-> LockRef;
+
+%---------------------------------------------------------
+%   Pending barging request
+%---------------------------------------------------------
+next(#state{
+  barging = #request{
+    client = ClientPID,
+    ref = Ref
+  },
+  holders = Holders,
+  clients = Clients,
+  requests = Requests
+} = State)->
+
+  #client{
+    requests = ClientRequests
+  } = maps:get(ClientPID, Clients),
+
+  case Holders -- ClientRequests of
+    [] ->
+      % the only client is holding the lock
+      Req = maps:get(Ref, Requests),
+      locked(Req, State#state{
+        barging = undefined
+      });
     _->
-      % The locker has not registered the lock yet wait
-      receive after 5 -> ok end,
-      get_lock_ref(Locks, Lock )
-  end.
+      State
+  end;
 
-get_queue_pid(Locks, Queue)->
-  case ets:lookup(Locks, Queue) of
-    [{_, PID}]-> PID;
+%---------------------------------------------------------
+%   shared lock queue
+%---------------------------------------------------------
+next(#state{
+  can_share = true,
+  queue = [Ref|_],
+  requests = Requests
+} = State0)->
+  case Requests of
+    #{Ref := #req{shared = true}} ->
+      State = locked(Ref, State0),
+      next(State);
     _->
-      % The queue isn't registered yet
-      timer:sleep(5),
-      get_queue_pid( Locks, Queue )
-  end.
-
-find_prev( Locks, LockRef, Queue )->
-  case ets:prev(Locks, ?queue(LockRef, Queue)) of
-    ?queue(LockRef, PrevQueue)->
-      case ets:lookup(Locks, ?queue(LockRef, PrevQueue)) of
-        [{_, PID}]->
-          PID;
-        _->
-          find_prev( Locks, LockRef, PrevQueue )
-      end;
-    _->
-      undefined
-  end.
-
-%%test()->
-%%  Nodes = ['n1@127.0.0.1', 'n2@127.0.0.1', 'n3@127.0.0.1','n4@127.0.0.1','n5@127.0.0.1'],
-%%  Scope = test_scope,
-%%  Term = test_term,
-%%  [spawn(N, ?MODULE, test_loop,[Nodes, Scope, Term]) || N <- Nodes].
-%%
-%%test_loop( Nodes, Scope, Term )->
-%%  ?LOGINFO("try lock"),
-%%  try_test_lock( Nodes, Scope, Term ),
-%%  timer:sleep( 1000 ),
-%%  test_loop( Nodes, Scope, Term ).
-%%
-%%try_test_lock( Nodes, Scope, Term )->
-%%  case elock:lock( Scope, Term, _IsShared=false, _Timeout=infinity, Nodes ) of
-%%    {ok, Unlock}->
-%%      ?LOGINFO("locked!"),
-%%      Unlock();
-%%    {error, Error}->
-%%      ?LOGINFO("error: ~p",[Error])
-%%  end.
+      State0
+  end;
+next(#state{can_share = false} = State)->
+  State;
+next(#state{queue = []} = State)->
+  State.
 
 
-%%  elock:start_link(test_scope).
-%%  {ok, U1} = elock:lock(test, t1, false, infinity ).
-%%  {ok, U2} = elock:lock(test, t2, false, infinity ).
-%%
-%%  spawn(fun()-> elock:lock(test, t3, false, infinity ), io:format("t3 locked\r\n"), spawn(fun()->elock:lock(test, t4, false, infinity ), io:format("t4 locked\r\n"), io:format("t1 lock: ~p\r\n",[elock:lock(test, t1, false, infinity )]) end ), timer:sleep(1000), elock:lock(test, t4, false, infinity ), io:format("t4 locked2\r\n"), timer:sleep(10000)  end).
-%%
-%%  {ok, U3} = elock:lock(test, t3, false, infinity ).

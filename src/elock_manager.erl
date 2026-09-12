@@ -279,11 +279,51 @@ handle_postponed(#state{
 handle_postponed(State)->
   State.
 
+%---------------------------------------------------------
+%   Add shared request to shared lock
+%---------------------------------------------------------
 add_request(
-    Request,
-    State0
+    #request{
+      shared = true,
+      client = ClientPID,
+      ref = Ref,
+      reply_to = ReplyTo
+    },
+    #state{
+      can_share = true,
+      queue = [],
+      clients = Clients0
+    } = State0
 )->
-  todo.
+
+  Req = #req{
+    client = ClientPID,
+    ref = Ref,
+    reply_to = ReplyTo,
+    shared = true
+  },
+
+  State = locked(Req, State0),
+  Clients = add_client_request(ClientPID, Ref, Clients0),
+
+  State#state{
+    clients = Clients
+  };
+
+add_request(
+    #request{
+      client = ClientPID
+    } = Request,
+    #state{
+      clients = Clients0
+    } = State
+)->
+  if
+    is_map_key(ClientPID, Clients0)->
+      try_barging(Request, State);
+    true ->
+      enqueue(Request, State)
+  end.
 
 %---------------------------------------------------------
 %   Remove a queued request
@@ -305,26 +345,106 @@ remove_request(
   State = unlocked(Req, State0),
   next(State).
 
+start_waiting(
+    #req{
+
+    } = Req,
+    #request{
+      client = Client,
+      ref = Ref,
+      timeout = Timeout,
+      held = HeldLocks,
+      nodes = Nodes
+    },
+    #state{
+      scope = Scope,
+      deadlock_scope = DeadlockScope,
+      lock_key = ?lock(Term)
+    })->
+
+  Timer =
+    if
+      is_integer(Timeout), Timeout > 0 ->
+        erlang:start_timer(Timeout, self(), {timeout, Ref});
+      true ->
+        undefined
+    end,
+
+  % Init deadlock check process
+  Deadlock = elock_deadlock:check_deadlock(Scope, DeadlockScope, Client ,Term, Nodes, HeldLocks),
+
+  Req#req{
+    deadlock = Deadlock,
+    timer = Timer
+  }.
+
+
+
 stop_waiting(#req{
   deadlock = Deadlock,
-  timer = Timeout
+  timer = Timer
 } = Req)->
-  catch Deadlock ! {stop, Deadlock},
-  catch erlang:cancel_timer(Timeout),
+  if
+    is_pid(Deadlock) ->
+      catch Deadlock ! {stop, Deadlock};
+    true->
+      ignore
+  end,
+  if
+    is_reference(Timer)->
+      catch erlang:cancel_timer(Timer);
+    true ->
+      ignore
+  end,
+
   Req#req{
     deadlock = undefined,
     timer = undefined
   }.
 
-enqueue(
+try_barging(
     #request{
-      shared = true
+
     },
     #state{
-      can_share = true
-    }
+
+    } = State0
 )->
   todo.
+
+enqueue(
+    #request{
+      client = ClientPID,
+      ref = Ref,
+      reply_to = ReplyTo,
+      shared = Shared
+    } = Request,
+    #state{
+      queue = Queue0,
+      requests = Requests0,
+      clients = Clients0
+    } = State
+)->
+
+  Req0 = #req{
+    client = ClientPID,
+    ref = Ref,
+    reply_to = ReplyTo,
+    shared = Shared,
+    has_lock = false
+  },
+  Req = start_waiting(Req0, Request, State),
+  Requests = Requests0#{
+    Ref => Req
+  },
+  Clients = add_client_request(ClientPID, Ref, Clients0),
+  Queue = Queue0 ++ [Ref],
+
+  State#state{
+    queue = Queue,
+    requests = Requests,
+    clients = Clients
+  }.
 
 dequeue(
     #req{
@@ -416,6 +536,24 @@ unlocked(
     can_share = CanShare
   }.
 
+
+add_client_request(ClientPID, Ref, Clients)->
+  Client =
+    case Clients of
+      #{ClientPID := Client0}->
+        #client{ requests = Requests} = Client0,
+        Client0#client{
+          requests = Requests ++ [Ref]
+        };
+      _->
+        #client{
+          requests = [Ref],
+          monitor_ref = erlang:monitor(process, ClientPID)
+        }
+    end,
+  Clients#{
+    ClientPID => Client
+  }.
 
 remove_client_request(ClientPID, Ref, Clients0)->
   Client0 = maps:get(ClientPID, Clients0),

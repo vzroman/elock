@@ -30,8 +30,7 @@
 lock(#request{
   ref = Ref,
   scope = Scope,
-  term = Term,
-  client = Client
+  term = Term
 } = Request
 )->
   LockKey = ?lock(Term),
@@ -85,13 +84,14 @@ start_manager(Request)->
   queue,
   requests,
   clients,
-  postponed,
   scope,
   lock_key,
   can_share,
   deadlock_scope,
+  barging,
   last,
-  barging
+  postponed,
+  postpone_timer
 }).
 
 -record(req,{
@@ -109,9 +109,8 @@ start_manager(Request)->
   monitor_ref
 }).
 
--record(postponed,{
-  request,
-  monitor
+-record(retry,{
+  ref
 }).
 
 init(#request{
@@ -146,13 +145,14 @@ init(#request{
         monitor_ref = erlang:monitor(process, Client)
       }
     },
-    postponed = [],
     scope = Scope,
     lock_key = LockKey,
     can_share = Shared,
     deadlock_scope = ?deadlock_scope(Scope),
+    barging = undefined,
     last = 1,
-    barging = undefined
+    postponed = [],
+    postpone_timer = undefined
   },
 
   loop(State).
@@ -171,6 +171,8 @@ loop(State0)->
         handle_deadlock(Ref, State0);
       {'DOWN', _Ref, process, ClientPID, _Reason}->
         handle_down(ClientPID, State0);
+      {timeout, _TimerRef, postpone_timeout}->
+        handle_postpone_timeout(State);
       Unexpected->
         ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
         State0
@@ -245,25 +247,61 @@ handle_request(
       queue = Queue
     } = Request,
     #state{
-      last = Last
+      last = Last,
+      postpone_timer = PostponeTimer
     } = State0
 ) when (Last+1) =:= Queue->
 
-  State = add_request(Request, State0),
+  State1 =
+    if
+      is_reference(PostponeTimer)->
+        erlang:cancel_timer(PostponeTimer),
+        State0#state{
+          postpone_timer = undefined
+        };
+      true ->
+        State0
+    end,
+
+  State = add_request(Request, State1),
 
   handle_postponed(State#state{
     last = Queue
   });
 
 handle_request(
-    #request{} = Request,
+    #request{
+      queue = Queue
+    } = Request,
     #state{
-      postponed = Postponed
+      last = Last,
+      postponed = Postponed,
+      postpone_timer = PostponeTimer0
     } = State
-)->
+) when Queue > Last->
+
+  PostponeTimer =
+    if
+      is_reference(PostponeTimer0)->
+        PostponeTimer0;
+      true->
+        erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
+    end,
+
   State#state{
-    postponed = ordsets:add_element(Request, Postponed)
-  }.
+    postponed = ordsets:add_element(Request, Postponed),
+    postpone_timer = PostponeTimer
+  };
+
+handle_request(
+    #request{
+      ref = Ref,
+      reply_to = ReplyTo
+    },
+    State
+)->
+  catch ReplyTo ! #retry{ref = Ref},
+  State.
 
 handle_timeout(
     Ref,
@@ -345,9 +383,21 @@ handle_postponed(#state{
     last = Queue
   });
 
+handle_postponed(#state{
+  postponed = [#request{
+    queue = Queue
+  }|_],
+  last = Last
+} = State0)
+  when Queue > Last->
+
+  todo;
+
 handle_postponed(State)->
   State.
 
+handle_postpone_timeout(State)->
+  todo.
 
 %---------------------------------------------------------
 %   Add a shared request to a shared lock

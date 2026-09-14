@@ -166,10 +166,10 @@ loop(State0)->
         handle_request(Request, State0);
       {timeout, Ref}->
         handle_timeout(Ref, State0);
-      {'DOWN', _Ref, process, ClientPID, _Reason}->
-        handle_down(ClientPID, State0);
       #deadlock{ref = Ref}->
         handle_deadlock(Ref, State0);
+      {'DOWN', _Ref, process, ClientPID, _Reason}->
+        handle_down(ClientPID, State0);
       Unexpected->
         ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
         State0
@@ -255,6 +255,55 @@ handle_request(
   State#state{
     postponed = ordsets:add_element(Request, Postponed)
   }.
+
+handle_timeout(
+    Ref,
+    #state{
+      requests = Requests
+    } = State0
+)->
+  case Requests of
+    #{Ref := #req{ has_lock = false } = Req}->
+      State = dequeue(Req, State0),
+      next(State);
+    _->
+      % unexpected request ref
+      State0
+  end.
+
+handle_deadlock(
+    Ref,
+    #state{
+      requests = Requests
+    } = State0
+)->
+  case Requests of
+    #{Ref := Req}->
+      #req{
+        has_lock = false,
+        reply_to = ReplyTo
+      } = Req,
+      catch ReplyTo ! #deadlock{ ref = Ref },
+      State = dequeue(Req, State0),
+      next(State);
+    _->
+      % unexpected request ref
+      State0
+  end.
+
+handle_down(
+    ClientPID,
+    #state{
+      clients = Clients
+    } = State
+)->
+  case Clients of
+    #{ ClientPID := #client{requests = Requests}}->
+      lists:foldl(fun remove_request/2, State, Requests );
+    _->
+      % unexpected PID
+      State
+  end.
 
 handle_postponed(#state{
   postponed = [#request{
@@ -401,22 +450,57 @@ dequeue(
       ref = Ref
     } = Req,
     #state{
+      barging = #request{
+        ref = Ref
+      },
+      requests = Requests0,
+      clients = Clients0
+    } = State
+)->
+  % Dequeue barging request
+  stop_waiting(Req),
+  Requests = maps:remove(Ref, Requests0),
+  Clients = remove_client_request(ClientPID, Ref, Clients0),
+
+  State#state{
+    requests = Requests,
+    clients = Clients,
+    barging = undefined
+  };
+
+dequeue(
+    #req{
+      client = ClientPID,
+      ref = Ref
+    } = Req,
+    #state{
       requests = Requests0,
       clients = Clients0,
-      queue = Queue0
-    } = State
+      queue = Queue0,
+      barging = Barging
+    } = State0
 )->
   stop_waiting(Req),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
 
-  Queue = Queue0 -- [Ref],
-
-  State#state{
-    queue = Queue,
+  State = State0#state{
     requests = Requests,
     clients = Clients
-  }.
+  },
+  case Barging of
+    #request{ ref = Ref }->
+      % Dequeue barging request
+      State#state{
+        barging = undefined
+      };
+    _->
+      State#state{
+        queue = Queue0 -- [Ref],
+        requests = Requests,
+        clients = Clients
+      }
+  end.
 
 get_lock(
     #request{

@@ -39,8 +39,6 @@ lock(#request{
     1->
       %------------------locked------------------
       Manager = start_manager(Request),
-      ?LOGDEBUG("~p set local lock: client ~p, manager ~p",[Term, Client, Manager]),
-
       {ok, #unlock{
         manager = Manager,
         ref = Ref
@@ -49,8 +47,6 @@ lock(#request{
     RequestQueue->
       %------------enqueued-------------------
       Manager = get_manager(Scope, LockKey),
-      ?LOGDEBUG("~p lock queued: holder ~p, locker ~p, request queue ~p",[Term, Client, Manager, RequestQueue]),
-
       Manager ! Request#request{ queue = RequestQueue },
       receive
         #locked{ref = Ref}->
@@ -113,6 +109,11 @@ start_manager(Request)->
   monitor_ref
 }).
 
+-record(postponed,{
+  request,
+  monitor
+}).
+
 init(#request{
   ref = Ref,
   scope = Scope,
@@ -164,7 +165,7 @@ loop(State0)->
         handle_unlock(Ref, State0);
       #request{} = Request->
         handle_request(Request, State0);
-      {timeout, Ref}->
+      {timeout, _TimerRef, {timeout, Ref}}->
         handle_timeout(Ref, State0);
       #deadlock{ref = Ref}->
         handle_deadlock(Ref, State0);
@@ -184,38 +185,20 @@ handle_unlock(
     #state{
       holders = [Ref],
       queue = [],
+      barging = undefined,
       requests = Requests,
-      clients = Clients,
-      lock_key = LockKey,
-      scope = Scope,
-      last = LastQueue
+      clients = Clients
     } = State0
 )->
 
-  % try to remove the lock
-  Self = self(),
-  ets:delete_object(Scope, {LockKey, Self, LastQueue}),
+  State = try_unlock(State0),
 
-  % check unlocked
-  case ets:lookup(Scope, LockKey) of
-    [{_,Self,_}]->
-      % not unlocked there is a queue
-      % wait for the request
+  % If here, then it's not unlocked
+  #req{client = Client} = maps:get(Ref, Requests),
+  #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
+  erlang:demonitor(MonRef),
 
-      #req{client = Client} = maps:get(Ref, Requests),
-      #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
-      erlang:demonitor(MonRef),
-
-      State0#state{
-        holders = [],
-        queue = [],
-        requests = #{},
-        clients = #{}
-      };
-    _->
-      % unlocked
-      exit(normal)
-  end;
+  State;
 
 handle_unlock(
     Ref,
@@ -229,6 +212,32 @@ handle_unlock(
     _->
       % unexpected request ref
       State
+  end.
+
+try_unlock(#state{
+  scope = Scope,
+  lock_key = LockKey,
+  last = LastQueue
+} = State)->
+  % try to remove the lock
+  Self = self(),
+  ets:delete_object(Scope, {LockKey, Self, LastQueue}),
+
+  % check unlocked
+  case ets:lookup(Scope, LockKey) of
+    [{_,Self,_}]->
+      % not unlocked there is a queue
+      % wait for the request
+      State#state{
+        holders = [],
+        queue = [],
+        requests = #{},
+        clients = #{},
+        can_share = true
+      };
+    _->
+      % unlocked
+      exit(normal)
   end.
 
 handle_request(
@@ -247,7 +256,7 @@ handle_request(
   });
 
 handle_request(
-    Request,
+    #request{} = Request,
     #state{
       postponed = Postponed
     } = State
@@ -263,7 +272,8 @@ handle_timeout(
     } = State0
 )->
   case Requests of
-    #{Ref := #req{ has_lock = false } = Req}->
+    #{Ref := #req{ has_lock = false, reply_to = ReplyTo } = Req}->
+      catch ReplyTo ! #timeout{ref = Ref},
       State = dequeue(Req, State0),
       next(State);
     _->
@@ -299,7 +309,22 @@ handle_down(
 )->
   case Clients of
     #{ ClientPID := #client{requests = Requests}}->
-      lists:foldl(fun remove_request/2, State, Requests );
+      lists:foldl(
+        fun(Ref, #state{requests = RequestsAcc} = StateAcc)->
+          Req = #req{
+            reply_to = ReplyTo
+          } = maps:get(Ref, RequestsAcc),
+          if
+            ReplyTo =/= ClientPID ->
+              exit(ReplyTo, kill);
+            true ->
+              ignore
+          end,
+          remove_request(Req, StateAcc)
+        end,
+        State,
+        Requests
+      );
     _->
       % unexpected PID
       State
@@ -340,6 +365,14 @@ add_request(
       can_share = true,
       queue = [],
       barging = undefined
+    } = State
+)->
+  get_lock(Request, State);
+
+add_request(
+    Request,
+    #state{
+      holders = []
     } = State
 )->
   get_lock(Request, State);
@@ -658,7 +691,7 @@ try_barging(
 %   Push the queue
 %---------------------------------------------------------
 %---------------------------------------------------------
-%   Case 1: There is a queued barging request
+%  There is a queued barging request
 %---------------------------------------------------------
 next(#state{
   barging = #request{
@@ -684,8 +717,30 @@ next(#state{
     _->
       State
   end;
+
 %---------------------------------------------------------
-%   case 2: The actual lock is shared. It may share
+%  Nobody is holding a lock
+%---------------------------------------------------------
+next(#state{
+  holders = [],
+  queue = [Ref|_],
+  requests = Requests
+} = State0)->
+  Req = maps:get(Ref, Requests),
+  State = locked(Req, State0),
+  next(State);
+
+%---------------------------------------------------------
+%  Nobody is holding and no queue
+%---------------------------------------------------------
+next(#state{
+  holders = [],
+  queue = []
+} = State)->
+ try_unlock(State);
+
+%---------------------------------------------------------
+%   The actual lock is shared. It may share
 %   the lock.
 %---------------------------------------------------------
 next(#state{
@@ -694,8 +749,8 @@ next(#state{
   requests = Requests
 } = State0)->
   case Requests of
-    #{Ref := #req{shared = true}} ->
-      State = locked(Ref, State0),
+    #{Ref := Req = #req{shared = true}} ->
+      State = locked(Req, State0),
       next(State);
     _->
       State0

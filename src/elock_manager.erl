@@ -554,7 +554,10 @@ handle_timeout(
   case Requests of
     #{Ref := #req{ has_lock = false, reply_to = ReplyTo } = Req}->
       catch ReplyTo ! #timeout{ref = Ref},
-      State = dequeue(Req, State0),
+      % The timer has just fired, there is nothing to cancel. Cancelling
+      % it here would cost a round trip to the scheduler that owns it -
+      % a fired timer is no longer in the manager's own timer tree
+      State = dequeue(Req#req{timer = undefined}, State0),
       next(State);
     _->
       % unexpected request ref

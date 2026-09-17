@@ -1,4 +1,34 @@
 
+%%=================================================================
+%%  One manager process per locked Term.
+%%
+%%  The lock itself is a single entry in the Scope ETS table:
+%%
+%%      { ?lock(Term), ManagerPID, LastTicket }
+%%
+%%  Taking a ticket with ets:update_counter/4 on the third element
+%%  is the only synchronization point between the clients:
+%%
+%%    * ticket 1 - the lock was free. The client is its first holder
+%%      and spawns the manager, which writes its own PID into the
+%%      entry.
+%%    * ticket N - the lock is busy. The client sends its request to
+%%      the manager and waits for the verdict: #locked{}, #deadlock{},
+%%      #timeout{} or #retry{}.
+%%
+%%  The ticket is also the ordering token. The counter serializes the
+%%  concurrent clients, but their messages may reach the manager in
+%%  any order, therefore the manager replays them strictly by the
+%%  ticket number (see handle_request/2). The queue is FIFO by the
+%%  moment of the ets:update_counter/4 call, not by the moment of the
+%%  message delivery.
+%%
+%%  Everything else belongs to the manager: it grants shared and
+%%  exclusive locks, queues the requests it can not grant, monitors
+%%  the clients, owns the timeout timers and the deadlock checkers.
+%%  It exits as soon as the lock entry is removed from ETS - the next
+%%  client will start a new manager.
+%%=================================================================
 -module(elock_manager).
 
 -include("elock.hrl").
@@ -11,12 +41,14 @@
   unlock/1
 ]).
 
-
+%%=================================================================
+%%  Client <-> manager protocol
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  The verdict on a queued request. #retry{} means the manager has
+%%  already passed the ticket by, the client has to take a new one
+%%-----------------------------------------------------------------
 -record(locked,{
-  ref
-}).
--record(unlock,{
-  manager,
   ref
 }).
 -record(deadlock,{
@@ -29,7 +61,17 @@
   ref
 }).
 
-%-----------Lock request------------------------------------------
+%%-----------------------------------------------------------------
+%%  The client's handle to the acquired lock
+%%-----------------------------------------------------------------
+-record(unlock,{
+  manager,
+  ref
+}).
+
+%%=================================================================
+%%  Client side
+%%=================================================================
 lock(#request{
   ref = Ref,
   scope = Scope,
@@ -40,6 +82,8 @@ lock(#request{
   case ets:update_counter(Scope, LockKey, {3,1}, {LockKey,0,0}) of % try to set lock
     1->
       %------------------locked------------------
+      % The lock was free. This client is its first holder and starts
+      % the manager for those who queue up behind it
       Manager = start_manager(Request),
       {ok, #unlock{
         manager = Manager,
@@ -48,6 +92,8 @@ lock(#request{
 
     RequestQueue->
       %------------enqueued-------------------
+      % Somebody is ahead. The ticket tells the manager where the
+      % request stands among the other clients
       Manager = get_manager(Scope, LockKey),
       Manager ! Request#request{ queue = RequestQueue },
       receive
@@ -61,6 +107,7 @@ lock(#request{
         #timeout{ref = Ref}->
           {error, timeout};
         #retry{ref = Ref}->
+          % The ticket is not valid any longer, start over
           lock(Request)
       end
   end.
@@ -69,6 +116,9 @@ unlock(#unlock{manager = Manager}=Unlock)->
   catch Manager ! Unlock,
   ok.
 
+%%-----------------------------------------------------------------
+%%  Client side utilities
+%%-----------------------------------------------------------------
 get_manager(Scope, LockKey)->
   case ets:lookup(Scope, LockKey) of
     [ { _Lock, Manager, _Queue } ] when is_pid(Manager)-> Manager;
@@ -78,42 +128,50 @@ get_manager(Scope, LockKey)->
       get_manager(Scope, LockKey)
   end.
 
+% Every client of the Term goes through the manager, hence the
+% priority. The off heap mailbox keeps the bursts of the incoming
+% requests out of the manager's garbage collection
 start_manager(Request)->
   spawn_opt(fun()->init(Request) end, [
     {priority, high},
     {message_queue_data, off_heap}
   ]).
 
+%%=================================================================
+%%  Manager
+%%=================================================================
 -record(state,{
-  holders,
-  queue,
-  requests,
-  clients,
-  scope,
-  lock_key,
-  can_share,
-  deadlock_scope,
-  barging,
-  last,
-  postponed,
-  postpone_timer
+  holders,          % refs of the requests holding the lock
+  queue,            % refs of the waiting requests, FIFO
+  requests,         % #{ Ref => #req{} }, both holders and waiters
+  clients,          % #{ ClientPID => #client{} }
+  scope,            % the ETS table of the locks
+  lock_key,         % ?lock(Term)
+  can_share,        % the lock is shared, i.e. every holder is shared
+  deadlock_scope,   % pg scope of the deadlock checkers
+  barging,          % the pending upgrade request, it is out of the queue
+  last,             % the last ticket taken into the queue
+  postponed,        % the requests that came before their turn
+  postpone_timer    % set while waiting for a missing ticket
 }).
 
 -record(req,{
-  client,
-  ref,
-  reply_to,
-  shared,
-  has_lock,
-  deadlock,
-  timer
+  client,           % the process that asked for the lock
+  ref,              % unique reference of the request
+  reply_to,         % the process waiting for the verdict
+  shared,           % the requested lock type
+  has_lock,         % true - holds the lock, false - waits in the queue
+  deadlock,         % the deadlock checker, only while waiting
+  timer             % the timeout timer, only while waiting
 }).
 
 -record(client,{
-  requests,
-  monitor_ref
+  requests,         % refs of all the requests of the client
+  monitor_ref       % one monitor per client, while it has requests
 }).
 
+% The manager is spawned by the winner of the ets:update_counter/4
+% race, therefore it starts with the lock already held
 init(#request{
   ref = Ref,
   scope = Scope,
@@ -124,6 +182,7 @@ init(#request{
 })->
 
   LockKey = ?lock(Term),
+  % From now on the queued clients can find the manager
   ets:update_element(Scope, LockKey, {2,self()}),
 
   State = #state{
@@ -180,69 +239,17 @@ loop(State0)->
     end,
   loop( State ).
 
-%---------------------------------------------------------
-%   The last known request - UNLOCK
-%---------------------------------------------------------
-handle_unlock(
-    Ref,
-    #state{
-      holders = [Ref],
-      queue = [],
-      barging = undefined,
-      requests = Requests,
-      clients = Clients
-    } = State0
-)->
-
-  State = try_unlock(State0),
-
-  % If here, then it's not unlocked
-  #req{client = Client} = maps:get(Ref, Requests),
-  #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
-  erlang:demonitor(MonRef),
-
-  State;
-
-handle_unlock(
-    Ref,
-    #state{
-      requests = Requests
-    } = State
-)->
-  case Requests of
-    #{ Ref := Req}->
-      remove_request(Req, State);
-    _->
-      % unexpected request ref
-      State
-  end.
-
-try_unlock(#state{
-  scope = Scope,
-  lock_key = LockKey,
-  last = LastQueue
-} = State)->
-  % try to remove the lock
-  Self = self(),
-  ets:delete_object(Scope, {LockKey, Self, LastQueue}),
-
-  % check unlocked
-  case ets:lookup(Scope, LockKey) of
-    [{_,Self,_}]->
-      % not unlocked there is a queue
-      % wait for the request
-      State#state{
-        holders = [],
-        queue = [],
-        requests = #{},
-        clients = #{},
-        can_share = true
-      };
-    _->
-      % unlocked
-      exit(normal)
-  end.
-
+%%=================================================================
+%%  New requests
+%%
+%%  The requests are taken into the queue strictly in the order of
+%%  their tickets. The one that comes too early is postponed until
+%%  its predecessors arrive, but no longer than the postpone timeout
+%%  - their clients may be descheduled or gone
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  The awaited ticket
+%%-----------------------------------------------------------------
 handle_request(
     #request{
       queue = Queue
@@ -253,6 +260,8 @@ handle_request(
     } = State0
 ) when (Last+1) =:= Queue->
 
+  % The gap is closed. If the postponed requests keep another one
+  % then handle_postponed/1 sets the timer again
   State1 =
     if
       is_reference(PostponeTimer)->
@@ -270,6 +279,13 @@ handle_request(
     last = Queue
   });
 
+%%-----------------------------------------------------------------
+%%  A ticket from ahead - the requests in between are still on their
+%%  way. Wait for them to keep the queue in the ticket order
+%%  the guard:
+%%  * the ticket is not the awaited one (the clause above)
+%%  * it is ahead of the last taken (Queue > Last), i.e. there is a gap
+%%-----------------------------------------------------------------
 handle_request(
     #request{
       queue = Queue
@@ -289,11 +305,21 @@ handle_request(
         erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
     end,
 
+  % #request.queue is the first field of the record, therefore the
+  % ordset keeps the postponed requests sorted by their tickets
   State#state{
     postponed = ordsets:add_element(Request, Postponed),
     postpone_timer = PostponeTimer
   };
 
+%%-----------------------------------------------------------------
+%%  The ticket has already been passed by (see
+%%  handle_postpone_timeout/1). The request can not take its place
+%%  in the queue any more, let the client take a new ticket
+%%  the guard:
+%%  * the ticket is neither the awaited one nor ahead (the clauses
+%%    above), hence it is behind the last taken
+%%-----------------------------------------------------------------
 handle_request(
     #request{
       ref = Ref,
@@ -304,6 +330,132 @@ handle_request(
   catch ReplyTo ! #retry{ref = Ref},
   State.
 
+%%-----------------------------------------------------------------
+%%  Take in the postponed requests while they follow each other
+%%  the guard:
+%%  * the first postponed ticket is the awaited one (Last + 1 =:= Queue)
+%%-----------------------------------------------------------------
+handle_postponed(#state{
+  postponed = [#request{
+    queue = Queue
+  } = Request|Rest],
+  last = Last
+} = State0)
+  when Last+1 =:= Queue->
+
+  State = add_request(Request, State0),
+
+  handle_postponed(State#state{
+    postponed = Rest,
+    last = Queue
+  });
+
+%%-----------------------------------------------------------------
+%%  There is still a gap ahead of the postponed requests - wait for
+%%  it to be filled
+%%  the guard:
+%%  * the first postponed ticket is not the awaited one (the clause
+%%    above)
+%%  * it is ahead of the last taken
+%%-----------------------------------------------------------------
+handle_postponed(#state{
+  postponed = [#request{
+    queue = Queue
+  }|_],
+  last = Last
+} = State)
+  when Queue > Last->
+  State#state{
+    postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
+  };
+
+%%-----------------------------------------------------------------
+%%  Nothing is postponed
+%%-----------------------------------------------------------------
+handle_postponed(State)->
+  State.
+
+%%-----------------------------------------------------------------
+%%  The missing requests did not come in time. Step over their
+%%  tickets - if they come later they will be told to retry
+%%-----------------------------------------------------------------
+handle_postpone_timeout(#state{
+  postponed = [#request{
+    queue = Queue
+  } = Request|Rest]
+} =State0)->
+  State = add_request(Request, State0),
+  handle_postponed(State#state{
+    postponed = Rest,
+    last = Queue
+  });
+handle_postpone_timeout(#state{
+  postponed = []
+} =State)->
+  State.
+
+%%=================================================================
+%%  Leaving requests
+%%
+%%  A request leaves the manager when the client unlocks, when the
+%%  timeout fires, when a deadlock is detected or when the client
+%%  itself is gone
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  The last known request - Term UNLOCK
+%%  the guard:
+%%  * the unlocking request is the only holder
+%%  * nothing is waiting in the queue
+%%  * there is no pending barging request
+%%  i.e. nobody needs the Term any more
+%%-----------------------------------------------------------------
+handle_unlock(
+    Ref,
+    #state{
+      holders = [Ref],
+      queue = [],
+      barging = undefined,
+      requests = Requests,
+      clients = Clients
+    } = State0
+)->
+
+  State = try_unlock(State0),
+
+  % If here, then it's not unlocked: a new client has taken a ticket
+  % and the state is already reset for it. The monitor of the leaving
+  % client is not in the reset state, drop it explicitly
+  #req{client = Client} = maps:get(Ref, Requests),
+  #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
+  erlang:demonitor(MonRef),
+
+  State;
+
+%%-----------------------------------------------------------------
+%%  One of the requests - the lock itself stays
+%%  the guard:
+%%  * the Term is still needed: there are other holders, or a queue,
+%%    or a pending barging request (the clause above)
+%%-----------------------------------------------------------------
+handle_unlock(
+    Ref,
+    #state{
+      requests = Requests
+    } = State
+)->
+  case Requests of
+    #{ Ref := Req}->
+      remove_request(Req, State);
+    _->
+      % unexpected request ref
+      State
+  end.
+
+%%-----------------------------------------------------------------
+%%  A waiting request has run out of its timeout. The timer of a
+%%  request that has got the lock is cancelled, but it may have
+%%  fired just before - such a message is ignored
+%%-----------------------------------------------------------------
 handle_timeout(
     Ref,
     #state{
@@ -320,6 +472,11 @@ handle_timeout(
       State0
   end.
 
+%%-----------------------------------------------------------------
+%%  The deadlock checker of a waiting request reports a cycle. The
+%%  checker is stopped as soon as the request gets the lock, so only
+%%  a waiting request can be reported
+%%-----------------------------------------------------------------
 handle_deadlock(
     Ref,
     #state{
@@ -340,6 +497,9 @@ handle_deadlock(
       State0
   end.
 
+%%-----------------------------------------------------------------
+%%  The client is gone - drop all its requests, held and queued
+%%-----------------------------------------------------------------
 handle_down(
     ClientPID,
     #state{
@@ -354,6 +514,9 @@ handle_down(
             reply_to = ReplyTo
           } = maps:get(Ref, RequestsAcc),
           if
+            % For a multi node lock the verdict is awaited not by the
+            % client itself but by a worker on its behalf. There is
+            % nobody to serve any more
             is_pid(ReplyTo), ReplyTo =/= ClientPID ->
               exit(ReplyTo, kill);
             true ->
@@ -369,58 +532,19 @@ handle_down(
       State
   end.
 
-handle_postponed(#state{
-  postponed = [#request{
-    queue = Queue
-  } = Request|Rest],
-  last = Last
-} = State0)
-  when Last+1 =:= Queue->
-
-  State = add_request(Request, State0),
-
-  handle_postponed(State#state{
-    postponed = Rest,
-    last = Queue
-  });
-
-handle_postponed(#state{
-  postponed = [#request{
-    queue = Queue
-  }|_],
-  last = Last
-} = State)
-  when Queue > Last->
-  State#state{
-    postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
-  };
-
-handle_postponed(State)->
-  State.
-
-handle_postpone_timeout(#state{
-  postponed = [#request{
-    queue = Queue
-  } = Request|Rest]
-} =State0)->
-  State = add_request(Request, State0),
-  handle_postponed(State#state{
-    postponed = Rest,
-    last = Queue
-  });
-handle_postpone_timeout(#state{
-  postponed = []
-} =State)->
-  State.
-
-%---------------------------------------------------------
-%   Add a shared request to a shared lock
-%   the guard:
-%   * the request is for shared lock
-%   * the actual lock is shared
-%   * there is no exclusive lock request queued (the queue = [])
-%   * there is no pending barging request
-%---------------------------------------------------------
+%%=================================================================
+%%  The queue
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  Add a shared request to a shared lock
+%%  the guard:
+%%  * the request is for shared lock
+%%  * the actual lock is shared
+%%  * there is no exclusive lock request queued (the queue = [])
+%%  * there is no pending barging request
+%%  The last two keep the queue fair: a newcomer does not overtake
+%%  the exclusive requests that are already waiting
+%%-----------------------------------------------------------------
 add_request(
     #request{
       shared = true
@@ -433,6 +557,11 @@ add_request(
 )->
   get_lock(Request, State);
 
+%%-----------------------------------------------------------------
+%%  Nobody is holding the lock - take it, shared or not
+%%  the guard:
+%%  * there are no holders
+%%-----------------------------------------------------------------
 add_request(
     Request,
     #state{
@@ -441,6 +570,14 @@ add_request(
 )->
   get_lock(Request, State);
 
+%%-----------------------------------------------------------------
+%%  The lock is busy - the request goes to the tail of the queue.
+%%  A client that is already among the holders may barge in instead
+%%  the guard:
+%%  * the lock is held and the request can not join it: it is
+%%    exclusive, or the lock is exclusive, or somebody is already
+%%    waiting for it (the clauses above)
+%%-----------------------------------------------------------------
 add_request(
     #request{
       client = ClientPID
@@ -457,9 +594,9 @@ add_request(
       enqueue(Request, State)
   end.
 
-%---------------------------------------------------------
-%   Remove a queued request
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  Remove a queued request
+%%-----------------------------------------------------------------
 remove_request(
     #req{has_lock = false} = Req,
     State0
@@ -467,9 +604,9 @@ remove_request(
   State = dequeue(Req, State0),
   next(State);
 
-%---------------------------------------------------------
-%   Remove a holding request
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  Remove a holding request
+%%-----------------------------------------------------------------
 remove_request(
     #req{has_lock = true} = Req,
     State0
@@ -477,6 +614,10 @@ remove_request(
   State = unlocked(Req, State0),
   next(State).
 
+%%-----------------------------------------------------------------
+%%  The client starts waiting here: the timeout timer and the
+%%  deadlock checker live as long as the request is in the queue
+%%-----------------------------------------------------------------
 enqueue(
     #request{
       client = ClientPID,
@@ -511,6 +652,11 @@ enqueue(
     clients = Clients
   }.
 
+%%-----------------------------------------------------------------
+%%  The upgrade request waits out of the queue - it is served as
+%%  soon as its client is the only holder left (see next/1). Only
+%%  one barging request at a time (see try_barging/2)
+%%-----------------------------------------------------------------
 enqueue_barging(
     #request{
       client = ClientPID,
@@ -541,6 +687,12 @@ enqueue_barging(
     barging = Request
   }.
 
+%%-----------------------------------------------------------------
+%%  A waiting request gives up: timeout, deadlock or a dead client.
+%%  The pending barging request
+%%  the guard:
+%%  * the request is the pending barging one
+%%-----------------------------------------------------------------
 dequeue(
     #req{
       client = ClientPID,
@@ -565,6 +717,12 @@ dequeue(
     barging = undefined
   };
 
+%%-----------------------------------------------------------------
+%%  A request from the queue
+%%  the guard:
+%%  * the request is not the pending barging one (the clause above),
+%%    hence it stands in the queue
+%%-----------------------------------------------------------------
 dequeue(
     #req{
       client = ClientPID,
@@ -599,6 +757,9 @@ dequeue(
       }
   end.
 
+%%-----------------------------------------------------------------
+%%  Grant the lock to a request that has never been queued
+%%-----------------------------------------------------------------
 get_lock(
     #request{
       client = ClientPID,
@@ -624,6 +785,10 @@ get_lock(
     clients = Clients
   }.
 
+%%-----------------------------------------------------------------
+%%  The request becomes a holder: the client is notified, the
+%%  waiting attributes are dropped
+%%-----------------------------------------------------------------
 locked(
     #req{
       ref = Ref,
@@ -662,6 +827,9 @@ locked(
     can_share = CanShare
   }.
 
+%%-----------------------------------------------------------------
+%%  A holder releases the lock
+%%-----------------------------------------------------------------
 unlocked(
     #req{
       client = ClientPID,
@@ -683,9 +851,9 @@ unlocked(
   Requests = maps:remove(Ref, Requests0),
 
   % If the lock was already shared or the removed request was shared
-  % then it can not change the state of state of the lock.
+  % then it can not change the state of the lock.
   % Otherwise we need to check if there are any exclusive requests
-  % among the holders
+  % among the rest of the holders
   CanShare =
     if
       CanShare0; Shared ->
@@ -701,10 +869,10 @@ unlocked(
     can_share = CanShare
   }.
 
-%---------------------------------------------------------
-%   The client is already holding the lock and requested
-%   it again.
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  The client is already holding the lock and requested
+%%  it again.
+%%-----------------------------------------------------------------
 try_barging(
     #request{
       ref = Ref,
@@ -732,7 +900,7 @@ try_barging(
       get_lock(Request, State);
     BargingRequest =:= undefined ->
       % Client requested exclusive lock while holding shared - upgrade.
-      % it can get it only when no other clients hold the lock.
+      % It can get it only when no other clients hold the lock.
       #client{
         requests = ClientRequests
       } = maps:get(ClientPID, Clients),
@@ -751,12 +919,19 @@ try_barging(
       State
   end.
 
-%---------------------------------------------------------
-%   Push the queue
-%---------------------------------------------------------
-%---------------------------------------------------------
-%  There is a queued barging request
-%---------------------------------------------------------
+%%=================================================================
+%%  Push the queue
+%%
+%%  Called after every change of the holders. It grants the lock to
+%%  as many waiting requests as the actual lock state allows and
+%%  releases the Term if there is nobody left
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  There is a queued barging request. The upgrade has the highest
+%%  priority, it only waits for the other clients to release
+%%  the guard:
+%%  * there is a pending barging request
+%%-----------------------------------------------------------------
 next(#state{
   barging = #request{
     client = ClientPID,
@@ -782,9 +957,13 @@ next(#state{
       State
   end;
 
-%---------------------------------------------------------
-%  Nobody is holding a lock
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  Nobody is holding a lock
+%%  the guard:
+%%  * there is no pending barging request (the clause above)
+%%  * there are no holders
+%%  * the queue is not empty
+%%-----------------------------------------------------------------
 next(#state{
   holders = [],
   queue = [Ref|_],
@@ -792,21 +971,30 @@ next(#state{
 } = State0)->
   Req = maps:get(Ref, Requests),
   State = locked(Req, State0),
+  % If the head was shared the next ones may join it
   next(State);
 
-%---------------------------------------------------------
-%  Nobody is holding and no queue
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  Nobody is holding and no queue
+%%  the guard:
+%%  * there is no pending barging request
+%%  * there are no holders
+%%  * the queue is empty
+%%-----------------------------------------------------------------
 next(#state{
   holders = [],
   queue = []
 } = State)->
  try_unlock(State);
 
-%---------------------------------------------------------
-%   The actual lock is shared. It may share
-%   the lock.
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  The actual lock is shared. It may share
+%%  the lock with the head of the queue
+%%  the guard:
+%%  * there is no pending barging request
+%%  * the lock is shared
+%%  * the queue is not empty
+%%-----------------------------------------------------------------
 next(#state{
   can_share = true,
   queue = [Ref|_],
@@ -817,17 +1005,66 @@ next(#state{
       State = locked(Req, State0),
       next(State);
     _->
+      % The head of the queue is exclusive, it stops the sharing
       State0
   end;
 
+%%-----------------------------------------------------------------
+%%  The lock is exclusive, nobody can join it
+%%-----------------------------------------------------------------
 next(#state{can_share = false} = State)->
   State;
+
+%%-----------------------------------------------------------------
+%%  Nothing to push
+%%  the guard:
+%%  * there is no pending barging request
+%%  * the lock is held and shared
+%%  * the queue is empty
+%%-----------------------------------------------------------------
 next(#state{queue = []} = State)->
   State.
 
-%---------------------------------------------------------
-%   Utilities
-%---------------------------------------------------------
+%%-----------------------------------------------------------------
+%%  The lock is not needed any more - try to remove it from ETS.
+%%  The entry is removed only if it still carries the last ticket
+%%  known to the manager, otherwise a new client has already queued
+%%  up and its request is on the way
+%%-----------------------------------------------------------------
+try_unlock(#state{
+  scope = Scope,
+  lock_key = LockKey,
+  last = LastQueue
+} = State)->
+  % try to remove the lock
+  Self = self(),
+  ets:delete_object(Scope, {LockKey, Self, LastQueue}),
+
+  % check unlocked
+  case ets:lookup(Scope, LockKey) of
+    [{_,Self,_}]->
+      % not unlocked there is a queue
+      % The entry is still ours: a new client has taken a ticket and
+      % its request is on the way. Start the next round with a clean
+      % state and wait for it
+      State#state{
+        holders = [],
+        queue = [],
+        requests = #{},
+        clients = #{},
+        can_share = true
+      };
+    _->
+      % unlocked, the next client will start a new manager
+      exit(normal)
+  end.
+
+%%=================================================================
+%%  Utilities
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  A client is monitored while it has at least one request
+%%-----------------------------------------------------------------
 add_client_request(ClientPID, Ref, Clients)->
   Client =
     case Clients of
@@ -866,6 +1103,10 @@ remove_client_request(ClientPID, Ref, Clients0)->
       }
   end.
 
+%%-----------------------------------------------------------------
+%%  The attributes of a waiting request: the timeout timer and the
+%%  deadlock checker. Both are dropped as soon as it stops waiting
+%%-----------------------------------------------------------------
 start_waiting(
     #request{
       client = Client,
@@ -919,6 +1160,9 @@ stop_waiting(#req{
     timer = undefined
   }.
 
+%%-----------------------------------------------------------------
+%%  The lock stays shared while every holder is shared
+%%-----------------------------------------------------------------
 can_share([Ref|Rest], Requests)->
   case Requests of
     #{ Ref := #req{ shared = false }} ->
@@ -928,4 +1172,3 @@ can_share([Ref|Rest], Requests)->
   end;
 can_share([], _Requests)->
   true.
-

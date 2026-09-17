@@ -24,7 +24,7 @@
 %%  try_test_lock/3
 %%]).
 
--define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
+%% ?deadlock_scope/1 comes from include/elock.hrl
 
 %------------call it from OTP supervisor as a permanent worker------
 start_link( Name )->
@@ -34,7 +34,7 @@ start_link( Name )->
     ets:new(Name,[
       named_table,
       public,
-      ordered_set,
+      set,
       {read_concurrency, true},
       {write_concurrency, auto}
     ]),

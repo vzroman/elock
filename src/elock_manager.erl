@@ -171,8 +171,8 @@ start_manager(Request)->
 %%  Manager
 %%=================================================================
 -record(state,{
-  holders,          % refs of the requests holding the lock
-  queue,            % refs of the waiting requests, FIFO
+  holders,          % #{ Ref => {Shared, ClientPID} } of the holding requests
+  queue,            % gb_sets of {Ticket, Ref}, ordered by the ticket
   requests,         % #{ Ref => #req{} }, both holders and waiters
   clients,          % #{ ClientPID => #client{} }
   scope,            % the ETS table of the locks
@@ -188,6 +188,7 @@ start_manager(Request)->
 -record(req,{
   client,           % the process that asked for the lock
   ref,              % unique reference of the request
+  queue,            % the ticket, the key of the request in #state.queue
   reply_to,         % the process waiting for the verdict
   shared,           % the requested lock type
   has_lock,         % true - holds the lock, false - waits in the queue
@@ -196,7 +197,7 @@ start_manager(Request)->
 }).
 
 -record(client,{
-  requests,         % refs of all the requests of the client
+  requests,         % #{ Ref => Shared } of all the requests of the client
   monitor_ref       % one monitor per client, while it has requests
 }).
 
@@ -216,12 +217,14 @@ init(#request{
   ets:update_element(Scope, LockKey, {2,self()}),
 
   State = #state{
-    holders = [Ref],
-    queue = ordsets:new(),
+    holders = #{ Ref => {Shared, Client} },
+    queue = gb_sets:empty(),
     requests = #{
       Ref => #req{
         client = Client,
         ref = Ref,
+        % The manager is started by the winner of the ticket 1
+        queue = 1,
         reply_to = ReplyTo,
         shared = Shared,
         has_lock = true,
@@ -231,7 +234,7 @@ init(#request{
     },
     clients = #{
       Client => #client{
-        requests = [Ref],
+        requests = #{ Ref => Shared },
         monitor_ref = erlang:monitor(process, Client)
       }
     },
@@ -444,14 +447,19 @@ handle_postpone_timeout(
 handle_postpone_timeout(
     _TimerRef,
     #state{
-      holders = [],
-      queue = [],
+      holders = Holders,
+      queue = Queue,
       postponed = [],
       last = Last
-    } =State)->
-  try_unlock(State#state{
-    last = Last + 1
-  });
+    } =State) when map_size(Holders) =:= 0->
+  case gb_sets:is_empty(Queue) of
+    true->
+      try_unlock(State#state{
+        last = Last + 1
+      });
+    false->
+      State
+  end;
 handle_postpone_timeout(_TimerRef, State)->
   State.
 
@@ -473,25 +481,31 @@ handle_postpone_timeout(_TimerRef, State)->
 handle_unlock(
     Ref,
     #state{
-      holders = [Ref],
-      queue = [],
+      holders = Holders,
+      queue = Queue,
       barging = undefined,
       requests = Requests,
       clients = Clients
     } = State0
-)->
+) when map_size(Holders) =:= 1, is_map_key(Ref, Holders)->
 
-  State = try_unlock(State0),
-  % TODO. Unregister lock
+  case gb_sets:is_empty(Queue) of
+    true->
+      State = try_unlock(State0),
+      % TODO. Unregister lock
 
-  % If here, then it's not unlocked: a new client has taken a ticket
-  % and the state is already reset for it. The monitor of the leaving
-  % client is not in the reset state, drop it explicitly
-  #req{client = Client} = maps:get(Ref, Requests),
-  #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
-  erlang:demonitor(MonRef),
+      % If here, then it's not unlocked: a new client has taken a ticket
+      % and the state is already reset for it. The monitor of the leaving
+      % client is not in the reset state, drop it explicitly
+      #req{client = Client} = maps:get(Ref, Requests),
+      #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
+      erlang:demonitor(MonRef),
 
-  State;
+      State;
+    false->
+      % Somebody is waiting for the Term
+      leave_lock(Ref, State0)
+  end;
 
 %%-----------------------------------------------------------------
 %%  One of the requests - the lock itself stays
@@ -499,7 +513,10 @@ handle_unlock(
 %%  * the Term is still needed: there are other holders, or a queue,
 %%    or a pending barging request (the clause above)
 %%-----------------------------------------------------------------
-handle_unlock(
+handle_unlock(Ref, State)->
+  leave_lock(Ref, State).
+
+leave_lock(
     Ref,
     #state{
       requests = Requests
@@ -568,9 +585,9 @@ handle_down(
     } = State
 )->
   case Clients of
-    #{ ClientPID := #client{requests = Requests}}->
-      lists:foldl(
-        fun(Ref, #state{requests = RequestsAcc} = StateAcc)->
+    #{ ClientPID := #client{requests = ClientRequests}}->
+      maps:fold(
+        fun(Ref, _Shared, #state{requests = RequestsAcc} = StateAcc)->
           Req = #req{
             reply_to = ReplyTo
           } = maps:get(Ref, RequestsAcc),
@@ -586,7 +603,7 @@ handle_down(
           remove_request(Req, StateAcc)
         end,
         State,
-        Requests
+        ClientRequests
       );
     _->
       % unexpected PID
@@ -601,10 +618,10 @@ handle_down(
 %%  the guard:
 %%  * the request is for shared lock
 %%  * the actual lock is shared
-%%  * there is no exclusive lock request queued (the queue = [])
 %%  * there is no pending barging request
-%%  The last two keep the queue fair: a newcomer does not overtake
-%%  the exclusive requests that are already waiting
+%%  and, in the body, that no request is queued. The last two keep
+%%  the queue fair: a newcomer does not overtake the exclusive
+%%  requests that are already waiting
 %%-----------------------------------------------------------------
 add_request(
     #request{
@@ -612,23 +629,31 @@ add_request(
     } = Request,
     #state{
       can_share = true,
-      queue = [],
+      queue = Queue,
       barging = undefined
     } = State
 )->
-  get_lock(Request, State);
+  case gb_sets:is_empty(Queue) of
+    true->
+      get_lock(Request, State);
+    false->
+      add_busy_request(Request, State)
+  end;
+
+add_request(Request, State)->
+  add_busy_request(Request, State).
 
 %%-----------------------------------------------------------------
 %%  Nobody is holding the lock - take it, shared or not
 %%  the guard:
 %%  * there are no holders
 %%-----------------------------------------------------------------
-add_request(
+add_busy_request(
     Request,
     #state{
-      holders = []
+      holders = Holders
     } = State
-)->
+) when map_size(Holders) =:= 0->
   get_lock(Request, State);
 
 %%-----------------------------------------------------------------
@@ -639,7 +664,7 @@ add_request(
 %%    exclusive, or the lock is exclusive, or somebody is already
 %%    waiting for it (the clauses above)
 %%-----------------------------------------------------------------
-add_request(
+add_busy_request(
     #request{
       client = ClientPID
     } = Request,
@@ -683,6 +708,7 @@ enqueue(
     #request{
       client = ClientPID,
       ref = Ref,
+      queue = Ticket,
       reply_to = ReplyTo,
       shared = Shared
     } = Request,
@@ -696,6 +722,7 @@ enqueue(
   Req0 = #req{
     client = ClientPID,
     ref = Ref,
+    queue = Ticket,
     reply_to = ReplyTo,
     shared = Shared,
     has_lock = false
@@ -704,8 +731,11 @@ enqueue(
   Requests = Requests0#{
     Ref => Req
   },
-  Clients = add_client_request(ClientPID, Ref, Clients0),
-  Queue = Queue0 ++ [Ref],
+  Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
+  % The tickets are unique and grow with the queue, hence the set is
+  % ordered by the arrival and the head of the queue is its smallest
+  % element
+  Queue = gb_sets:insert({Ticket, Ref}, Queue0),
 
   State#state{
     queue = Queue,
@@ -722,6 +752,7 @@ enqueue_barging(
     #request{
       client = ClientPID,
       ref = Ref,
+      queue = Ticket,
       reply_to = ReplyTo
     } = Request,
     #state{
@@ -732,6 +763,9 @@ enqueue_barging(
   Req0 = #req{
     client = ClientPID,
     ref = Ref,
+    % The barging request never enters #state.queue, the ticket is
+    % kept only to keep every #req{} alike
+    queue = Ticket,
     reply_to = ReplyTo,
     shared = false, % Enqueued barging request is always exclusive
     has_lock = false
@@ -740,7 +774,7 @@ enqueue_barging(
   Requests = Requests0#{
     Ref => Req
   },
-  Clients = add_client_request(ClientPID, Ref, Clients0),
+  Clients = add_client_request(ClientPID, Ref, _Shared = false, Clients0),
 
   State#state{
     requests = Requests,
@@ -787,7 +821,8 @@ dequeue(
 dequeue(
     #req{
       client = ClientPID,
-      ref = Ref
+      ref = Ref,
+      queue = Ticket
     } = Req,
     #state{
       requests = Requests0,
@@ -812,7 +847,7 @@ dequeue(
       };
     _->
       State#state{
-        queue = Queue0 -- [Ref],
+        queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
         requests = Requests,
         clients = Clients
       }
@@ -825,6 +860,7 @@ get_lock(
     #request{
       client = ClientPID,
       ref = Ref,
+      queue = Ticket,
       reply_to = ReplyTo,
       shared = Shared
     },
@@ -835,12 +871,13 @@ get_lock(
   Req = #req{
     client = ClientPID,
     ref = Ref,
+    queue = Ticket,
     reply_to = ReplyTo,
     shared = Shared
   },
 
   State = locked(Req, State0),
-  Clients = add_client_request(ClientPID, Ref, Clients0),
+  Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
 
   State#state{
     clients = Clients
@@ -852,7 +889,9 @@ get_lock(
 %%-----------------------------------------------------------------
 locked(
     #req{
+      client = ClientPID,
       ref = Ref,
+      queue = Ticket,
       reply_to = ReplyTo,
       shared = Shared
     } = Req0,
@@ -874,8 +913,10 @@ locked(
   Requests = Requests0#{
     Ref => Req
   },
-  Holders = Holders0 ++ [Ref],
-  Queue = Queue0 -- [Ref],
+  Holders = Holders0#{ Ref => {Shared, ClientPID} },
+  % locked/2 is also reached by requests that never stood in the
+  % queue - get_lock/2 and the barging clause of next/1
+  Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
 
   % If the actual lock is inclusive, then it's
   % a barging request, it doesn't downgrade the lock
@@ -908,7 +949,7 @@ unlocked(
   % TODO. Unregister lock
 
   Clients = remove_client_request(ClientPID, Ref, Clients0),
-  Holders = Holders0 -- [Ref],
+  Holders = maps:remove(Ref, Holders0),
   Requests = maps:remove(Ref, Requests0),
 
   % If the lock was already shared or the removed request was shared
@@ -920,7 +961,7 @@ unlocked(
       CanShare0; Shared ->
         CanShare0;
       true ->
-        can_share(Holders, Requests)
+        can_share(Holders)
     end,
 
   State#state{
@@ -965,11 +1006,12 @@ try_barging(
       #client{
         requests = ClientRequests
       } = maps:get(ClientPID, Clients),
-      case Holders -- ClientRequests of
-        [] ->
+      % The request is not registered with the client yet
+      case only_holder(ClientRequests, Holders, _Waiting = 0) of
+        true ->
           % All the holding requests belong to the same client
           get_lock(Request, State);
-        _->
+        false->
           % There are other clients holding the lock - wait
           enqueue_barging(Request, State)
       end;
@@ -1007,83 +1049,74 @@ next(#state{
     requests = ClientRequests
   } = maps:get(ClientPID, Clients),
 
-  case Holders -- ClientRequests of
-    [] ->
+  % The barging request itself is registered with the client, but it
+  % is not a holder
+  case only_holder(ClientRequests, Holders, _Waiting = 1) of
+    true ->
       % the only client is holding the lock
       Req = maps:get(Ref, Requests),
       locked(Req, State#state{
         barging = undefined
       });
-    _->
+    false->
       State
   end;
 
 %%-----------------------------------------------------------------
-%%  Nobody is holding a lock
+%%  Nobody is holding a lock - the head of the queue takes it, or
+%%  the Term is released if nobody is waiting either
 %%  the guard:
 %%  * there is no pending barging request (the clause above)
 %%  * there are no holders
-%%  * the queue is not empty
 %%-----------------------------------------------------------------
 next(#state{
-  holders = [],
-  queue = [Ref|_],
+  holders = Holders,
+  queue = Queue,
   requests = Requests
-} = State0)->
-  Req = maps:get(Ref, Requests),
-  State = locked(Req, State0),
-  % If the head was shared the next ones may join it
-  next(State);
-
-%%-----------------------------------------------------------------
-%%  Nobody is holding and no queue
-%%  the guard:
-%%  * there is no pending barging request
-%%  * there are no holders
-%%  * the queue is empty
-%%-----------------------------------------------------------------
-next(#state{
-  holders = [],
-  queue = []
-} = State)->
- try_unlock(State);
+} = State0) when map_size(Holders) =:= 0->
+  case gb_sets:is_empty(Queue) of
+    true->
+      try_unlock(State0);
+    false->
+      {_Ticket, Ref} = gb_sets:smallest(Queue),
+      Req = maps:get(Ref, Requests),
+      State = locked(Req, State0),
+      % If the head was shared the next ones may join it
+      next(State)
+  end;
 
 %%-----------------------------------------------------------------
 %%  The actual lock is shared. It may share
 %%  the lock with the head of the queue
 %%  the guard:
 %%  * there is no pending barging request
+%%  * the lock is held
 %%  * the lock is shared
-%%  * the queue is not empty
 %%-----------------------------------------------------------------
 next(#state{
   can_share = true,
-  queue = [Ref|_],
+  queue = Queue,
   requests = Requests
 } = State0)->
-  case Requests of
-    #{Ref := Req = #req{shared = true}} ->
-      State = locked(Req, State0),
-      next(State);
-    _->
-      % The head of the queue is exclusive, it stops the sharing
-      State0
+  case gb_sets:is_empty(Queue) of
+    true->
+      State0;
+    false->
+      {_Ticket, Ref} = gb_sets:smallest(Queue),
+      case Requests of
+        #{Ref := Req = #req{shared = true}} ->
+          State = locked(Req, State0),
+          next(State);
+        _->
+          % The head of the queue is exclusive, it stops the sharing
+          State0
+      end
   end;
 
 %%-----------------------------------------------------------------
 %%  The lock is exclusive, nobody can join it
 %%-----------------------------------------------------------------
-next(#state{can_share = false} = State)->
-  State;
-
-%%-----------------------------------------------------------------
-%%  Nothing to push
-%%  the guard:
-%%  * there is no pending barging request
-%%  * the lock is held and shared
-%%  * the queue is empty
-%%-----------------------------------------------------------------
-next(#state{queue = []} = State)->
+next(State)->
   State.
 
 %%-----------------------------------------------------------------
@@ -1109,8 +1142,8 @@ try_unlock(#state{
       % its request is on the way. Start the next round with a clean
       % state and wait for it
       State#state{
-        holders = [],
-        queue = [],
+        holders = #{},
+        queue = gb_sets:empty(),
         requests = #{},
         clients = #{},
         can_share = true,
@@ -1127,17 +1160,17 @@ try_unlock(#state{
 %%-----------------------------------------------------------------
 %%  A client is monitored while it has at least one request
 %%-----------------------------------------------------------------
-add_client_request(ClientPID, Ref, Clients)->
+add_client_request(ClientPID, Ref, Shared, Clients)->
   Client =
     case Clients of
       #{ClientPID := Client0}->
         #client{ requests = Requests} = Client0,
         Client0#client{
-          requests = Requests ++ [Ref]
+          requests = Requests#{ Ref => Shared }
         };
       _->
         #client{
-          requests = [Ref],
+          requests = #{ Ref => Shared },
           monitor_ref = erlang:monitor(process, ClientPID)
         }
     end,
@@ -1152,8 +1185,8 @@ remove_client_request(ClientPID, Ref, Clients0)->
     monitor_ref = MonRef
   } = Client0,
 
-  case Requests0 -- [Ref] of
-    [] ->
+  case maps:remove(Ref, Requests0) of
+    Requests when map_size(Requests) =:= 0 ->
       erlang:demonitor(MonRef),
       maps:remove(ClientPID, Clients0);
     Requests->
@@ -1164,6 +1197,17 @@ remove_client_request(ClientPID, Ref, Clients0)->
         ClientPID => Client
       }
   end.
+
+%%-----------------------------------------------------------------
+%%  Does any client other than this one hold the lock?
+%%
+%%  A client that holds the lock never enters the queue (see
+%%  add_busy_request/2), therefore every request of such a client is
+%%  a holder as well - except its own pending barging request, which
+%%  the caller counts in Waiting
+%%-----------------------------------------------------------------
+only_holder(ClientRequests, Holders, Waiting)->
+  map_size(ClientRequests) - Waiting =:= map_size(Holders).
 
 %%-----------------------------------------------------------------
 %%  The attributes of a waiting request: the timeout timer and the
@@ -1225,12 +1269,12 @@ stop_waiting(#req{
 %%-----------------------------------------------------------------
 %%  The lock stays shared while every holder is shared
 %%-----------------------------------------------------------------
-can_share([Ref|Rest], Requests)->
-  case Requests of
-    #{ Ref := #req{ shared = false }} ->
-      false;
-    _->
-      can_share(Rest, Requests)
-  end;
-can_share([], _Requests)->
+can_share(Holders)->
+  can_share_loop( maps:next( maps:iterator(Holders) ) ).
+
+can_share_loop({_Ref, {_Shared = false, _ClientPID}, _Iterator})->
+  false;
+can_share_loop({_Ref, {_Shared, _ClientPID}, Iterator})->
+  can_share_loop( maps:next(Iterator) );
+can_share_loop(none)->
   true.

@@ -96,20 +96,37 @@ lock(#request{
       % request stands among the other clients
       case get_manager(Scope, LockKey, RequestQueue) of
         Manager when is_pid(Manager) ->
+          % The verdict lives in the manager's mailbox. If the manager
+          % exits before it has replied then the request goes with the
+          % mailbox and nobody will ever answer - monitor it
+          MonitorRef = erlang:monitor(process, Manager),
           Manager ! Request#request{ queue = RequestQueue },
-          receive
-            #locked{ref = Ref}->
-              {ok, #unlock{
-                manager = Manager,
-                ref = Ref
-              }};
-            #deadlock{ref = Ref}->
-              {error, deadlock};
-            #timeout{ref = Ref}->
-              {error, timeout};
-            #retry{ref = Ref}->
-              % The ticket is not valid any longer, start over
-              lock(Request)
+          Verdict =
+            receive
+              #locked{ref = Ref}->
+                {ok, #unlock{
+                  manager = Manager,
+                  ref = Ref
+                }};
+              #deadlock{ref = Ref}->
+                {error, deadlock};
+              #timeout{ref = Ref}->
+                {error, timeout};
+              #retry{ref = Ref}->
+                % The ticket is not valid any longer, start over
+                retry;
+              {'DOWN', MonitorRef, process, Manager, _Reason}->
+                % The manager is gone and the request went with it.
+                % The lock entry is removed before the manager exits,
+                % so the new ticket starts the next round
+                retry
+            end,
+          erlang:demonitor(MonitorRef, [flush]),
+          case Verdict of
+            retry ->
+              lock(Request);
+            _->
+              Verdict
           end;
         _->
           lock(Request)

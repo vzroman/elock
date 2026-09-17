@@ -1,0 +1,4 @@
+[{<<"ecall">>,
+  {git,"https://github.com/vzroman/ecall.git",
+       {ref,"4f64dee9e1a5b5d732a9d05ad8665e57f94d95d2"}},
+  0}].

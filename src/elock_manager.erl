@@ -25,6 +25,9 @@
 -record(timeout,{
   ref
 }).
+-record(retry,{
+  ref
+}).
 
 %-----------Lock request------------------------------------------
 lock(#request{
@@ -56,7 +59,9 @@ lock(#request{
         #deadlock{ref = Ref}->
           {error, deadlock};
         #timeout{ref = Ref}->
-          {error, timeout}
+          {error, timeout};
+        #retry{ref = Ref}->
+          lock(Request)
       end
   end.
 
@@ -107,10 +112,6 @@ start_manager(Request)->
 -record(client,{
   requests,
   monitor_ref
-}).
-
--record(retry,{
-  ref
 }).
 
 init(#request{
@@ -172,7 +173,7 @@ loop(State0)->
       {'DOWN', _Ref, process, ClientPID, _Reason}->
         handle_down(ClientPID, State0);
       {timeout, _TimerRef, postpone_timeout}->
-        handle_postpone_timeout(State);
+        handle_postpone_timeout(State0);
       Unexpected->
         ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
         State0
@@ -353,7 +354,7 @@ handle_down(
             reply_to = ReplyTo
           } = maps:get(Ref, RequestsAcc),
           if
-            ReplyTo =/= ClientPID ->
+            is_pid(ReplyTo), ReplyTo =/= ClientPID ->
               exit(ReplyTo, kill);
             true ->
               ignore
@@ -388,16 +389,29 @@ handle_postponed(#state{
     queue = Queue
   }|_],
   last = Last
-} = State0)
+} = State)
   when Queue > Last->
-
-  todo;
+  State#state{
+    postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
+  };
 
 handle_postponed(State)->
   State.
 
-handle_postpone_timeout(State)->
-  todo.
+handle_postpone_timeout(#state{
+  postponed = [#request{
+    queue = Queue
+  } = Request|Rest]
+} =State0)->
+  State = add_request(Request, State0),
+  handle_postponed(State#state{
+    postponed = Rest,
+    last = Queue
+  });
+handle_postpone_timeout(#state{
+  postponed = []
+} =State)->
+  State.
 
 %---------------------------------------------------------
 %   Add a shared request to a shared lock
@@ -914,6 +928,4 @@ can_share([Ref|Rest], Requests)->
   end;
 can_share([], _Requests)->
   true.
-
-
 

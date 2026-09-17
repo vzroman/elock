@@ -100,7 +100,7 @@ lock(#request{
           % exits before it has replied then the request goes with the
           % mailbox and nobody will ever answer - monitor it
           MonitorRef = erlang:monitor(process, Manager),
-          Manager ! Request#request{ queue = RequestQueue },
+          Manager ! Request#request{ queue = RequestQueue, reply_to = self() },
           Verdict =
             receive
               #locked{ref = Ref}->
@@ -119,6 +119,7 @@ lock(#request{
                 % The manager is gone and the request went with it.
                 % The lock entry is removed before the manager exits,
                 % so the new ticket starts the next round
+                ets:match_delete(Scope, {LockKey, Manager, '_'}),
                 retry
             end,
           erlang:demonitor(MonitorRef, [flush]),
@@ -397,6 +398,17 @@ handle_postponed(#state{
   State#state{
     postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
   };
+
+handle_postponed(#state{
+  postponed = [#request{
+    ref = Ref,
+    reply_to = ReplyTo
+  }|Rest]
+} = State)->
+  ReplyTo ! #retry{ref = Ref},
+  handle_postponed(State#state{
+    postponed = Rest
+  });
 
 %%-----------------------------------------------------------------
 %%  Nothing is postponed

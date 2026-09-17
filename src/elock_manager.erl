@@ -94,20 +94,24 @@ lock(#request{
       %------------enqueued-------------------
       % Somebody is ahead. The ticket tells the manager where the
       % request stands among the other clients
-      Manager = get_manager(Scope, LockKey),
-      Manager ! Request#request{ queue = RequestQueue },
-      receive
-        #locked{ref = Ref}->
-          {ok, #unlock{
-            manager = Manager,
-            ref = Ref
-          }};
-        #deadlock{ref = Ref}->
-          {error, deadlock};
-        #timeout{ref = Ref}->
-          {error, timeout};
-        #retry{ref = Ref}->
-          % The ticket is not valid any longer, start over
+      case get_manager(Scope, LockKey, RequestQueue) of
+        Manager when is_pid(Manager) ->
+          Manager ! Request#request{ queue = RequestQueue },
+          receive
+            #locked{ref = Ref}->
+              {ok, #unlock{
+                manager = Manager,
+                ref = Ref
+              }};
+            #deadlock{ref = Ref}->
+              {error, deadlock};
+            #timeout{ref = Ref}->
+              {error, timeout};
+            #retry{ref = Ref}->
+              % The ticket is not valid any longer, start over
+              lock(Request)
+          end;
+        _->
           lock(Request)
       end
   end.
@@ -119,13 +123,21 @@ unlock(#unlock{manager = Manager}=Unlock)->
 %%-----------------------------------------------------------------
 %%  Client side utilities
 %%-----------------------------------------------------------------
-get_manager(Scope, LockKey)->
+get_manager(Scope, LockKey, MyQueue)->
   case ets:lookup(Scope, LockKey) of
-    [ { _Lock, Manager, _Queue } ] when is_pid(Manager)-> Manager;
+    [ { _Lock, Manager, Queue } ] when is_pid(Manager)->
+      if
+        Queue >= MyQueue ->
+          Manager;
+        true ->
+          retry
+      end;
+    []->
+      retry;
     _->
       % The manager has not registered itself yet, wait
       receive after 1 -> ok end,
-      get_manager(Scope, LockKey)
+      get_manager(Scope, LockKey, MyQueue)
   end.
 
 % Every client of the Term goes through the manager, hence the
@@ -231,8 +243,8 @@ loop(State0)->
         handle_deadlock(Ref, State0);
       {'DOWN', _Ref, process, ClientPID, _Reason}->
         handle_down(ClientPID, State0);
-      {timeout, _TimerRef, postpone_timeout}->
-        handle_postpone_timeout(State0);
+      {timeout, TimerRef, postpone_timeout}->
+        handle_postpone_timeout(TimerRef, State0);
       Unexpected->
         ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
         State0
@@ -379,19 +391,39 @@ handle_postponed(State)->
 %%  The missing requests did not come in time. Step over their
 %%  tickets - if they come later they will be told to retry
 %%-----------------------------------------------------------------
-handle_postpone_timeout(#state{
-  postponed = [#request{
-    queue = Queue
-  } = Request|Rest]
-} =State0)->
-  State = add_request(Request, State0),
+handle_postpone_timeout(
+    TimerRef,
+    #state{
+      postpone_timer = PostponeTimerRef
+    } =State
+) when TimerRef =/= PostponeTimerRef ->
+  State;
+handle_postpone_timeout(
+    _TimerRef,
+    #state{
+      postponed = [#request{
+        queue = Queue
+      } = Request|Rest]
+    } =State0)->
+  State = add_request(Request, State0#state{
+    postpone_timer = undefined
+  }),
   handle_postponed(State#state{
     postponed = Rest,
     last = Queue
   });
-handle_postpone_timeout(#state{
-  postponed = []
-} =State)->
+handle_postpone_timeout(
+    _TimerRef,
+    #state{
+      holders = [],
+      queue = [],
+      postponed = [],
+      last = Last
+    } =State)->
+  try_unlock(State#state{
+    last = Last + 1
+  });
+handle_postpone_timeout(_TimerRef, State)->
   State.
 
 %%=================================================================
@@ -421,6 +453,7 @@ handle_unlock(
 )->
 
   State = try_unlock(State0),
+  % TODO. Unregister lock
 
   % If here, then it's not unlocked: a new client has taken a ticket
   % and the state is already reset for it. The monitor of the leaving
@@ -484,11 +517,10 @@ handle_deadlock(
     } = State0
 )->
   case Requests of
-    #{Ref := Req}->
-      #req{
-        has_lock = false,
-        reply_to = ReplyTo
-      } = Req,
+    #{Ref := Req = #req{
+      has_lock = false,
+      reply_to = ReplyTo}
+    }->
       catch ReplyTo ! #deadlock{ ref = Ref },
       State = dequeue(Req, State0),
       next(State);
@@ -1052,7 +1084,8 @@ try_unlock(#state{
         queue = [],
         requests = #{},
         clients = #{},
-        can_share = true
+        can_share = true,
+        postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
       };
     _->
       % unlocked, the next client will start a new manager

@@ -170,6 +170,10 @@ start_manager(Request)->
 %%=================================================================
 %%  Manager
 %%=================================================================
+%% How long the manager waits for a ticket that has not arrived yet
+%% before it steps over it (see handle_postpone_timeout/2)
+-define(POSTPONE_TIMEOUT, 100).
+
 -record(state,{
   holders,          % #{ Ref => {Shared, ClientPID} } of the holding requests
   queue,            % gb_sets of {Ticket, Ref}, ordered by the ticket
@@ -288,26 +292,15 @@ handle_request(
       queue = Queue
     } = Request,
     #state{
-      last = Last,
-      postpone_timer = PostponeTimer
+      last = Last
     } = State0
 ) when (Last+1) =:= Queue->
 
-  % The gap is closed. If the postponed requests keep another one
-  % then handle_postponed/1 sets the timer again
-  State1 =
-    if
-      is_reference(PostponeTimer)->
-        erlang:cancel_timer(PostponeTimer),
-        State0#state{
-          postpone_timer = undefined
-        };
-      true ->
-        State0
-    end,
+  State = add_request(Request, State0),
 
-  State = add_request(Request, State1),
-
+  % The gap is closed here, but another one may be left behind the
+  % postponed requests - handle_postponed/1 owns the timer and
+  % decides whether it is still needed
   handle_postponed(State#state{
     last = Queue
   });
@@ -325,25 +318,15 @@ handle_request(
     } = Request,
     #state{
       last = Last,
-      postponed = Postponed,
-      postpone_timer = PostponeTimer0
+      postponed = Postponed
     } = State
 ) when Queue > Last->
 
-  PostponeTimer =
-    if
-      is_reference(PostponeTimer0)->
-        PostponeTimer0;
-      true->
-        erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
-    end,
-
   % #request.queue is the first field of the record, therefore the
   % ordset keeps the postponed requests sorted by their tickets
-  State#state{
-    postponed = ordsets:add_element(Request, Postponed),
-    postpone_timer = PostponeTimer
-  };
+  arm_postpone_timer(State#state{
+    postponed = ordsets:add_element(Request, Postponed)
+  });
 
 %%-----------------------------------------------------------------
 %%  The ticket has already been passed by (see
@@ -398,9 +381,7 @@ handle_postponed(#state{
   last = Last
 } = State)
   when Queue > Last->
-  State#state{
-    postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
-  };
+  arm_postpone_timer(State);
 
 handle_postponed(#state{
   postponed = [#request{
@@ -417,7 +398,7 @@ handle_postponed(#state{
 %%  Nothing is postponed
 %%-----------------------------------------------------------------
 handle_postponed(State)->
-  State.
+  cancel_postpone_timer(State).
 
 %%-----------------------------------------------------------------
 %%  The missing requests did not come in time. Step over their
@@ -437,9 +418,7 @@ handle_postpone_timeout(
         queue = Queue
       } = Request|Rest]
     } =State0)->
-  State = add_request(Request, State0#state{
-    postpone_timer = undefined
-  }),
+  State = add_request(Request, postpone_timer_fired(State0)),
   handle_postponed(State#state{
     postponed = Rest,
     last = Queue
@@ -451,7 +430,8 @@ handle_postpone_timeout(
       queue = Queue,
       postponed = [],
       last = Last
-    } =State) when map_size(Holders) =:= 0->
+    } =State0) when map_size(Holders) =:= 0->
+  State = postpone_timer_fired(State0),
   case gb_sets:is_empty(Queue) of
     true->
       try_unlock(State#state{
@@ -461,7 +441,37 @@ handle_postpone_timeout(
       State
   end;
 handle_postpone_timeout(_TimerRef, State)->
+  postpone_timer_fired(State).
+
+%%-----------------------------------------------------------------
+%%  The postpone timer
+%%
+%%  #state.postpone_timer is written here and nowhere else. One timer
+%%  serves every postponed request: it is armed by the first one that
+%%  has to wait and it keeps running - never restarted from zero -
+%%  until no ticket is missing any more
+%%-----------------------------------------------------------------
+arm_postpone_timer(#state{postpone_timer = Timer} = State) when is_reference(Timer)->
+  State;
+arm_postpone_timer(State)->
+  State#state{
+    postpone_timer = erlang:start_timer(?POSTPONE_TIMEOUT, self(), postpone_timeout)
+  }.
+
+cancel_postpone_timer(#state{postpone_timer = Timer} = State) when is_reference(Timer)->
+  erlang:cancel_timer(Timer),
+  State#state{
+    postpone_timer = undefined
+  };
+cancel_postpone_timer(State)->
   State.
+
+%% A fired timer is gone, but a cancelled one may have fired already -
+%% hence the reference guard of handle_postpone_timeout/2
+postpone_timer_fired(State)->
+  State#state{
+    postpone_timer = undefined
+  }.
 
 %%=================================================================
 %%  Leaving requests
@@ -701,6 +711,37 @@ remove_request(
   next(State).
 
 %%-----------------------------------------------------------------
+%%  The #req{} of a new request. The ticket is what keys it in
+%%  #state.queue, has_lock is turned on by locked/2 when the request
+%%  gets the lock
+%%-----------------------------------------------------------------
+new_req(#request{
+  client = ClientPID,
+  ref = Ref,
+  queue = Ticket,
+  reply_to = ReplyTo,
+  shared = Shared
+})->
+  #req{
+    client = ClientPID,
+    ref = Ref,
+    queue = Ticket,
+    reply_to = ReplyTo,
+    shared = Shared,
+    has_lock = false
+  }.
+
+%%-----------------------------------------------------------------
+%%  An enqueued barging request is always exclusive - it is the
+%%  upgrade the client is waiting for. It never enters #state.queue,
+%%  the ticket is kept only to keep every #req{} alike
+%%-----------------------------------------------------------------
+new_barging_req(Request)->
+  (new_req(Request))#req{
+    shared = false
+  }.
+
+%%-----------------------------------------------------------------
 %%  The client starts waiting here: the timeout timer and the
 %%  deadlock checker live as long as the request is in the queue
 %%-----------------------------------------------------------------
@@ -709,7 +750,6 @@ enqueue(
       client = ClientPID,
       ref = Ref,
       queue = Ticket,
-      reply_to = ReplyTo,
       shared = Shared
     } = Request,
     #state{
@@ -719,15 +759,7 @@ enqueue(
     } = State
 )->
 
-  Req0 = #req{
-    client = ClientPID,
-    ref = Ref,
-    queue = Ticket,
-    reply_to = ReplyTo,
-    shared = Shared,
-    has_lock = false
-  },
-  Req = start_waiting(Request, State, Req0),
+  Req = start_waiting(Request, State, new_req(Request)),
   Requests = Requests0#{
     Ref => Req
   },
@@ -751,26 +783,14 @@ enqueue(
 enqueue_barging(
     #request{
       client = ClientPID,
-      ref = Ref,
-      queue = Ticket,
-      reply_to = ReplyTo
+      ref = Ref
     } = Request,
     #state{
       requests = Requests0,
       clients = Clients0
     } =State
 )->
-  Req0 = #req{
-    client = ClientPID,
-    ref = Ref,
-    % The barging request never enters #state.queue, the ticket is
-    % kept only to keep every #req{} alike
-    queue = Ticket,
-    reply_to = ReplyTo,
-    shared = false, % Enqueued barging request is always exclusive
-    has_lock = false
-  },
-  Req = start_waiting(Request, State, Req0),
+  Req = start_waiting(Request, State, new_barging_req(Request)),
   Requests = Requests0#{
     Ref => Req
   },
@@ -827,31 +847,16 @@ dequeue(
     #state{
       requests = Requests0,
       clients = Clients0,
-      queue = Queue0,
-      barging = Barging
-    } = State0
+      queue = Queue0
+    } = State
 )->
   stop_waiting(Req),
-  Requests = maps:remove(Ref, Requests0),
-  Clients = remove_client_request(ClientPID, Ref, Clients0),
 
-  State = State0#state{
-    requests = Requests,
-    clients = Clients
-  },
-  case Barging of
-    #request{ ref = Ref }->
-      % Dequeue barging request
-      State#state{
-        barging = undefined
-      };
-    _->
-      State#state{
-        queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
-        requests = Requests,
-        clients = Clients
-      }
-  end.
+  State#state{
+    queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
+    requests = maps:remove(Ref, Requests0),
+    clients = remove_client_request(ClientPID, Ref, Clients0)
+  }.
 
 %%-----------------------------------------------------------------
 %%  Grant the lock to a request that has never been queued
@@ -860,23 +865,13 @@ get_lock(
     #request{
       client = ClientPID,
       ref = Ref,
-      queue = Ticket,
-      reply_to = ReplyTo,
       shared = Shared
-    },
+    } = Request,
     #state{
       clients = Clients0
     } = State0
 )->
-  Req = #req{
-    client = ClientPID,
-    ref = Ref,
-    queue = Ticket,
-    reply_to = ReplyTo,
-    shared = Shared
-  },
-
-  State = locked(Req, State0),
+  State = locked(new_req(Request), State0),
   Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
 
   State#state{
@@ -1141,14 +1136,13 @@ try_unlock(#state{
       % The entry is still ours: a new client has taken a ticket and
       % its request is on the way. Start the next round with a clean
       % state and wait for it
-      State#state{
+      arm_postpone_timer(State#state{
         holders = #{},
         queue = gb_sets:empty(),
         requests = #{},
         clients = #{},
-        can_share = true,
-        postpone_timer = erlang:start_timer(_Timeout = 100, self(), postpone_timeout)
-      };
+        can_share = true
+      });
     _->
       % unlocked, the next client will start a new manager
       exit(normal)

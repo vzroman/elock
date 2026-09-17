@@ -459,7 +459,7 @@ arm_postpone_timer(State)->
   }.
 
 cancel_postpone_timer(#state{postpone_timer = Timer} = State) when is_reference(Timer)->
-  erlang:cancel_timer(Timer),
+  erlang:cancel_timer(Timer,[{async, true} | {info, false}]),
   State#state{
     postpone_timer = undefined
   };
@@ -1253,7 +1253,7 @@ stop_waiting(#req{
   end,
   if
     is_reference(Timer)->
-      catch erlang:cancel_timer(Timer);
+      catch erlang:cancel_timer(Timer, [{async, true} | {info, false}]);
     true ->
       ignore
   end,

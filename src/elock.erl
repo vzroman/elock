@@ -4,34 +4,82 @@
 -include("elock.hrl").
 
 %%=================================================================
+%%	OTP API
+%%=================================================================
+-export([
+  start_link/1
+]).
+
+%%=================================================================
 %%	API
 %%=================================================================
 -export([
-  start_link/1,
-  lock/4, lock/5,
+  lock/3, lock/4,
+  unlock/1,
   ready_nodes/1
 ]).
 
+-define(context,'$elock_context$').
+-record(context,{
+  refs,
+  held
+}).
+
+-record(ref,{
+  scope,
+  term,
+  nodes,
+  shared
+}).
+
+-record(manager,{
+  pid,
+  shared,
+  exclusive
+}).
+
+-record(lock,{
+  lock_ref,
+  refs
+}).
+
+% #context{
+%   refs = #{
+%     Ref => #ref{
+%       scope = Scope,
+%       term = Term,
+%       nodes = Nodes,
+%       shared = Shared
+%     }
+%   },
+%   held = #{
+%     Scope => #{
+%       Term => #{
+%         Node => #manager{
+%           pid = ManagerPID,
+%           shared = #lock{
+%             lock_ref = LockRef,
+%             refs = [Ref]
+%           },
+%           exclusive = #lock{
+%             lock_ref = LockRef,
+%             refs = [Ref]
+%           }
+%         }
+%       }
+%     }
+%   }
+% }
+
+
 %%=================================================================
-%%	Internal API
+%%	OTP API
 %%=================================================================
--export([
-  do_lock/2
-]).
-
-%%-export([
-%%  test/0,
-%%  try_test_lock/3
-%%]).
-
-%% ?deadlock_scope/1 comes from include/elock.hrl
-
-%------------call it from OTP supervisor as a permanent worker------
-start_link( Name )->
+start_link(Scope)->
   {ok, spawn_link(fun()->
 
     % Prepare the storage for locks
-    ets:new(Name,[
+    ets:new(Scope,[
       named_table,
       public,
       set,
@@ -39,7 +87,7 @@ start_link( Name )->
       {write_concurrency, auto}
     ]),
 
-    DeadLockScope = ?deadlock_scope( Name ),
+    DeadLockScope = ?deadlock_scope(Scope),
     case pg:start_link( DeadLockScope ) of
       {ok,_} -> ok;
       {error,{already_started,_}}->ok;
@@ -50,14 +98,227 @@ start_link( Name )->
     timer:sleep(infinity)
   end)}.
 
-%-----------Lock request------------------------------------------
-lock(Locks, Term, IsShared, Timeout )->
-  lock(Locks, Term, IsShared, Timeout, [node()]).
+%%=================================================================
+%%	API
+%%=================================================================
+lock(Scope, Term, Nodes)->
+  lock(Scope, Term, Nodes, _Options = #{}).
+lock(Scope, Term, Nodes, Options)->
+  validate_nodes(Nodes),
+  #{
+    timeout := Timeout,
+    is_shared := IsShared
+  } = validate_options(Options),
+  Ref = make_ref(),
+  Request = prepare_request(#request{
+    ref = Ref,
+    scope = Scope,
+    term = Term,
+    nodes = Nodes,
+    client = self(),
+    timeout = Timeout,
+    shared = IsShared
+  }),
+  case run_request(Request) of
+    {ok, Locks} ->
+      locked(Request, Locks),
+      Ref;
+    Error->
+      Error
+  end.
 
-lock(_Locks, _Term, _IsShared, _Timeout, [] )->
-  {ok,fun()->ok end};
+unlock(Ref)->
+  case erase_context() of
+    Context0 = #context{refs = Refs} when is_map_key(Ref, Refs)->
+      Context = unlock(Ref, Context0),
+      if
+        Context =/= undefined ->
+          put_context(Context);
+        true ->
+          ignore
+      end,
+      ok;
+    _->
+      ok
+  end.
 
-lock(Locks, Term, IsShared, Timeout, [Node]=Nodes ) when Node=:=node()->
+ready_nodes(Scope)->
+  [node(PID)|| PID <- pg:get_members(?deadlock_scope(Scope), {?MODULE,'$members$'})].
+
+%%=================================================================
+%%	REQUEST
+%%=================================================================
+prepare_request(Request) ->
+  case get_context() of
+    Context = #context{} ->
+      prepare_request(Request, Context);
+    _->
+      Request#request{
+        held = []
+      }
+  end.
+
+prepare_request(
+    #request{
+      scope = Scope
+    } =Request,
+    Context
+)->
+  NeedLockNodes = need_lock_nodes(Request, Context),
+  if
+    NeedLockNodes =:= []->
+      ignore;
+    true ->
+      HeldLocks = held_locks(Scope, Context),
+      Request#request{
+        held = HeldLocks
+      }
+  end.
+
+need_lock_nodes(
+    #request{
+      scope = Scope,
+      term = Term,
+      nodes = Nodes,
+      shared = Shared
+    },
+    #context{
+      held = Held
+    }
+)->
+  case Held of
+    #{
+      Scope := #{
+        Term := HeldNodes
+      }
+    }->
+      lists:filter(
+        fun(N)->
+          case HeldNodes of
+            #{N := #manager{shared = #lock{}}} when Shared =:= true->
+              false;
+            #{N := #manager{exclusive = #lock{}}} when Shared =:= false->
+              false;
+            _->
+              true
+          end
+        end,
+        Nodes
+      );
+    _->
+      Nodes
+  end.
+
+held_locks(
+    Scope,
+    #context{
+      held = Held
+    }
+)->
+  case Held of
+    #{ Scope := ScopeTerms }->
+      maps:fold(
+        fun(Term, Nodes, Acc)->
+          Acc ++ [{Term,N}|| N <- maps:keys(Nodes)]
+        end,
+        [],
+        ScopeTerms
+      );
+    _->
+      []
+  end.
+
+run_request(#request{})->
+  todo;
+run_request(ignore)->
+  {ok, ignore}.
+
+locked(Request, Locks)->
+  todo.
+
+%-----------------------------------------------------------------
+%	Validate utilities
+%-----------------------------------------------------------------
+validate_nodes(Nodes)->
+  if
+    is_list(Nodes), length(Nodes) > 0 -> ok;
+    true -> throw({invalid_nodes, Nodes})
+  end,
+  lists:foreach(
+    fun(N)->
+      if
+        is_atom(N) -> ok;
+        true -> throw({invalid_node, N})
+      end
+    end,
+    Nodes
+  ).
+
+validate_options(Options)->
+  if
+    is_map(Options) -> ok;
+    true -> throw({invalid_options, Options})
+  end,
+  WithDefaults = maps:merge(#{
+    is_shared => false,
+    timeout => undefined
+  }, Options),
+  maps:foreach(fun validate_option/2, WithDefaults),
+  WithDefaults.
+
+validate_option(is_shared, Value)->
+  if
+    is_boolean(Value) -> Value;
+    true -> throw({invalid_is_shared, Value})
+  end;
+validate_option(timeout, Value)->
+  if
+    Value =:= undefined-> ok;
+    is_integer(Value), Value > 0 -> ok;
+    true -> throw({invalid_timeout, Value})
+  end.
+
+%-----------------------------------------------------------------
+%	Context utilities
+%-----------------------------------------------------------------
+get_context()->
+  get(?context).
+put_context(Context)->
+  put(?context, Context).
+erase_context()->
+  erase(?context).
+
+% #context{
+%   refs = #{
+%     Ref => #ref{
+%       ref = Ref,
+%       scope = Scope,
+%       term = Term,
+%       nodes = Nodes,
+%       shared = Shared
+%     }
+%   },
+%   managers = #{
+%     Scope => #{
+%       Term => #{
+%         Node => #manager{
+%           pid = ManagerPID,
+%           shared = #lock{
+%             lock_ref = LockRef,
+%             refs = [Ref]
+%           },
+%           exclusive = #lock{
+%             lock_ref = LockRef,
+%             refs = [Ref]
+%           }
+%         }
+%       }
+%     }
+%   }
+% }
+
+
+lock(Locks, Term, IsShared, Timeout, [Node]=Nodes) when Node=:=node()->
   in_context(Locks, Term, IsShared, Nodes, fun(Lock)->
     case do_lock( Lock, Timeout ) of
       {ok,Unlock}->{ok,[Unlock]};
@@ -65,7 +326,7 @@ lock(Locks, Term, IsShared, Timeout, [Node]=Nodes ) when Node=:=node()->
     end
   end);
 
-lock(Locks, Term, IsShared, Timeout, Nodes ) when is_list(Nodes)->
+lock(Locks, Term, IsShared, Timeout, Nodes) when is_list(Nodes)->
   in_context( Locks, Term, IsShared, Nodes, fun( Lock )->
     case ecall:call_all_wait(Nodes, ?MODULE, do_lock, [Lock, Timeout ]) of
       {OKs,[]}->

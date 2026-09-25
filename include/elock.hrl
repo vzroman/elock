@@ -5,25 +5,33 @@
 %%-------------------------------------------------------------------------------
 %% Types
 %%-------------------------------------------------------------------------------
--define(lock(T),{lock,T}).
--define(queue(R,Q),{queue,R,Q}).
-
--define(holder(H,T),{holder,H,T}).
--define(wait(T),{wait,T}).
-
--define(deadlock_scope(Locks),list_to_atom(atom_to_list(Locks)++"_$deadlock_scope$")).
-
 -record(request,{
   queue,
   ref,
   scope,
   term,
   client,
-  reply_to,
+  proxy,
   shared,
   held,
   nodes,
   timeout
+}).
+
+-record(unlock,{
+  manager,
+  ref
+}).
+
+-record(queued,{
+  ref,
+  manager,
+  node
+}).
+
+-record(add_held_locks,{
+  ref,
+  held
 }).
 
 %%-------------------------------------------------------------------------------

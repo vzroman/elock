@@ -33,7 +33,7 @@ check_deadlock(Locks, Scope, Holder, Term, Nodes, HeldLocks)->
     % Check for lock success on neighbour nodes
     NeighbourLocks = check_neighbours(Locks, Scope, Holder, Locker, Term, Nodes),
     ?LOGDEBUG("~p neigbour locks: ~p",[ Term, NeighbourLocks ]),
-
+    
     % Subscribe to lock success on neighbour nodes
     AllHeldLocks = ordsets:from_list( HeldLocks ++ NeighbourLocks ),
 

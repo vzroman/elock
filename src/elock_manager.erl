@@ -37,8 +37,7 @@
 %%	API
 %%=================================================================
 -export([
-  lock/1,
-  unlock/1
+  lock/1
 ]).
 
 %%=================================================================
@@ -61,12 +60,22 @@
   ref
 }).
 
-%%-----------------------------------------------------------------
-%%  The client's handle to the acquired lock
-%%-----------------------------------------------------------------
--record(unlock,{
+-record(graph,{
+  edges,
+  refs
+}).
+
+-record(edge,{
   manager,
-  ref
+  refs
+}).
+
+-record(deadlock_probe,{
+  ref,
+  term,
+  manager,
+  holds,
+  sent_to
 }).
 
 %%=================================================================
@@ -78,36 +87,29 @@ lock(#request{
   term = Term
 } = Request
 )->
-  LockKey = ?lock(Term),
-  case ets:update_counter(Scope, LockKey, {3,1}, {LockKey,0,0}) of % try to set lock
+  case ets:update_counter(Scope, Term, {3,1}, {Term,0,0}) of % try to set lock
     1->
       %------------------locked------------------
       % The lock was free. This client is its first holder and starts
       % the manager for those who queue up behind it
       Manager = start_manager(Request),
-      {ok, #unlock{
-        manager = Manager,
-        ref = Ref
-      }};
+      {ok, Manager};
 
     RequestQueue->
       %------------enqueued-------------------
       % Somebody is ahead. The ticket tells the manager where the
       % request stands among the other clients
-      case get_manager(Scope, LockKey, RequestQueue) of
+      case get_manager(Scope, Term, RequestQueue) of
         Manager when is_pid(Manager) ->
           % The verdict lives in the manager's mailbox. If the manager
           % exits before it has replied then the request goes with the
           % mailbox and nobody will ever answer - monitor it
           MonitorRef = erlang:monitor(process, Manager),
-          Manager ! Request#request{ queue = RequestQueue, reply_to = self() },
+          Manager ! Request#request{ queue = RequestQueue, proxy = self() },
           Verdict =
             receive
               #locked{ref = Ref}->
-                {ok, #unlock{
-                  manager = Manager,
-                  ref = Ref
-                }};
+                {ok, Manager};
               #deadlock{ref = Ref}->
                 {error, deadlock};
               #timeout{ref = Ref}->
@@ -119,7 +121,7 @@ lock(#request{
                 % The manager is gone and the request went with it.
                 % The lock entry is removed before the manager exits,
                 % so the new ticket starts the next round
-                ets:match_delete(Scope, {LockKey, Manager, '_'}),
+                ets:match_delete(Scope, {Term, Manager, '_'}),
                 retry
             end,
           erlang:demonitor(MonitorRef, [flush]),
@@ -134,15 +136,11 @@ lock(#request{
       end
   end.
 
-unlock(#unlock{manager = Manager}=Unlock)->
-  catch Manager ! Unlock,
-  ok.
-
 %%-----------------------------------------------------------------
 %%  Client side utilities
 %%-----------------------------------------------------------------
-get_manager(Scope, LockKey, MyQueue)->
-  case ets:lookup(Scope, LockKey) of
+get_manager(Scope, Term, MyQueue)->
+  case ets:lookup(Scope, Term) of
     [ { _Lock, Manager, Queue } ] when is_pid(Manager)->
       if
         Queue >= MyQueue ->
@@ -155,7 +153,7 @@ get_manager(Scope, LockKey, MyQueue)->
     _->
       % The manager has not registered itself yet, wait
       receive after 1 -> ok end,
-      get_manager(Scope, LockKey, MyQueue)
+      get_manager(Scope, Term, MyQueue)
   end.
 
 % Every client of the Term goes through the manager, hence the
@@ -180,23 +178,22 @@ start_manager(Request)->
   requests,         % #{ Ref => #req{} }, both holders and waiters
   clients,          % #{ ClientPID => #client{} }
   scope,            % the ETS table of the locks
-  lock_key,         % ?lock(Term)
+  term,             % Term
   can_share,        % the lock is shared, i.e. every holder is shared
-  deadlock_scope,   % pg scope of the deadlock checkers
   barging,          % the pending upgrade request, it is out of the queue
   last,             % the last ticket taken into the queue
   postponed,        % the requests that came before their turn
-  postpone_timer    % set while waiting for a missing ticket
+  postpone_timer,   % set while waiting for a missing ticket
+  graph
 }).
 
 -record(req,{
   client,           % the process that asked for the lock
   ref,              % unique reference of the request
   queue,            % the ticket, the key of the request in #state.queue
-  reply_to,         % the process waiting for the verdict
+  proxy,            % the process waiting for the verdict
   shared,           % the requested lock type
   has_lock,         % true - holds the lock, false - waits in the queue
-  deadlock,         % the deadlock checker, only while waiting
   timer             % the timeout timer, only while waiting
 }).
 
@@ -212,13 +209,12 @@ init(#request{
   scope = Scope,
   term = Term,
   client = Client,
-  reply_to = ReplyTo,
+  proxy = Proxy,
   shared = Shared
 })->
 
-  LockKey = ?lock(Term),
   % From now on the queued clients can find the manager
-  ets:update_element(Scope, LockKey, {2,self()}),
+  ets:update_element(Scope, Term, {2,self()}),
 
   State = #state{
     holders = #{ Ref => {Shared, Client} },
@@ -229,10 +225,9 @@ init(#request{
         ref = Ref,
         % The manager is started by the winner of the ticket 1
         queue = 1,
-        reply_to = ReplyTo,
+        proxy = Proxy,
         shared = Shared,
         has_lock = true,
-        deadlock = undefined,
         timer = undefined
       }
     },
@@ -243,13 +238,16 @@ init(#request{
       }
     },
     scope = Scope,
-    lock_key = LockKey,
+    term = Term,
     can_share = Shared,
-    deadlock_scope = ?deadlock_scope(Scope),
     barging = undefined,
     last = 1,
     postponed = [],
-    postpone_timer = undefined
+    postpone_timer = undefined,
+    graph = #graph{
+      edges = #{},
+      refs = #{}
+    }
   },
 
   loop(State).
@@ -339,11 +337,11 @@ handle_request(
 handle_request(
     #request{
       ref = Ref,
-      reply_to = ReplyTo
+      proxy = Proxy
     },
     State
 )->
-  catch ReplyTo ! #retry{ref = Ref},
+  catch Proxy ! #retry{ref = Ref},
   State.
 
 %%-----------------------------------------------------------------
@@ -386,10 +384,10 @@ handle_postponed(#state{
 handle_postponed(#state{
   postponed = [#request{
     ref = Ref,
-    reply_to = ReplyTo
+    proxy = Proxy
   }|Rest]
 } = State)->
-  ReplyTo ! #retry{ref = Ref},
+  catch Proxy ! #retry{ref = Ref},
   handle_postponed(State#state{
     postponed = Rest
   });
@@ -507,7 +505,8 @@ handle_unlock(
       % If here, then it's not unlocked: a new client has taken a ticket
       % and the state is already reset for it. The monitor of the leaving
       % client is not in the reset state, drop it explicitly
-      #req{client = Client} = maps:get(Ref, Requests),
+      Req = #req{client = Client} = maps:get(Ref, Requests),
+      kill_proxy(Req),
       #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
       erlang:demonitor(MonRef),
 
@@ -552,8 +551,8 @@ handle_timeout(
     } = State0
 )->
   case Requests of
-    #{Ref := #req{ has_lock = false, reply_to = ReplyTo } = Req}->
-      catch ReplyTo ! #timeout{ref = Ref},
+    #{Ref := #req{ has_lock = false, proxy = Proxy } = Req}->
+      catch Proxy ! #timeout{ref = Ref},
       % The timer has just fired, there is nothing to cancel. Cancelling
       % it here would cost a round trip to the scheduler that owns it -
       % a fired timer is no longer in the manager's own timer tree
@@ -578,9 +577,9 @@ handle_deadlock(
   case Requests of
     #{Ref := Req = #req{
       has_lock = false,
-      reply_to = ReplyTo}
-    }->
-      catch ReplyTo ! #deadlock{ ref = Ref },
+      proxy = Proxy
+    }}->
+      catch Proxy ! #deadlock{ ref = Ref },
       State = dequeue(Req, State0),
       next(State);
     _->
@@ -601,18 +600,7 @@ handle_down(
     #{ ClientPID := #client{requests = ClientRequests}}->
       maps:fold(
         fun(Ref, _Shared, #state{requests = RequestsAcc} = StateAcc)->
-          Req = #req{
-            reply_to = ReplyTo
-          } = maps:get(Ref, RequestsAcc),
-          if
-            % For a multi node lock the verdict is awaited not by the
-            % client itself but by a worker on its behalf. There is
-            % nobody to serve any more
-            is_pid(ReplyTo), ReplyTo =/= ClientPID ->
-              exit(ReplyTo, kill);
-            true ->
-              ignore
-          end,
+          Req = maps:get(Ref, RequestsAcc),
           remove_request(Req, StateAcc)
         end,
         State,
@@ -700,6 +688,7 @@ remove_request(
     #req{has_lock = false} = Req,
     State0
 )->
+  kill_proxy(Req),
   State = dequeue(Req, State0),
   next(State);
 
@@ -710,8 +699,24 @@ remove_request(
     #req{has_lock = true} = Req,
     State0
 )->
+  kill_proxy(Req),
   State = unlocked(Req, State0),
   next(State).
+
+kill_proxy(#req{
+  client = ClientPID,
+  proxy = Proxy
+})->
+  if
+  % For a multi node lock the verdict is awaited not by the
+  % client itself but by a worker on its behalf. There is
+  % nobody to serve any more
+    is_pid(Proxy), Proxy =/= ClientPID ->
+      exit(Proxy, kill);
+    true ->
+      ignore
+  end,
+  ok.
 
 %%-----------------------------------------------------------------
 %%  The #req{} of a new request. The ticket is what keys it in
@@ -722,14 +727,14 @@ new_req(#request{
   client = ClientPID,
   ref = Ref,
   queue = Ticket,
-  reply_to = ReplyTo,
+  proxy = Proxy,
   shared = Shared
 })->
   #req{
     client = ClientPID,
     ref = Ref,
     queue = Ticket,
-    reply_to = ReplyTo,
+    proxy = Proxy,
     shared = Shared,
     has_lock = false
   }.
@@ -757,24 +762,17 @@ enqueue(
     } = Request,
     #state{
       queue = Queue0,
-      requests = Requests0,
       clients = Clients0
-    } = State
+    } = State0
 )->
-
-  Req = start_waiting(Request, State, new_req(Request)),
-  Requests = Requests0#{
-    Ref => Req
-  },
+  State = start_waiting(Request, State0),
   Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
   % The tickets are unique and grow with the queue, hence the set is
   % ordered by the arrival and the head of the queue is its smallest
   % element
   Queue = gb_sets:insert({Ticket, Ref}, Queue0),
-
   State#state{
     queue = Queue,
-    requests = Requests,
     clients = Clients
   }.
 
@@ -789,18 +787,12 @@ enqueue_barging(
       ref = Ref
     } = Request,
     #state{
-      requests = Requests0,
       clients = Clients0
-    } =State
+    } =State0
 )->
-  Req = start_waiting(Request, State, new_barging_req(Request)),
-  Requests = Requests0#{
-    Ref => Req
-  },
+  State = start_waiting(Request, State0),
   Clients = add_client_request(ClientPID, Ref, _Shared = false, Clients0),
-
   State#state{
-    requests = Requests,
     clients = Clients,
     barging = Request
   }.
@@ -822,15 +814,13 @@ dequeue(
       },
       requests = Requests0,
       clients = Clients0
-    } = State
+    } = State0
 )->
   % Dequeue barging request
-  stop_waiting(Req),
-  Requests = maps:remove(Ref, Requests0),
+  State = stop_waiting(Req, State0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
 
   State#state{
-    requests = Requests,
     clients = Clients,
     barging = undefined
   };
@@ -890,7 +880,7 @@ locked(
       client = ClientPID,
       ref = Ref,
       queue = Ticket,
-      reply_to = ReplyTo,
+      proxy = Proxy,
       shared = Shared
     } = Req0,
     #state{
@@ -900,13 +890,11 @@ locked(
       can_share = CanShare0
     } = State)->
 
-  ReplyTo ! #locked{ref = Ref},
+  catch Proxy ! #locked{ref = Ref},
   Req = stop_waiting(Req0#req{
     has_lock = true,
-    reply_to = undefined
+    proxy = undefined
   }),
-
-  % TODO. Register lock
 
   Requests = Requests0#{
     Ref => Req
@@ -978,7 +966,7 @@ try_barging(
       ref = Ref,
       client = ClientPID,
       shared = Shared,
-      reply_to = ReplyTo
+      proxy = Proxy
     } = Request,
     #state{
       holders = Holders,
@@ -1016,7 +1004,7 @@ try_barging(
     true->
       % Client requested lock upgrade, but there is already another client
       % waiting for upgrade - deadlock. The first enqueued wins.
-      catch ReplyTo ! #deadlock{ref = Ref},
+      catch Proxy ! #deadlock{ref = Ref},
       State
   end.
 
@@ -1125,15 +1113,15 @@ next(State)->
 %%-----------------------------------------------------------------
 try_unlock(#state{
   scope = Scope,
-  lock_key = LockKey,
+  term = Term,
   last = LastQueue
 } = State)->
   % try to remove the lock
   Self = self(),
-  ets:delete_object(Scope, {LockKey, Self, LastQueue}),
+  ets:delete_object(Scope, {Term, Self, LastQueue}),
 
   % check unlocked
-  case ets:lookup(Scope, LockKey) of
+  case ets:lookup(Scope, Term) of
     [{_,Self,_}]->
       % not unlocked there is a queue
       % The entry is still ours: a new client has taken a ticket and
@@ -1212,18 +1200,33 @@ only_holder(ClientRequests, Holders, Waiting)->
 %%-----------------------------------------------------------------
 start_waiting(
     #request{
-      client = Client,
-      ref = Ref,
-      timeout = Timeout,
-      held = HeldLocks,
-      nodes = Nodes
-    },
-    #state{
-      scope = Scope,
-      deadlock_scope = DeadlockScope,
-      lock_key = ?lock(Term)
-    },
-    Req
+      timeout = Timeout
+    } = Request,
+    Graph0
+)->
+  Req = start_timer(
+    new_req(Request),
+    Timeout
+  ),
+
+  Graph = init_deadlock_probe(Request, Graph0),
+
+  {Req, Graph}.
+
+stop_waiting(
+    Req0,
+    Graph0
+)->
+  Req = stop_timer(Req0),
+  Graph = stop_deadlock_probe(Req, Graph0),
+
+  {Req, Graph}.
+
+start_timer(
+    #req{
+      ref = Ref
+    } =Req,
+    Timeout
 )->
   Timer =
     if
@@ -1232,37 +1235,24 @@ start_waiting(
       true ->
         undefined
     end,
-
-  % Init deadlock check process
-  Deadlock = elock_deadlock:check_deadlock(Scope, DeadlockScope, Client ,Term, Nodes, HeldLocks),
-
   Req#req{
-    deadlock = Deadlock,
     timer = Timer
   }.
 
-stop_waiting(#req{
-  deadlock = Deadlock,
-  timer = Timer
-} = Req)->
-  if
-    is_pid(Deadlock) ->
-      catch Deadlock ! {stop, Deadlock};
-    true->
-      ignore
-  end,
+stop_timer(
+    #req{
+      ref = Timer
+    } =Req
+)->
   if
     is_reference(Timer)->
-      catch erlang:cancel_timer(Timer, [{async, true} | {info, false}]);
+      catch erlang:cancel_timer(Timer, [{async, true} | {info, false}]),
+      Req#req{
+        timer = undefined
+      };
     true ->
-      ignore
-  end,
-
-  Req#req{
-    deadlock = undefined,
-    timer = undefined
-  }.
-
+      Req
+  end.
 %%-----------------------------------------------------------------
 %%  The lock stays shared while every holder is shared
 %%-----------------------------------------------------------------
@@ -1275,3 +1265,51 @@ can_share_loop({_Ref, {_Shared, _ClientPID}, Iterator})->
   can_share_loop( maps:next(Iterator) );
 can_share_loop(none)->
   true.
+
+% Graph structure:
+% #graph{
+%   edges = #{
+%     {Term, Node} => #edge{
+%       manager = Manager,
+%       refs = #{
+%         Ref => Count
+%       }
+%     }
+%   },
+%   refs = #{
+%     Ref => [{Term, Node}]
+%   }
+% }
+init_deadlock_probe(
+    #request{
+      ref = Ref,
+      nodes = Nodes,
+      client = ClientPID,
+      held = Held
+    },
+    #graph{
+      edges = Edges0,
+      refs = Refs0
+    } = Graph0
+)->
+  if
+    length(Nodes) > 1->
+      catch ecall:send(
+        ClientPID,
+        #queued{
+          ref = Ref,
+          manager = self(),
+          node = node()
+        }
+      );
+    true ->
+      ignore
+  end,
+
+  if
+    map_size(Held) > 0 ->
+
+      todo;
+    true ->
+      Graph0
+  end.

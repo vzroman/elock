@@ -205,14 +205,14 @@ remove_lock(
       fun(Node, Manager, Acc)->
         Key = {Term, Node},
         case Acc of
-          {Manager, Count} ->
+          #{Key := {Manager, Count}} ->
             if
               Count =:= 1 ->
                 maps:remove(Key, Acc);
               true ->
                 Acc#{ Key => {Manager, Count - 1}}
             end;
-          {_NewManager, Count}->
+          #{Key := {_NewManager, _Count}}->
             ?LOGWARNING("~p unlocked stale lock ~p",[self(), Key]),
             Acc;
           _->
@@ -327,7 +327,7 @@ wait_verdict(#waiting{
       case NodeResult of
         {ok, {ok,Manager}} ->
 
-          Queued = maps:remove(Manager, Queued0),
+          Queued = maps:remove(Node, Queued0),
           notify_queued(Queued, #{Node => Manager}, Term, Ref),
 
           Nodes = Nodes0#{
@@ -344,6 +344,11 @@ wait_verdict(#waiting{
           wait_unlock(Pending, Ref),
           Error
       end;
+    #queued{ref = Ref, node = Node} when is_map_key(Node, Nodes0)->
+      % The grant overtook the notification: the node is held already
+      % and there is nothing to notify. Should the request fail, the
+      % granted nodes are unlocked through unlock_nodes/2 anyway
+      wait_verdict(Waiting0);
     #queued{ref = Ref, manager = Manager, node = Node}->
       notify_queued(#{Node => Manager}, Nodes0, Term, Ref),
       Queued = Queued0#{

@@ -26,9 +26,9 @@
 %%  Everything else belongs to the manager: it grants shared and
 %%  exclusive locks, queues the requests it can not grant, monitors
 %%  the clients, owns the timeout timers and exchanges the deadlock
-%%  probes with the managers of the other terms (see the deadlock
-%%  probes section). It exits as soon as the lock entry is removed
-%%  from ETS - the next client will start a new manager.
+%%  probes with the managers of the other terms (see elock_graph).
+%%  It exits as soon as the lock entry is removed from ETS - the
+%%  next client will start a new manager.
 %%=================================================================
 -module(elock_manager).
 
@@ -46,12 +46,11 @@
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  The verdict on a queued request. #retry{} means the manager has
-%%  already passed the ticket by, the client has to take a new one
+%%  already passed the ticket by, the client has to take a new one.
+%%  #deadlock{} lives in elock.hrl: it is also the reply of a probe
+%%  to the origin manager (see elock_graph)
 %%-----------------------------------------------------------------
 -record(locked,{
-  ref
-}).
--record(deadlock,{
   ref
 }).
 -record(timeout,{
@@ -59,23 +58,6 @@
 }).
 -record(retry,{
   ref
-}).
-
-%%=================================================================
-%%  Manager <-> manager protocol
-%%=================================================================
-%%-----------------------------------------------------------------
-%%  The probe of a waiting request (see the deadlock probes section).
-%%  It travels along the wait-for edges from manager to manager, the
-%%  one that closes a cycle on a heavier waiter answers the origin
-%%  manager with #deadlock{}
-%%-----------------------------------------------------------------
--record(deadlock_probe,{
-  ref,      % the origin request
-  term,     % {Term, Node} - the lock the origin waits for
-  manager,  % the origin manager, the verdict is sent back to it
-  weight,   % {HeldCount, Ref} of the origin - the lighter request loses
-  sent_to   % #{ ManagerPID => true } - managers this probe has already been sent to
 }).
 
 %%=================================================================
@@ -184,7 +166,7 @@ start_manager(Request)->
   last,             % the last ticket taken into the queue
   postponed,        % the requests that came before their turn
   postpone_timer,   % set while waiting for a missing ticket
-  graph
+  graph             % the locks held by the waiters (see elock_graph)
 }).
 
 -record(req,{
@@ -210,8 +192,7 @@ init(#request{
   term = Term,
   client = Client,
   proxy = Proxy,
-  shared = Shared,
-  held = Held
+  shared = Shared
 })->
 
   % From now on the queued clients can find the manager
@@ -1154,45 +1135,29 @@ try_unlock(#state{
         queue = gb_sets:empty(),
         requests = #{},
         clients = #{},
-        can_share = true
+        can_share = true,
+        graph = undefined
       });
     _->
       % unlocked, the next client will start a new manager
       exit(normal)
   end.
 
-start_deadlock_probe(
-    #request{
-      ref = Ref,
-      nodes = Nodes,
-      client = ClientPID
-    },
-    #req{
-      held = Held
-    } = Req,
-    Term
-)->
-  if
-    length(Nodes) > 1->
-      catch ecall:send(
-        ClientPID,
-        #queued{
-          ref = Ref,
-          manager = self(),
-          node = node()
-        }
-      );
-    true ->
-      ignore
-  end,
-
-  probe_held_locks(Req, Held, Term).
-
+%%=================================================================
+%%  Deadlock probes
+%%
+%%  The wait-for graph and the probe protocol live in elock_graph,
+%%  the manager feeds it: a request joins the graph when it starts
+%%  waiting and leaves it when it stops (see start_waiting/2 and
+%%  stop_waiting/2). The grants a multi node request gets on the
+%%  other nodes meanwhile and the probes of the other managers come
+%%  in here
+%%=================================================================
 %%-----------------------------------------------------------------
 %%  A waiting request has been granted on another node. The hold
-%%  joins its held map and is probed: it adds wait-for edges and may
-%%  be the very edge that closes a cycle, and only the request that
-%%  gained it can see that
+%%  joins its held map in the graph and is probed: it adds wait-for
+%%  edges and may be the very edge that closes a cycle, and only the
+%%  request that gained it can see that
 %%-----------------------------------------------------------------
 handle_add_held_locks(
     #add_held_locks{
@@ -1201,21 +1166,17 @@ handle_add_held_locks(
     },
     #state{
       requests = Requests,
-      term = Term
+      term = Term,
+      graph = Graph0
     } = State
 )->
   case Requests of
     #{Ref := #req{
-      has_lock = false,
-      held = Held
-    } = Req0}->
-      New = new_held_locks(Update, Held),
-      Req = Req0#req{
-        held = maps:merge(Held, New)
-      },
-      probe_held_locks(Req, New, Term),
+      has_lock = false
+    }}->
+      Graph = elock_graph:add_held_locks(Ref, Term, Update, Graph0),
       State#state{
-        requests = Requests#{ Ref => Req }
+        graph = Graph
       };
     _->
       % The request got the lock or left meanwhile, or the update
@@ -1224,51 +1185,17 @@ handle_add_held_locks(
   end.
 
 %%-----------------------------------------------------------------
-%%  The entries of the update the held map does not have yet: a new
-%%  key, or a fresh PID for a key whose old one is stale
-%%-----------------------------------------------------------------
-new_held_locks(Update, Held)->
-  maps:filter(
-    fun(Key, Manager)->
-      case Held of
-        #{Key := Manager}->
-          false;
-        _->
-          true
-      end
-    end,
-    Update
-  ).
-
-%%-----------------------------------------------------------------
-%%  The probe for the held locks of a waiting request goes to the
-%%  manager of each of them, except this very Term
-%%-----------------------------------------------------------------
-probe_held_locks(
-    #req{
-      ref = Ref,
-      weight = Weight
-    },
-    Held,
-    Term
-)->
-  Self = self(),
-  WaitTerm = {Term, node()},
-  SentTo = #{ Self => true },
-  send_deadlock_probe(
-    #deadlock_probe{
-      ref = Ref,
-      term = WaitTerm,
-      manager = Self,
-      weight = Weight,
-      sent_to = SentTo
-    },
-    probe_targets([ maps:remove(WaitTerm, Held) ], SentTo)
-  ).
-
-%%-----------------------------------------------------------------
-%%  A probe from another manager. The waiters that hold the lock the
-%%  origin waits for close a cycle with it
+%%  A probe from another manager, in two steps:
+%%  * the graph weighs the waiters that close a cycle with the
+%%    origin against it. If the origin loses the graph has answered
+%%    the origin manager and the probe stops here. Otherwise the
+%%    closers lose and are aborted one by one - an abort pushes the
+%%    queue and may grant the lock to a later closer, that resolves
+%%    its cycle and handle_deadlock/2 ignores it, hence the refs
+%%    rather than the #req{} copies
+%%  * the probe is passed on from the graph after the aborts: a
+%%    waiter that has got the lock is a holder now, it does not
+%%    depend on the origin any more and is not forwarded for
 %%-----------------------------------------------------------------
 handle_deadlock_probe(
     Probe,
@@ -1276,129 +1203,13 @@ handle_deadlock_probe(
       graph = Graph0
     } = State0
 )->
-  {AbortRefs, Graph} = elock_graph:probe(Probe, Graph0),
-  State =
-    lists:foldl(
-      fun handle_deadlock/2,
-      State0,
-      AbortRefs
-    ),
-  State#state{
-    graph = Graph
-  }.
-
-%%-----------------------------------------------------------------
-%%  Does the waiter hold the lock the origin waits for? The same
-%%  incarnation of it, i.e. by the origin manager's PID - a hold by
-%%  another PID is a stale one, not an edge
-%%-----------------------------------------------------------------
-closes_cycle(
-    #req{
-      held = Held
-    },
-    Term,
-    Manager
-)->
-  case Held of
-    #{ Term := Manager }->
-      true;
-    _->
-      false
-  end.
-
-%%-----------------------------------------------------------------
-%%  The verdict to the origin manager, it aborts the origin if it is
-%%  still waiting (see handle_deadlock/2)
-%%-----------------------------------------------------------------
-abort_origin(#deadlock_probe{
-  ref = Ref,
-  manager = Manager
-})->
-  catch ecall:send(Manager, #deadlock{ref = Ref}),
-  ok.
-
-%%-----------------------------------------------------------------
-%%  The closers are aborted one by one. An abort pushes the queue
-%%  and may grant the lock to a later closer - that resolves its
-%%  cycle and handle_deadlock/2 ignores it, hence the refs rather
-%%  than the #req{} copies
-%%-----------------------------------------------------------------
-abort_closers(Closers, State)->
-  lists:foldl(
-    fun handle_deadlock/2,
-    State,
-    [ Ref || #req{ref = Ref} <- Closers ]
-  ).
-
-%%-----------------------------------------------------------------
-%%  Pass the probe on: the waiters of this Term depend on the origin,
-%%  so do the waiters of the locks they hold
-%%-----------------------------------------------------------------
-forward_deadlock_probe(
-    #deadlock_probe{
-      sent_to = SentTo
-    } = Probe,
-    State
-)->
-  HeldMaps = [ Held || #req{held = Held} <- waiters(State) ],
-  send_deadlock_probe(Probe, probe_targets(HeldMaps, SentTo)).
-
-%%-----------------------------------------------------------------
-%%  The managers of the held locks that the probe has not been sent
-%%  to yet
-%%-----------------------------------------------------------------
-probe_targets(HeldMaps, SentTo)->
-  maps:from_keys(
-    [ Manager ||
-      Held <- HeldMaps,
-      Manager <- maps:values(Held),
-      not is_map_key(Manager, SentTo)
-    ],
-    true
-  ).
-
-%%-----------------------------------------------------------------
-%%  The targets are added to sent_to and get the probe
-%%  the guard:
-%%  * there is somebody to send to
-%%-----------------------------------------------------------------
-send_deadlock_probe(
-    #deadlock_probe{
-      sent_to = SentTo
-    } = Probe0,
-    Targets
-) when map_size(Targets) > 0->
-  Probe = Probe0#deadlock_probe{
-    sent_to = maps:merge(SentTo, Targets)
-  },
-  maps:foreach(
-    fun(Manager, _)->
-      catch ecall:send(Manager, Probe)
-    end,
-    Targets
-  ),
-  ok;
-
-%%-----------------------------------------------------------------
-%%  Nobody to send to - the probe stops here
-%%-----------------------------------------------------------------
-send_deadlock_probe(_Probe, _Targets)->
-  ok.
-
-%%-----------------------------------------------------------------
-%%  The waiting requests: the queue and the pending barging request
-%%-----------------------------------------------------------------
-waiters(#state{
-  queue = Queue,
-  barging = Barging,
-  requests = Requests
-})->
-  Queued = [ maps:get(Ref, Requests) || {_Ticket, Ref} <- gb_sets:to_list(Queue) ],
-  case Barging of
-    #request{ref = BargingRef}->
-      [ maps:get(BargingRef, Requests) | Queued ];
-    undefined->
-      Queued
+  case elock_graph:probe(Probe, Graph0) of
+    {forward, AbortRefs}->
+      State = #state{graph = Graph} = lists:foldl(fun handle_deadlock/2, State0, AbortRefs),
+      elock_graph:forward(Probe, Graph),
+      State;
+    stop->
+      State0
   end.
 
 %%=================================================================
@@ -1457,9 +1268,11 @@ only_holder(ClientRequests, Holders, Waiting)->
   map_size(ClientRequests) - Waiting =:= map_size(Holders).
 
 %%-----------------------------------------------------------------
-%%  The attributes of a waiting request: the timeout timer, dropped
-%%  as soon as it stops waiting, and the deadlock probe, sent once
-%%  when the waiting starts (see the deadlock probes section)
+%%  A request starts waiting: the client of a multi node request is
+%%  told where it queued up (it answers with #add_held_locks{} as
+%%  the other nodes grant), the timeout timer is set for as long as
+%%  the request waits, and the request joins the wait-for graph,
+%%  which probes the locks it holds (see elock_graph)
 %%-----------------------------------------------------------------
 start_waiting(
     #request{

@@ -34,6 +34,14 @@
   held
 }).
 
+-record(deadlock_probe,{
+  ref,      % the origin request
+  edge,     % {Term, Node} - the lock the origin waits for
+  manager,  % the origin manager, the verdict is sent back to it
+  weight,   % {HeldCount, Ref} of the origin - the lighter request loses
+  sent_to   % #{ ManagerPID => true } - managers this probe has already been sent to
+}).
+
 %%-------------------------------------------------------------------------------
 %% LOGGING
 %%-------------------------------------------------------------------------------

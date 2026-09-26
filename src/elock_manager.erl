@@ -183,7 +183,8 @@ start_manager(Request)->
   barging,          % the pending upgrade request, it is out of the queue
   last,             % the last ticket taken into the queue
   postponed,        % the requests that came before their turn
-  postpone_timer    % set while waiting for a missing ticket
+  postpone_timer,   % set while waiting for a missing ticket
+  graph
 }).
 
 -record(req,{
@@ -192,15 +193,6 @@ start_manager(Request)->
   queue,            % the ticket, the key of the request in #state.queue
   proxy,            % the process waiting for the verdict
   shared,           % the requested lock type
-  held,             % #{ {Term, Node} => ManagerPID } the client held when
-                    % it asked, grows while a multi node request waits
-  weight,           % {HeldCount, Ref} as of the request: fewer held locks
-                    % lose, the ref breaks the ties. The held map of a
-                    % multi node request grows while it waits, the weight
-                    % must not, so that both sides of a cycle compare the
-                    % same numbers whichever probe gets there first, and
-                    % the request weighs the same at every manager it
-                    % waits at
   has_lock,         % true - holds the lock, false - waits in the queue
   timer             % the timeout timer, only while waiting
 }).
@@ -236,8 +228,6 @@ init(#request{
         queue = 1,
         proxy = Proxy,
         shared = Shared,
-        held = Held,
-        weight = {map_size(Held), Ref},
         has_lock = true,
         timer = undefined
       }
@@ -254,7 +244,8 @@ init(#request{
     barging = undefined,
     last = 1,
     postponed = [],
-    postpone_timer = undefined
+    postpone_timer = undefined,
+    graph = undefined
   },
 
   loop(State).
@@ -740,8 +731,7 @@ new_req(#request{
   ref = Ref,
   queue = Ticket,
   proxy = Proxy,
-  shared = Shared,
-  held = Held
+  shared = Shared
 })->
   #req{
     client = ClientPID,
@@ -749,19 +739,7 @@ new_req(#request{
     queue = Ticket,
     proxy = Proxy,
     shared = Shared,
-    held = Held,
-    weight = {map_size(Held), Ref},
     has_lock = false
-  }.
-
-%%-----------------------------------------------------------------
-%%  An enqueued barging request is always exclusive - it is the
-%%  upgrade the client is waiting for. It never enters #state.queue,
-%%  the ticket is kept only to keep every #req{} alike
-%%-----------------------------------------------------------------
-new_barging_req(Request)->
-  (new_req(Request))#req{
-    shared = false
   }.
 
 %%-----------------------------------------------------------------
@@ -779,11 +757,12 @@ enqueue(
     #state{
       queue = Queue0,
       requests = Requests0,
-      clients = Clients0
+      clients = Clients0,
+      graph = Graph0
     } = State
 )->
 
-  Req = start_waiting(Request, State, new_req(Request)),
+  {Req, Graph} = start_waiting(Request, Graph0),
   Requests = Requests0#{
     Ref => Req
   },
@@ -796,7 +775,8 @@ enqueue(
   State#state{
     queue = Queue,
     requests = Requests,
-    clients = Clients
+    clients = Clients,
+    graph = Graph
   }.
 
 %%-----------------------------------------------------------------
@@ -811,10 +791,11 @@ enqueue_barging(
     } = Request,
     #state{
       requests = Requests0,
-      clients = Clients0
+      clients = Clients0,
+      graph = Graph0
     } =State
 )->
-  Req = start_waiting(Request, State, new_barging_req(Request)),
+  {Req, Graph} = start_waiting(Request, Graph0),
   Requests = Requests0#{
     Ref => Req
   },
@@ -823,7 +804,8 @@ enqueue_barging(
   State#state{
     requests = Requests,
     clients = Clients,
-    barging = Request
+    barging = Request,
+    graph = Graph
   }.
 
 %%-----------------------------------------------------------------
@@ -842,18 +824,20 @@ dequeue(
         ref = Ref
       },
       requests = Requests0,
-      clients = Clients0
+      clients = Clients0,
+      graph = Graph0
     } = State
 )->
   % Dequeue barging request
-  stop_waiting(Req),
+  {_, Graph} = stop_waiting(Req, Graph0),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
 
   State#state{
     requests = Requests,
     clients = Clients,
-    barging = undefined
+    barging = undefined,
+    graph = Graph
   };
 
 %%-----------------------------------------------------------------
@@ -871,15 +855,20 @@ dequeue(
     #state{
       requests = Requests0,
       clients = Clients0,
-      queue = Queue0
+      queue = Queue0,
+      graph = Graph0
     } = State
 )->
-  stop_waiting(Req),
+  Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
+  Requests = maps:remove(Ref, Requests0),
+  Clients = remove_client_request(ClientPID, Ref, Clients0),
+  {_, Graph} = stop_waiting(Req, Graph0),
 
   State#state{
-    queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
-    requests = maps:remove(Ref, Requests0),
-    clients = remove_client_request(ClientPID, Ref, Clients0)
+    queue = Queue,
+    requests = Requests,
+    clients = Clients,
+    graph = Graph
   }.
 
 %%-----------------------------------------------------------------
@@ -918,14 +907,18 @@ locked(
       holders = Holders0,
       queue = Queue0,
       requests = Requests0,
-      can_share = CanShare0
+      can_share = CanShare0,
+      graph = Graph0
     } = State)->
 
   catch Proxy ! #locked{ref = Ref},
-  Req = stop_waiting(Req0#req{
-    has_lock = true,
-    proxy = undefined
-  }),
+  {Req, Graph} = stop_waiting(
+    Req0#req{
+      has_lock = true,
+      proxy = undefined
+    },
+    Graph0
+  ),
 
   Requests = Requests0#{
     Ref => Req
@@ -943,7 +936,8 @@ locked(
     holders = Holders,
     queue = Queue,
     requests = Requests,
-    can_share = CanShare
+    can_share = CanShare,
+    graph = Graph
   }.
 
 %%-----------------------------------------------------------------
@@ -962,9 +956,6 @@ unlocked(
       can_share = CanShare0
     } = State
 )->
-
-  % TODO. Unregister lock
-
   Clients = remove_client_request(ClientPID, Ref, Clients0),
   Holders = maps:remove(Ref, Holders0),
   Requests = maps:remove(Ref, Requests0),
@@ -1170,48 +1161,6 @@ try_unlock(#state{
       exit(normal)
   end.
 
-%%=================================================================
-%%  Deadlock probes
-%%
-%%  A waiter depends on every holder of its Term, and a holder that
-%%  is itself waiting for another Term carries the dependency on - a
-%%  deadlock is a cycle of such dependencies. #req.held is the set of
-%%  the locks the client held when it made the request, i.e. the
-%%  terms the request holds while it waits. A multi node request is
-%%  granted node by node: every grant the client gets while the
-%%  request still waits here comes in as #add_held_locks{} and joins
-%%  the held map.
-%%
-%%  There are no checker processes, the managers probe each other.
-%%  When a request starts waiting here (the origin) the probe goes
-%%  to the manager of every lock it holds, except this very Term (a
-%%  barging request holds the term it waits for), and every hold it
-%%  gains meanwhile is probed the same way: it adds wait-for edges
-%%  and may be the one that closes a cycle. A request that holds
-%%  nothing can not be on a cycle - no probe.
-%%
-%%  A manager that receives the probe looks at its own waiters:
-%%    * a waiter that holds the origin's term closes a cycle. The
-%%      lighter request loses (see #req.weight). If any closer is
-%%      heavier than the origin then the origin loses: #deadlock{}
-%%      goes back to the origin manager and the probe stops - the
-%%      abort of the origin breaks every cycle through it. Otherwise
-%%      every closer is aborted here.
-%%    * the probe is passed on to the managers of the locks held by
-%%      the waiters that are left: they depend on the holders of
-%%      this Term, which depend on the origin. The managers that have
-%%      already seen the probe are skipped, hence the flood is finite.
-%%
-%%  Every edge is probed as soon as it appears, hence the probe of
-%%  the edge that completes a cycle finds the rest of the cycle
-%%  already in place
-%%=================================================================
-%%-----------------------------------------------------------------
-%%  A request starts waiting: the client of a multi node request is
-%%  told where it queued up (it answers with #add_held_locks{} as
-%%  the other nodes grant), and the locks the request holds are
-%%  probed
-%%-----------------------------------------------------------------
 start_deadlock_probe(
     #request{
       ref = Ref,
@@ -1322,43 +1271,21 @@ probe_held_locks(
 %%  origin waits for close a cycle with it
 %%-----------------------------------------------------------------
 handle_deadlock_probe(
-    #deadlock_probe{
-      ref = Ref,
-      term = Term,
-      manager = Manager,
-      weight = Weight
-    } = Probe,
-    State0
+    Probe,
+    #state{
+      graph = Graph0
+    } = State0
 )->
-  % The origin may meet itself: a multi node request waits at several
-  % managers and a barging one holds the term it waits for. A request
-  % can not close a cycle with itself, and the equal weights would
-  % make the origin "win" and abort itself
-  Closers = [ W ||
-    #req{ref = WaiterRef} = W <- waiters(State0),
-    WaiterRef =/= Ref,
-    closes_cycle(W, Term, Manager)
-  ],
-  Heavier = lists:any(
-    fun(#req{weight = CloserWeight})->
-      CloserWeight > Weight
-    end,
-    Closers
-  ),
-  case Heavier of
-    true->
-      % A closer outweighs the origin - the origin loses. Its abort
-      % breaks every cycle through it, the lighter closers are left
-      % alone and the probe stops here
-      abort_origin(Probe),
-      State0;
-    false->
-      % The origin outweighs every closer, if any - they lose and the
-      % probe goes on from the state after the aborts
-      State = abort_closers(Closers, State0),
-      forward_deadlock_probe(Probe, State),
-      State
-  end.
+  {AbortRefs, Graph} = elock_graph:probe(Probe, Graph0),
+  State =
+    lists:foldl(
+      fun handle_deadlock/2,
+      State0,
+      AbortRefs
+    ),
+  State#state{
+    graph = Graph
+  }.
 
 %%-----------------------------------------------------------------
 %%  Does the waiter hold the lock the origin waits for? The same
@@ -1538,16 +1465,41 @@ start_waiting(
     #request{
       timeout = Timeout
     } = Request,
-    #state{
-      term = Term
-    },
-    Req
+    Graph0
 )->
-  start_deadlock_probe(Request, Req, Term),
-  start_timer(Req, Timeout).
+  notify_queued(Request),
+  Req = start_timer(new_req(Request), Timeout),
+  Graph = elock_graph:add_edges(Request, Graph0),
+  {Req, Graph}.
 
-stop_waiting(Req)->
-  stop_timer(Req).
+stop_waiting(
+    #req{
+      ref = Ref
+    } = Req0,
+    Graph0
+)->
+  Req = stop_timer(Req0),
+  Graph = elock_graph:remove_edges(Ref, Graph0),
+  {Req, Graph}.
+
+notify_queued(#request{
+  ref = Ref,
+  client = ClientPID,
+  nodes = Nodes
+})->
+  if
+    length(Nodes) > 1->
+      catch ecall:send(
+        ClientPID,
+        #queued{
+          ref = Ref,
+          manager = self(),
+          node = node()
+        }
+      );
+    true ->
+      ignore
+  end.
 
 start_timer(
     #req{

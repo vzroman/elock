@@ -72,7 +72,7 @@ lock(Scope, Term, Nodes, Options)->
   } = validate_options(Options),
   Ref = make_ref(),
   Context = get_context(),
-  HeldLocks = held_locks(Scope, Context),
+  HeldLocks = held_locks(Context),
   Request = #request{
     ref = Ref,
     scope = Scope,
@@ -157,10 +157,15 @@ unlock(_UnexpectedRef, #context{} = Context)->
 unlock(_Ref, _NoContext)->
   ok.
 
-% Locked structure:
+% Locked structure, the locks the process holds in every scope:
 % #{
-%   {Term, Node} => {Manager, Count}
+%   {Scope, Term, Node} => {Manager, Count}
 % }
+% A lock is keyed by its scope as well: the same Term may be locked
+% in several scopes on a node and those are different locks with
+% different managers. The whole map goes into #request.held (see
+% held_locks/1), hence a deadlock through several scopes is seen
+% like one within a scope (see elock_graph)
 add_lock(
     #lock{
       scope = Scope,
@@ -169,27 +174,22 @@ add_lock(
     },
     Locked
 )->
-  ScopeLocked0 = maps:get(Scope, Locked, #{}),
-  ScopeLocked =
-    maps:fold(
-      fun(Node, Manager, Acc)->
-        Key = {Term, Node},
-        case Acc of
-          #{Key := {Manager, Count}}->
-            Acc#{ Key => {Manager, Count + 1}};
-          #{Key := {_StaleManager, StaleCount}}->
-            ?LOGWARNING("~p has stale lock: ~p, count: ~p",[self(), Key, StaleCount]),
-            Acc#{ Key => {Manager, 1}};
-          _->
-            Acc#{ Key => {Manager, 1}}
-        end
-      end,
-      ScopeLocked0,
-      Nodes
-    ),
-  Locked#{
-    Scope => ScopeLocked
-  }.
+  maps:fold(
+    fun(Node, Manager, Acc)->
+      Key = {Scope, Term, Node},
+      case Acc of
+        #{Key := {Manager, Count}}->
+          Acc#{ Key => {Manager, Count + 1}};
+        #{Key := {_StaleManager, StaleCount}}->
+          ?LOGWARNING("~p has stale lock: ~p, count: ~p",[self(), Key, StaleCount]),
+          Acc#{ Key => {Manager, 1}};
+        _->
+          Acc#{ Key => {Manager, 1}}
+      end
+    end,
+    Locked,
+    Nodes
+  ).
 
 remove_lock(
     #lock{
@@ -199,59 +199,31 @@ remove_lock(
     },
     Locked
 )->
-  ScopeLocked0 = maps:get(Scope, Locked),
-  ScopeLocked =
-    maps:fold(
-      fun(Node, Manager, Acc)->
-        Key = {Term, Node},
-        case Acc of
-          #{Key := {Manager, Count}} ->
-            if
-              Count =:= 1 ->
-                maps:remove(Key, Acc);
-              true ->
-                Acc#{ Key => {Manager, Count - 1}}
-            end;
-          #{Key := {_NewManager, _Count}}->
-            ?LOGWARNING("~p unlocked stale lock ~p",[self(), Key]),
-            Acc;
-          _->
-            Acc
-        end
-      end,
-      ScopeLocked0,
-      Nodes
-    ),
-  if
-    map_size(ScopeLocked) > 0 ->
-      Locked#{
-        Scope => ScopeLocked
-      };
-    true ->
-      maps:remove(Scope, Locked)
-  end.
+  maps:fold(
+    fun(Node, Manager, Acc)->
+      Key = {Scope, Term, Node},
+      case Acc of
+        #{Key := {Manager, Count}} ->
+          if
+            Count =:= 1 ->
+              maps:remove(Key, Acc);
+            true ->
+              Acc#{ Key => {Manager, Count - 1}}
+          end;
+        #{Key := {_NewManager, _Count}}->
+          ?LOGWARNING("~p unlocked stale lock ~p",[self(), Key]),
+          Acc;
+        _->
+          Acc
+      end
+    end,
+    Locked,
+    Nodes
+  ).
 
-held_locks(
-    Scope,
-    #context{
-      locked = Locked
-    }
-)->
-  case Locked of
-    #{ Scope := ScopeLocked }->
-      maps:fold(
-        fun(Key, {Manager, _Count}, Acc)->
-          Acc#{
-            Key => Manager
-          }
-        end,
-        #{},
-        ScopeLocked
-      );
-    _->
-      #{}
-  end;
-held_locks(_Scope, _NoContext)->
+held_locks(#context{locked = Locked})->
+  maps:map(fun(_Key, {Manager, _Count})-> Manager end, Locked);
+held_locks(_NoContext)->
   #{}.
 
 ready_nodes(Scope)->
@@ -262,6 +234,7 @@ ready_nodes(Scope)->
 %%=================================================================
 -record(waiting,{
   ref,
+  scope,
   term,
   pending,
   nodes,
@@ -288,6 +261,7 @@ run_request(#request{
   end;
 run_request(#request{
   ref = Ref,
+  scope = Scope,
   term = Term,
   nodes = Nodes
 } = Request) ->
@@ -306,6 +280,7 @@ run_request(#request{
     ),
   wait_verdict(#waiting{
     ref = Ref,
+    scope = Scope,
     term = Term,
     pending = Pending,
     nodes = #{},
@@ -314,6 +289,7 @@ run_request(#request{
 
 wait_verdict(#waiting{
   ref = Ref,
+  scope = Scope,
   term = Term,
   pending = Pending0,
   queued = Queued0,
@@ -327,7 +303,7 @@ wait_verdict(#waiting{
         {ok, {ok,Manager}} ->
 
           Queued = maps:remove(Node, Queued0),
-          notify_queued(Queued, #{Node => Manager}, Term, Ref),
+          notify_queued(Queued, #{Node => Manager}, Scope, Term, Ref),
 
           Nodes = Nodes0#{
             Node => Manager
@@ -353,7 +329,7 @@ wait_verdict(#waiting{
       % granted nodes are unlocked through unlock_nodes/2 anyway
       wait_verdict(Waiting0);
     #queued{ref = Ref, manager = Manager, node = Node}->
-      notify_queued(#{Node => Manager}, Nodes0, Term, Ref),
+      notify_queued(#{Node => Manager}, Nodes0, Scope, Term, Ref),
       Queued = Queued0#{
         Node => Manager
       },
@@ -386,13 +362,13 @@ wait_unlock(Pending0, Ref)
 wait_unlock(_Calls, _Ref)->
   ok.
 
-notify_queued(Queued, Locked, Term, Ref)
+notify_queued(Queued, Locked, Scope, Term, Ref)
   when map_size(Queued) > 0, map_size(Locked) > 0->
   Held =
     maps:fold(
       fun(Node, Manager, Acc)->
         Acc#{
-          {Term, Node} => Manager
+          {Scope, Term, Node} => Manager
         }
       end,
       #{},
@@ -404,7 +380,7 @@ notify_queued(Queued, Locked, Term, Ref)
   },
   [ catch ecall:send(Manager, Message) || Manager <- maps:values(Queued) ],
   ok;
-notify_queued(_Queued, _Locked, _Term, _Ref)->
+notify_queued(_Queued, _Locked, _Scope, _Term, _Ref)->
   ok.
 
 %%=================================================================

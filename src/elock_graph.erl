@@ -5,7 +5,11 @@
 %%  is itself waiting for another Term carries the dependency on - a
 %%  deadlock is a cycle of such dependencies. #request.held is the
 %%  set of the locks the client held when it made the request, i.e.
-%%  the terms the request holds while it waits. A multi node request
+%%  the terms the request holds while it waits. A lock is
+%%  {Scope, Term, Node}: the scopes are separate heaps of locks, but
+%%  a cycle through several of them blocks like any other, hence the
+%%  held map spans the scopes and the key carries the scope - the
+%%  same Term in two scopes is two locks. A multi node request
 %%  is granted node by node: every grant the client gets while the
 %%  request still waits comes in as #add_held_locks{} and joins the
 %%  held map (see add_held_locks/4).
@@ -60,13 +64,13 @@
 % Graph structure:
 % #graph{
 %   edges = #{
-%     {Term, Node} => #{
+%     {Scope, Term, Node} => #{
 %       Ref => Weight
 %     }
 %   },
 %   index = #{
 %     Ref => {Weight, #{
-%       {Term, Node} => Manager
+%       {Scope, Term, Node} => Manager
 %     }}
 %   }
 % }
@@ -110,6 +114,7 @@ add_edges(
 add_edges(
     #request{
       ref = Ref,
+      scope = Scope,
       term = Term,
       held = Held
     },
@@ -120,7 +125,7 @@ add_edges(
 ) when map_size(Held) > 0->
 
   Weight = map_size(Held),
-  run_probe(Ref, Term, Held, Weight),
+  run_probe(Ref, {Scope, Term, node()}, Held, Weight),
 
   Edges = add_holder(Ref, Weight, maps:keys(Held), Edges0),
   Index = Index0#{
@@ -148,14 +153,15 @@ add_edges(Request, _Graph)->
 %%  edge that closes a cycle, and only the request that gained them
 %%  can see that. The weight stays as it was when the request asked
 %%  (see the header), a request that held nothing then is not in the
-%%  graph yet and joins with the weight 0
+%%  graph yet and joins with the weight 0. Edge is the lock of this
+%%  manager, the one the request waits for
 %%  the guard:
 %%  * the update is not empty (the clause above)
 %%  * the graph exists
 %%-----------------------------------------------------------------
 add_held_locks(
     Ref,
-    Term,
+    Edge,
     Update,
     #graph{
       edges = Edges0,
@@ -167,7 +173,7 @@ add_held_locks(
     New when map_size(New) =:= 0->
       Graph0;
     New->
-      run_probe(Ref, Term, New, Weight),
+      run_probe(Ref, Edge, New, Weight),
 
       Edges = add_holder(Ref, Weight, maps:keys(New), Edges0),
       Index = Index0#{
@@ -184,8 +190,8 @@ add_held_locks(
 %%  the guard:
 %%  * there is no graph yet (the clauses above)
 %%-----------------------------------------------------------------
-add_held_locks(Ref, Term, Update, _Graph)->
-  add_held_locks(Ref, Term, Update, #graph{
+add_held_locks(Ref, Edge, Update, _Graph)->
+  add_held_locks(Ref, Edge, Update, #graph{
     edges = #{},
     index = #{}
   }).
@@ -410,11 +416,12 @@ drop_coin(Ref1, Ref2)->
 %%  The probe of a waiting request for the locks it holds - the whole
 %%  held map when it starts waiting, the new entries as it gains
 %%  them. It goes to the manager of each of them, except this very
-%%  manager: a barging request holds the term it waits for. sent_to
+%%  manager: a barging request holds the term it waits for. Edge is
+%%  the lock of this manager, the one the origin waits for. sent_to
 %%  names every manager the probe has been sent to, this one
 %%  included, before it goes
 %%-----------------------------------------------------------------
-run_probe(Ref, Term, Held, Weight)->
+run_probe(Ref, Edge, Held, Weight)->
   Self = self(),
   SentTo =
     maps:fold(
@@ -426,7 +433,7 @@ run_probe(Ref, Term, Held, Weight)->
     ),
   Probe = #deadlock_probe{
     ref = Ref,
-    edge = {Term, node()},
+    edge = Edge,
     manager = Self,
     weight = Weight,
     sent_to = SentTo

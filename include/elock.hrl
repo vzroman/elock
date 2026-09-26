@@ -41,7 +41,7 @@
 
 -record(deadlock_probe,{
   ref,      % the origin request
-  edge,     % {Term, Node} - the lock the origin waits for
+  edge,     % {Scope, Term, Node} - the lock the origin waits for
   manager,  % the origin manager, the verdict is sent back to it
   weight,   % the held count of the origin - the lighter loses, the coin settles a tie
   sent_to   % #{ ManagerPID => true } - managers this probe has already been sent to

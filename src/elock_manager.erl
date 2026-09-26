@@ -1166,6 +1166,7 @@ handle_add_held_locks(
     },
     #state{
       requests = Requests,
+      scope = Scope,
       term = Term,
       graph = Graph0
     } = State
@@ -1174,7 +1175,7 @@ handle_add_held_locks(
     #{Ref := #req{
       has_lock = false
     }}->
-      Graph = elock_graph:add_held_locks(Ref, Term, Update, Graph0),
+      Graph = elock_graph:add_held_locks(Ref, {Scope, Term, node()}, Update, Graph0),
       State#state{
         graph = Graph
       };

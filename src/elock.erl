@@ -84,8 +84,8 @@ lock(Scope, Term, Nodes, Options)->
     shared = IsShared
   },
   case run_request(Request) of
-    {ok, Nodes} ->
-      locked(Request, Nodes, Context),
+    {ok, LockedNodes} ->
+      locked(Request, LockedNodes, Context),
       {ok, Ref};
     Error ->
       Error
@@ -187,7 +187,7 @@ add_lock(
       ScopeLocked0,
       Nodes
     ),
-  Locked = Locked#{
+  Locked#{
     Scope => ScopeLocked
   }.
 
@@ -222,15 +222,14 @@ remove_lock(
       ScopeLocked0,
       Nodes
     ),
-  Locked =
-    if
-      map_size(ScopeLocked) > 0 ->
-        Locked#{
-          Scope => ScopeLocked
-        };
-      true ->
-        maps:remove(Scope, Locked)
-    end.
+  if
+    map_size(ScopeLocked) > 0 ->
+      Locked#{
+        Scope => ScopeLocked
+      };
+    true ->
+      maps:remove(Scope, Locked)
+  end.
 
 held_locks(
     Scope,
@@ -341,6 +340,10 @@ wait_verdict(#waiting{
           wait_verdict(Waiting);
         Error ->
           unlock_nodes(Nodes0, Ref),
+          % The copies still queued elsewhere are withdrawn as well,
+          % otherwise they hold the queue behind them and carry the
+          % held locks the client has released into the probes
+          unlock_nodes(Queued0, Ref),
           wait_unlock(Pending, Ref),
           Error
       end;

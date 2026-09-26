@@ -457,7 +457,7 @@ erase_context()->
   erase(?context).
 
 unlock_nodes(Nodes, Ref) when map_size(Nodes) > 0->
-  [ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes)],
+  [catch ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes)],
   ok;
 unlock_nodes(_Locked, _Ref)->
   ok.

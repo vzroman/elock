@@ -14,10 +14,14 @@
 %%	API
 %%=================================================================
 -export([
-  lock/3, lock/4,
+  lock/3, lock/4, lock/5,
   unlock/1,
   ready_nodes/1
 ]).
+
+% lock/4 also serves the current API, so only its boolean form is
+% deprecated (documented below); an attribute would mark both forms.
+-deprecated([{lock, 5, "Use lock/3 or lock/4 with nodes and options, then unlock/1"}]).
 
 -define(context,'$elock_context$').
 -define(pg_scope(Scope),list_to_atom(atom_to_list(Scope)++"_$pg$")).
@@ -64,6 +68,10 @@ start_link(Scope)->
 %%=================================================================
 lock(Scope, Term, Nodes)->
   lock(Scope, Term, Nodes, _Options = #{}).
+% Deprecated compatibility form returning {ok, UnlockFun}.
+% Use lock(Scope, Term, [node()], Options) and unlock/1 instead.
+lock(Scope, Term, IsShared, Timeout) when is_boolean(IsShared)->
+  lock(Scope, Term, IsShared, Timeout, [node()]);
 lock(Scope, Term, Nodes, Options)->
   validate_nodes(Nodes),
   #{
@@ -88,6 +96,29 @@ lock(Scope, Term, Nodes, Options)->
       locked(Request, LockedNodes, Context),
       {ok, Ref};
     Error ->
+      Error
+  end.
+
+% Deprecated compatibility API; use lock/3 or lock/4 and unlock/1 instead.
+% Call UnlockFun() in the process that acquired the lock.
+% infinity means no timeout; deadlocks retain the previous atom verdict.
+-spec lock(atom(), term(), boolean(), timeout(), [node()]) ->
+  {ok, fun(() -> ok)} | {error, term()}.
+lock(_Scope, _Term, _IsShared, _Timeout, [])->
+  {ok, fun()-> ok end};
+lock(_Scope, _Term, _IsShared, 0, _Nodes)->
+  {error, timeout};
+lock(Scope, Term, IsShared, Timeout, Nodes)->
+  Options = #{
+    is_shared => IsShared,
+    timeout => case Timeout of infinity -> undefined; _ -> Timeout end
+  },
+  case lock(Scope, Term, Nodes, Options) of
+    {ok, Ref}->
+      {ok, fun()-> unlock(Ref) end};
+    {error, {deadlock, _Winner}}->
+      {error, deadlock};
+    Error->
       Error
   end.
 

@@ -35,6 +35,10 @@
 -export([
   validate_nodes_test/1,
   validate_options_test/1,
+  legacy_lock_test/1,
+  legacy_empty_nodes_test/1,
+  legacy_timeout_test/1,
+  legacy_deadlock_test/1,
   context_after_lock_test/1,
   reentrant_context_count_test/1,
   multi_scope_context_test/1,
@@ -106,6 +110,7 @@
 all()->
   [
     {group, validation},
+    {group, compatibility},
     {group, context},
     {group, request},
     {group, multi_node_client},
@@ -117,6 +122,12 @@ groups()->
     {validation, [], [
       validate_nodes_test,
       validate_options_test
+    ]},
+    {compatibility, [], [
+      legacy_lock_test,
+      legacy_empty_nodes_test,
+      legacy_timeout_test,
+      legacy_deadlock_test
     ]},
     {context, [], [
       context_after_lock_test,
@@ -283,6 +294,89 @@ validate_options_test(Config)->
 
   ?assertEqual([], elock_test_utils:locks(Scope)),
   ?assertEqual(undefined, get(?CONTEXT)).
+
+%%=================================================================
+%%  Compatibility API
+%%=================================================================
+%% The old arities share locks with the current API and return callbacks
+%% that release them and clean up the owning process's context.
+legacy_lock_test(Config)->
+  Scope = ?config(scope, Config),
+  Nodes = [node()],
+  C1 = elock_test_utils:client(),
+  C2 = elock_test_utils:client(),
+
+  {ok, Unlock1} = elock_test_utils:call(C1,
+    fun()-> elock:lock(Scope, t, true, infinity) end),
+  {ok, Unlock2} = elock_test_utils:call(C2,
+    fun()-> elock:lock(Scope, t, true, 1000, Nodes) end),
+  ?assert(is_function(Unlock1, 0)),
+  ?assert(is_function(Unlock2, 0)),
+  ?assertEqual({error, timeout}, elock:lock(Scope, t, Nodes, #{timeout => 30})),
+
+  {ok, Ref} = elock_test_utils:lock(C1, Scope, other, Nodes),
+  ?assert(is_reference(Ref)),
+  ?assertEqual(ok, elock_test_utils:call(C1, Unlock1)),
+  ?assertEqual(ok, elock_test_utils:call(C1, Unlock1)),
+  ?assertEqual({error, timeout}, elock:lock(Scope, t, Nodes, #{timeout => 30})),
+  ?assertEqual(ok, elock_test_utils:call(C2, Unlock2)),
+  ?assertEqual(undefined, elock_test_utils:context(C2)),
+
+  {ok, ExclusiveRef} = elock:lock(Scope, t, Nodes),
+  ?assertEqual(ok, elock:unlock(ExclusiveRef)),
+  ?assertEqual(ok, elock_test_utils:unlock(C1, Ref)),
+  ?assertEqual(undefined, elock_test_utils:context(C1)),
+  elock_test_utils:wait_idle(Scope).
+
+%% An empty node list succeeds without a scope or a context, and its
+%% callback leaves any other locks intact.
+legacy_empty_nodes_test(Config)->
+  Scope = ?config(scope, Config),
+  {ok, EmptyUnlock} = elock:lock(unstarted_scope, t, false, infinity, []),
+  ?assert(is_function(EmptyUnlock, 0)),
+  ?assertEqual(undefined, get(?CONTEXT)),
+  {ok, Ref} = elock:lock(Scope, t, [node()]),
+  Context = get(?CONTEXT),
+  {ok, ZeroUnlock} = elock:lock(Scope, t, false, 0, []),
+  ?assertEqual(ok, EmptyUnlock()),
+  ?assertEqual(ok, ZeroUnlock()),
+  ?assertEqual(Context, get(?CONTEXT)),
+  ?assertEqual(ok, elock:unlock(Ref)),
+  elock_test_utils:wait_idle(Scope).
+
+%% Finite and zero timeouts keep the previous error shape and leave
+%% no locks behind for the unsuccessful caller.
+legacy_timeout_test(Config)->
+  Scope = ?config(scope, Config),
+  C1 = elock_test_utils:client(),
+  {ok, Unlock} = elock_test_utils:call(C1,
+    fun()-> elock:lock(Scope, t, false, infinity, [node()]) end),
+  ?assertEqual({error, timeout}, elock:lock(Scope, t, false, 30)),
+  ?assertEqual({error, timeout}, elock:lock(Scope, t, true, 30, [node()])),
+  ?assertEqual({error, timeout}, elock:lock(Scope, t, false, 0)),
+  ?assertEqual({error, timeout}, elock:lock(Scope, other, false, 0, [node()])),
+  ?assertEqual(undefined, get(?CONTEXT)),
+  ?assertEqual(ok, elock_test_utils:call(C1, Unlock)),
+  elock_test_utils:wait_idle(Scope).
+
+%% The manager's richer deadlock verdict is reduced to the old atom
+%% through both legacy arities. Neither failure creates a context.
+legacy_deadlock_test(Config)->
+  Scope = ?config(scope, Config),
+  C1 = elock_test_utils:client(),
+  true = ets:insert(Scope, {t, self(), 1}),
+  Calls = [
+    fun()-> elock:lock(Scope, t, false, infinity) end,
+    fun()-> elock:lock(Scope, t, true, 1000, [node()]) end
+  ],
+  lists:foreach(fun(Call)->
+    Pending = elock_test_utils:cast(C1, Call),
+    #request{ref = Ref} = ?RECEIVE(#request{}),
+    C1 ! #deadlock{ref = Ref, winner = ?WINNER},
+    ?assertEqual({ok, {error, deadlock}}, elock_test_utils:result(Pending, ?DEADLINE)),
+    ?assertEqual(undefined, elock_test_utils:context(C1))
+  end, Calls),
+  true = ets:delete(Scope, t).
 
 %%=================================================================
 %%  Context

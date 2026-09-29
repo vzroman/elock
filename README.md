@@ -29,12 +29,12 @@ API
     
     If you want to lock any erlang term call:
     
-    {ok,Unlock} | {error,timeout} | {error, {deadlock, {Scope, Term, Node}}}
+    {ok,Unlock} | {error,timeout} | {error,deadlock}
         =  elock:lock(Locks, Term, IsShared, Timeout )
 
     Distributed locks are almost the same:
 
-    {ok,Unlock} | {error,timeout} | {error, {deadlock, {Scope, Term, Node}}}
+    {ok,Unlock} | {error,timeout} | {error,deadlock}
         =  elock:lock(Locks, Term, IsShared, Timeout, Nodes )
 
     * Locks is your '$mylocks'
@@ -46,18 +46,26 @@ API
     * Timeout is Milliseconds or infinity
     * Nodes is a list of nodes where you want to lock the Term
 
-    When you need to unlock the Term call Unlock() from returned to you {ok,Unlock}.
+    To unlock the Term call Unlock() in the process that acquired the lock.
 
     Deadlocks are detected automatically. If a requested lock leads to a deadlock 
     then one of the requests will get:
-        {error, {deadlock, {Scope, Term, Node}}}
-    {Scope, Term, Node} identifies the lock the winning request is waiting for.
+        {error, deadlock}
     Most cases deadlock will get a process which has less locked terms.
     If you already have locked the Term and try to lock it with a different 
     IsShared type then the previous lock is automatically released and 
     the new request is queued.
 
     That's it.
+
+The forms above, `lock(Scope, Term, IsShared, Timeout)` and
+`lock(Scope, Term, IsShared, Timeout, Nodes)`, are **deprecated compatibility
+wrappers**. The current API is
+`elock:lock(Scope, Term, Nodes)` or `elock:lock(Scope, Term, Nodes, Options)`,
+returning `{ok, Ref}` to release with `elock:unlock(Ref)` in the same process.
+`Options` defaults to `#{is_shared => false, timeout => undefined}`;
+`undefined` means no timeout. This API returns
+`{error, {deadlock, {Scope, Term, Node}}}` with the lock the winner is waiting for.
     
     
     
@@ -72,4 +80,3 @@ BUILD
 TODO
 -----
     Tests!!!
-    

@@ -40,6 +40,7 @@
 -export([
   ready_nodes_test/1,
   single_remote_node_lock_test/1,
+  legacy_distributed_lock_test/1,
   duplicate_nodes_collapse_test/1,
   multi_node_lock_test/1,
   context_spans_nodes_test/1,
@@ -109,6 +110,7 @@ groups()->
     {basic, [], [
       ready_nodes_test,
       single_remote_node_lock_test,
+      legacy_distributed_lock_test,
       duplicate_nodes_collapse_test,
       multi_node_lock_test,
       context_spans_nodes_test,
@@ -204,6 +206,38 @@ end_per_testcase(_TestCase, Config)->
 %%=================================================================
 %%  Basic
 %%=================================================================
+%% Both a single remote node and several nodes accept the old API.
+%% Shared locks coexist with the current API; conflicts return the old
+%% timeout verdict, and the callback releases every participating node.
+legacy_distributed_lock_test(Config)->
+  Scope = ?config(scope, Config),
+  [N1, N2, N3] = Nodes = ?config(nodes, Config),
+  C1 = elock_test_utils:client(N1),
+  C2 = elock_test_utils:client(N3),
+  lists:foreach(fun({LockNodes, Shared})->
+    {ok, Unlock} = elock_test_utils:call(C1,
+      fun()-> elock:lock(Scope, t, Shared, infinity, LockNodes) end),
+    ?assert(is_function(Unlock, 0)),
+    case Shared of
+      true->
+        {ok, SharedRef} = elock_test_utils:lock(C2, Scope, t, LockNodes, ?SHARED),
+        ?assertEqual(ok, elock_test_utils:unlock(C2, SharedRef));
+      false->
+        ok
+    end,
+    ?assertEqual({error, timeout}, elock_test_utils:call(C2,
+      fun()-> elock:lock(Scope, t, false, 30, LockNodes) end)),
+    ?assertEqual(undefined, elock_test_utils:context(C2)),
+    ?assertEqual(ok, elock_test_utils:call(C1, Unlock)),
+    ?assertEqual(undefined, elock_test_utils:context(C1)),
+    [ elock_test_utils:wait_idle(Node, Scope) || Node <- Nodes ],
+
+    {ok, NextUnlock} = elock_test_utils:call(C2,
+      fun()-> elock:lock(Scope, t, false, 1000, LockNodes) end),
+    ?assertEqual(ok, elock_test_utils:call(C2, NextUnlock)),
+    [ elock_test_utils:wait_idle(Node, Scope) || Node <- Nodes ]
+  end, [{LockNodes, Shared} || LockNodes <- [[N2], Nodes], Shared <- [false, true]]).
+
 %%-----------------------------------------------------------------
 %%  Every node sees all three nodes of the scope. Stopping the scope
 %%  holder of n3 removes n3 from the view of the others (n3 itself

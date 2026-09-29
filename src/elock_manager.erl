@@ -1028,7 +1028,7 @@ try_barging(
     true->
       % Client requested lock upgrade, but there is already another client
       % waiting for upgrade - deadlock. The first enqueued wins.
-      catch Proxy ! #deadlock{ref = Ref, winner = elock_graph:local_edge(Scope, Term)},
+      catch Proxy ! #deadlock{ref = Ref, winner = {Scope, Term, node()}},
       State
   end.
 
@@ -1196,8 +1196,7 @@ handle_add_held_locks(
     #{Ref := #req{
       has_lock = false
     }}->
-      Edge = elock_graph:local_edge(Scope, Term),
-      Graph = elock_graph:add_held_locks(Ref, Edge, Update, Graph0),
+      Graph = elock_graph:add_held_locks(Ref, {Scope, Term, node()}, Update, Graph0),
       State#state{
         graph = Graph
       };
@@ -1228,8 +1227,7 @@ handle_deadlock_probe(
       term = Term
     } = State0
 )->
-  Edge = elock_graph:local_edge(Scope, Term),
-  case elock_graph:probe(Probe, Edge, Graph0) of
+  case elock_graph:probe(Probe, {Scope, Term, node()}, Graph0) of
     {forward, AbortRefs}->
       State = #state{graph = Graph} = lists:foldl(
         fun(Ref, Acc)->

@@ -79,7 +79,6 @@
 %%	API
 %%=================================================================
 -export([
-  local_edge/2,
   add_edges/2,
   add_held_locks/4,
   remove_edges/2,
@@ -90,11 +89,6 @@
 %%=================================================================
 %%  The edges
 %%=================================================================
-%% The identity of a lock managed on this node.
--spec local_edge(atom(), term()) -> {atom(), term(), node()}.
-local_edge(Scope, Term)->
-  {Scope, Term, node()}.
-
 %%-----------------------------------------------------------------
 %%  A request starts waiting
 %%  the guard:
@@ -131,7 +125,7 @@ add_edges(
 ) when map_size(Held) > 0->
 
   Weight = map_size(Held),
-  run_probe(Ref, local_edge(Scope, Term), Held, Weight),
+  run_probe(Ref, {Scope, Term, node()}, Held, Weight),
 
   Edges = add_holder(Ref, Weight, maps:keys(Held), Edges0),
   Index = Index0#{

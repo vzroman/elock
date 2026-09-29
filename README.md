@@ -29,12 +29,12 @@ API
     
     If you want to lock any erlang term call:
     
-    {ok,Unlock} | {error,timeout} | {error, deadlock} 
+    {ok,Unlock} | {error,timeout} | {error, {deadlock, {Scope, Term, Node}}}
         =  elock:lock(Locks, Term, IsShared, Timeout )
 
     Distributed locks are almost the same:
 
-    {ok,Unlock} | {error,timeout} | {error, deadlock} 
+    {ok,Unlock} | {error,timeout} | {error, {deadlock, {Scope, Term, Node}}}
         =  elock:lock(Locks, Term, IsShared, Timeout, Nodes )
 
     * Locks is your '$mylocks'
@@ -50,7 +50,8 @@ API
 
     Deadlocks are detected automatically. If a requested lock leads to a deadlock 
     then one of the requests will get:
-        {error, deadlock}
+        {error, {deadlock, {Scope, Term, Node}}}
+    {Scope, Term, Node} identifies the lock the winning request is waiting for.
     Most cases deadlock will get a process which has less locked terms.
     If you already have locked the Term and try to lock it with a different 
     IsShared type then the previous lock is automatically released and 

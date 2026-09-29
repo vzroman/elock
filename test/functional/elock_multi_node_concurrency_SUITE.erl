@@ -18,7 +18,7 @@
 %%  A multi node request may lose a cycle even when its client holds
 %%  nothing else: two requests for the same term granted on two
 %%  nodes in the opposite order wait for each other and one of them
-%%  gets {error, deadlock} (see same_term_opposite_order_deadlock_test
+%%  gets {error, {deadlock, Winner}} (see same_term_opposite_order_deadlock_test
 %%  of elock_multi_node_SUITE). The work of the scenarios without
 %%  deadlocks of their own repeats such a request - the client holds
 %%  nothing, the retry is what any client would do - and reports the
@@ -239,7 +239,7 @@ distributed_shared_exclusive_test(Config)->
 %%  timeout), R times per round; the odd clients hold in the first
 %%  scope and ask in the second, the even ones the other way round,
 %%  so that cycles can form. Every request ends with ok or
-%%  {error, deadlock} - nothing hangs - and every node is idle after
+%%  {error, {deadlock, Winner}} - nothing hangs - and every node is idle after
 %%  every round. Rounds run until a deadlock has been observed
 %%  (capped), and at least one must have been
 %%-----------------------------------------------------------------
@@ -266,9 +266,16 @@ storm_rounds(_Clients, _Work, _Scopes, _Nodes, Cap, Round, Deadlocks) when Round
   Deadlocks;
 storm_rounds(Clients, Work, Scopes, Nodes, Cap, Round, _Deadlocks)->
   Results = run(Clients, Work),
-  check_results(Results, [ok, {error, deadlock}]),
+  check_results(Results, fun
+    (ok)-> true;
+    ({error, {deadlock, {Scope, _Term, Node}}})->
+      lists:member(Scope, Scopes) andalso lists:member(Node, Nodes);
+    (_Unexpected)-> false
+  end),
   [ elock_test_utils:wait_idle(Node, Scope) || Node <- Nodes, Scope <- Scopes ],
-  Deadlocks = length([ O || O <- lists:append(maps:values(Results)), O =:= {error, deadlock} ]),
+  Deadlocks = length([
+    O || O = {error, {deadlock, {_, _, _}}} <- lists:append(maps:values(Results))
+  ]),
   ct:pal("distributed deadlock storm round ~p: ~p deadlocks, ~p holds repeated after a deadlock", [Round, Deadlocks, deadlocks()]),
   storm_rounds(Clients, Work, Scopes, Nodes, Cap, Round + 1, Deadlocks).
 
@@ -586,7 +593,7 @@ subset(Nodes)->
 % deadlock reported to the coordinator: {ok, Ref} or {error, timeout}
 request(Scope, Term, Nodes, Options, Coordinator)->
   case elock:lock(Scope, Term, Nodes, Options) of
-    {error, deadlock}->
+    {error, {deadlock, {_Scope, _Term, _Node}}}->
       Coordinator ! {deadlock, self()},
       request(Scope, Term, Nodes, Options, Coordinator);
     Verdict->

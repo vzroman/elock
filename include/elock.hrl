@@ -36,7 +36,8 @@
 
 % The deadlock verdict: to the client, and to the origin manager in reply to its probe (see elock_graph)
 -record(deadlock,{
-  ref
+  ref,
+  winner    % {Scope, Term, Node} - the lock the winning request waits for
 }).
 
 -record(deadlock_probe,{

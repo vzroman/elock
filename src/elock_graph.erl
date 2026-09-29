@@ -46,7 +46,7 @@
 %%  already in place.
 %%
 %%  The graph is changed by the manager alone: a request joins it
-%%  when it starts waiting and leaves it when it stops. probe/2 only
+%%  when it starts waiting and leaves it when it stops. probe/3 only
 %%  names the closers to abort and forward/2 is called after the
 %%  aborts, on the graph as it is then - an abort pushes the queue
 %%  and may grant the lock to a later waiter, from then on it is a
@@ -79,16 +79,22 @@
 %%	API
 %%=================================================================
 -export([
+  local_edge/2,
   add_edges/2,
   add_held_locks/4,
   remove_edges/2,
-  probe/2,
+  probe/3,
   forward/2
 ]).
 
 %%=================================================================
 %%  The edges
 %%=================================================================
+%% The identity of a lock managed on this node.
+-spec local_edge(atom(), term()) -> {atom(), term(), node()}.
+local_edge(Scope, Term)->
+  {Scope, Term, node()}.
+
 %%-----------------------------------------------------------------
 %%  A request starts waiting
 %%  the guard:
@@ -125,7 +131,7 @@ add_edges(
 ) when map_size(Held) > 0->
 
   Weight = map_size(Held),
-  run_probe(Ref, {Scope, Term, node()}, Held, Weight),
+  run_probe(Ref, local_edge(Scope, Term), Held, Weight),
 
   Edges = add_holder(Ref, Weight, maps:keys(Held), Edges0),
   Index = Index0#{
@@ -297,14 +303,18 @@ remove_edges(_Ref, Graph)->
 %%    are left alone
 %%  * otherwise every closer loses. They are handed to the manager
 %%    to abort, it passes the probe on after that (see forward/2)
-%%  The graph is not changed here
+%%  LocalEdge is this manager's lock, which the winning closer
+%%  waits for when the origin loses. The graph is not changed here
 %%-----------------------------------------------------------------
+-spec probe(#deadlock_probe{}, {atom(), term(), node()}, #graph{} | undefined) ->
+  stop | {forward, [reference()]}.
 probe(
     #deadlock_probe{
       ref = Ref,
       edge = Edge,
       manager = Manager
     } = Probe,
+    LocalEdge,
     #graph{
       edges = Edges,
       index = Index
@@ -314,7 +324,7 @@ probe(
     #{ Edge := Holders }->
       case check_cycles(maps:to_list(Holders), Probe, Index, []) of
         origin->
-          catch ecall:send(Manager, #deadlock{ref = Ref}),
+          catch ecall:send(Manager, #deadlock{ref = Ref, winner = LocalEdge}),
           stop;
         Closers->
           {forward, Closers}
@@ -329,7 +339,7 @@ probe(
 %%  the guard:
 %%  * there is no graph (the clause above)
 %%-----------------------------------------------------------------
-probe(_Probe, _Graph)->
+probe(_Probe, _LocalEdge, _Graph)->
   {forward, []}.
 
 %%-----------------------------------------------------------------
@@ -451,7 +461,7 @@ run_probe(Ref, Edge, Held, Weight)->
 %%  locks they hold. It goes to the managers of every lock held by
 %%  the waiters that are left, except those it has been sent to
 %%  already, and they join sent_to before it goes. The manager calls
-%%  this after the aborts of the closers (see probe/2), on the graph
+%%  this after the aborts of the closers (see probe/3), on the graph
 %%  as it is then: an abort pushes the queue and may grant the lock
 %%  to a later waiter, from then on it is a holder and does not
 %%  depend on the origin

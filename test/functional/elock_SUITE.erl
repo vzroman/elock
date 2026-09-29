@@ -17,6 +17,8 @@
 -include("elock.hrl").
 -include("elock_test.hrl").
 
+-define(WINNER, {winner_scope, winner_term, 'winner@node'}).
+
 %% API
 -export([
   all/0,
@@ -728,7 +730,7 @@ request_fields_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  The verdicts of the manager: #locked{} -> {ok, Ref} and the
-%%  context counts the fake manager, #deadlock{} -> {error, deadlock}
+%%  context counts the fake manager; #deadlock{} includes the winner lock
 %%  and no context, #timeout{} -> {error, timeout}, #retry{} -> the
 %%  client comes back with a new ticket, a verdict for a foreign ref
 %%  is left in the client's mailbox
@@ -756,8 +758,8 @@ verdicts_test(Config)->
   % #deadlock{}
   R2 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{}),
   #request{ref = Ref2, queue = 3} = ?RECEIVE(#request{}),
-  C1 ! #deadlock{ref = Ref2},
-  ?assertEqual({ok, {error, deadlock}}, elock_test_utils:result(R2, ?DEADLINE)),
+  C1 ! #deadlock{ref = Ref2, winner = ?WINNER},
+  ?assertEqual({ok, {error, {deadlock, ?WINNER}}}, elock_test_utils:result(R2, ?DEADLINE)),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
 
   % #timeout{}
@@ -784,7 +786,7 @@ verdicts_test(Config)->
   #request{ref = Ref5, queue = 7} = ?RECEIVE(#request{}),
   Foreign = [
     #locked{ref = make_ref()},
-    #deadlock{ref = make_ref()},
+    #deadlock{ref = make_ref(), winner = ?WINNER},
     #timeout{ref = make_ref()},
     #retry{ref = make_ref()}
   ],
@@ -930,7 +932,7 @@ wait_verdict_foreign_queued_left_in_mailbox_test(Config)->
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  A failure: n1 granted, n3 queued, n2 fails with {error, deadlock}
+%%  A failure: n1 granted, n3 queued, n2 fails with a deadlock verdict
 %%  -> #unlock{} to the granted and to the queued manager, the still
 %%  pending n4 is awaited: it grants late and is unlocked too, a
 %%  #queued{} arriving meanwhile is unlocked as well. The error is
@@ -944,7 +946,7 @@ wait_verdict_failure_test(Config)->
   M4 = elock_test_utils:collector(),
   M5 = elock_test_utils:collector(),
   W1 = worker({ok, {ok, M1}}),
-  W2 = worker({error, deadlock}),
+  W2 = worker({error, {deadlock, ?WINNER}}),
   W4 = worker({ok, {ok, M4}}),
 
   finish_worker(W1),
@@ -952,7 +954,7 @@ wait_verdict_failure_test(Config)->
   finish_worker(W2),
   self() ! #queued{ref = Ref, manager = M5, node = n5},
   finish_worker(W4),
-  ?assertEqual({error, deadlock},
+  ?assertEqual({error, {deadlock, ?WINNER}},
     elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W4 => n4 }))),
 
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
@@ -976,7 +978,7 @@ wait_verdict_failure_late_results_test(Config)->
   W1 = worker({error, timeout}),
   W2 = worker({error, {badrpc, noconnection}}),
   W3 = worker({ok, {ok, M3}}),
-  W4 = worker({error, deadlock}),
+  W4 = worker({error, {deadlock, ?WINNER}}),
 
   finish_worker(W1),
   finish_worker(W2),
@@ -1008,7 +1010,7 @@ wait_verdict_failure_reasons_test(Config)->
     end,
     [
       {error, timeout},
-      {error, deadlock},
+      {error, {deadlock, ?WINNER}},
       {error, {badrpc, noconnection}},
       {error, {badrpc, {'EXIT', {badarg, []}}}},
       {error, {exit, killed}},

@@ -545,7 +545,7 @@ upgrade_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  Two shared holders both upgrading: the second gets
-%%  {error, deadlock} at once and keeps its shared lock; the first
+%%  {error, {deadlock, Winner}} at once and keeps its shared lock; the first
 %%  proceeds when the second unlocks its shared ref
 %%-----------------------------------------------------------------
 upgrade_conflict_test(Config)->
@@ -561,7 +561,8 @@ upgrade_conflict_test(Config)->
   ?WAIT(elock_test_utils:locks(Scope) =:= [{t, Manager, 3}]),
   still_waiting(Up1),
 
-  ?assertEqual({error, deadlock}, elock_test_utils:lock(C2, Scope, t, [Node], ?EXCLUSIVE)),
+  ?assertEqual({error, {deadlock, {Scope, t, Node}}},
+    elock_test_utils:lock(C2, Scope, t, [Node], ?EXCLUSIVE)),
   Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
   ?assertEqual(#context{
     ref2lock = #{ Ref2 => Lock },
@@ -1331,7 +1332,8 @@ unlock_after_failed_request_test(Config)->
   Up = elock_test_utils:lock_async(C1, Scope, t2, [Node], ?EXCLUSIVE),
   ?WAIT(lists:sort(elock_test_utils:locks(Scope)) =:= [{t1, M1, 2}, {t2, M2, 3}]),
   still_waiting(Up),
-  ?assertEqual({error, deadlock}, elock_test_utils:lock(C2, Scope, t2, [Node], ?EXCLUSIVE)),
+  ?assertEqual({error, {deadlock, {Scope, t2, Node}}},
+    elock_test_utils:lock(C2, Scope, t2, [Node], ?EXCLUSIVE)),
   ?assertEqual(#context{
     ref2lock = #{ Ref3 => #lock{ scope = Scope, term = t2, nodes = #{ Node => M2 } } },
     locked = #{ {Scope, t2, Node} => {M2, 1} }

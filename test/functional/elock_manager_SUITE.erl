@@ -20,6 +20,8 @@
 -include("elock.hrl").
 -include("elock_test.hrl").
 
+-define(WINNER, {winner_scope, winner_term, 'winner@node'}).
+
 %% API
 -export([
   all/0,
@@ -296,8 +298,8 @@ lock_busy_term_test(Config)->
   % #deadlock{}
   R2 = elock_test_utils:cast(C1, fun()-> elock_manager:lock(Request) end),
   ?assertEqual(Request#request{queue = 3, proxy = C1}, ?RECEIVE(#request{})),
-  C1 ! #deadlock{ref = Ref},
-  ?assertEqual({ok, {error, deadlock}}, elock_test_utils:result(R2, ?DEADLINE)),
+  C1 ! #deadlock{ref = Ref, winner = ?WINNER},
+  ?assertEqual({ok, {error, {deadlock, ?WINNER}}}, elock_test_utils:result(R2, ?DEADLINE)),
 
   % #timeout{}
   R3 = elock_test_utils:cast(C1, fun()-> elock_manager:lock(Request) end),
@@ -320,7 +322,7 @@ lock_busy_term_test(Config)->
   ?assertEqual(Request#request{queue = 7, proxy = C1}, ?RECEIVE(#request{})),
   Foreign = [
     #locked{ref = make_ref()},
-    #deadlock{ref = make_ref()},
+    #deadlock{ref = make_ref(), winner = ?WINNER},
     #timeout{ref = make_ref()},
     #retry{ref = make_ref()}
   ],
@@ -939,8 +941,8 @@ waiting_request_proxy_test(Config)->
   #request{ref = Ref4} = Req4 = request(Scope, 4, C4, false, #{proxy => P4, nodes => Nodes}),
   State5 = elock_manager:add_request(Req4, State0),
   [#queued{ref = Ref4}] = elock_test_utils:collected(P4, 1),
-  State6 = elock_manager:handle_deadlock(Ref4, State5),
-  ?assertEqual([#deadlock{ref = Ref4}], elock_test_utils:collected(P4, 1)),
+  State6 = elock_manager:handle_deadlock(#deadlock{ref = Ref4, winner = ?WINNER}, State5),
+  ?assertEqual([#deadlock{ref = Ref4, winner = ?WINNER}], elock_test_utils:collected(P4, 1)),
   ?assert(is_process_alive(P4)),
   ?assertEqual(plain(State0), plain(State6)),
   ?NO_MESSAGE,
@@ -1168,7 +1170,8 @@ second_upgrade_deadlock_test(Config)->
 
   ?assertEqual(State2, elock_manager:add_request(Req4, State2)),
 
-  ?assertEqual([#deadlock{ref = Ref4}], elock_test_utils:collected(C2, 1)),
+  ?assertEqual([#deadlock{ref = Ref4, winner = {Scope, ?TERM, node()}}],
+    elock_test_utils:collected(C2, 1)),
   ?assertEqual(lists:sort([{process, C1}, {process, C2}]), monitors()),
   ?NO_MESSAGE.
 
@@ -1202,8 +1205,8 @@ barging_dequeued_test(Config)->
   ?NO_MESSAGE,
 
   % a deadlock verdict on the pending upgrade dequeues it the same way
-  State4 = elock_manager:handle_deadlock(Ref3, State2),
-  ?assertEqual([#deadlock{ref = Ref3}], elock_test_utils:collected(C1, 1)),
+  State4 = elock_manager:handle_deadlock(#deadlock{ref = Ref3, winner = ?WINNER}, State2),
+  ?assertEqual([#deadlock{ref = Ref3, winner = ?WINNER}], elock_test_utils:collected(C1, 1)),
   ?assertEqual(plain(State1), plain(State4)),
   ?NO_MESSAGE.
 
@@ -1225,9 +1228,9 @@ handle_deadlock_test(Config)->
   State2 = elock_manager:add_request(Req3, State1),
   ?assertEqual([{2, Ref2}, {3, Ref3}], gb_sets:to_list(State2#state.queue)),
 
-  State3 = elock_manager:handle_deadlock(Ref2, State2),
+  State3 = elock_manager:handle_deadlock(#deadlock{ref = Ref2, winner = ?WINNER}, State2),
 
-  ?assertEqual([#deadlock{ref = Ref2}], elock_test_utils:collected(C2, 1)),
+  ?assertEqual([#deadlock{ref = Ref2, winner = ?WINNER}], elock_test_utils:collected(C2, 1)),
   ?assertEqual([#locked{ref = Ref3}], elock_test_utils:collected(C3, 1)),
   #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State3,
   ?assertEqual(plain(State0#state{
@@ -1243,9 +1246,12 @@ handle_deadlock_test(Config)->
   ?assertEqual(lists:sort([{process, C1}, {process, C3}]), monitors()),
 
   % a holder is ignored, an unknown ref is ignored
-  ?assertEqual(State3, elock_manager:handle_deadlock(Ref1, State3)),
-  ?assertEqual(State3, elock_manager:handle_deadlock(Ref3, State3)),
-  ?assertEqual(State3, elock_manager:handle_deadlock(make_ref(), State3)),
+  ?assertEqual(State3,
+    elock_manager:handle_deadlock(#deadlock{ref = Ref1, winner = ?WINNER}, State3)),
+  ?assertEqual(State3,
+    elock_manager:handle_deadlock(#deadlock{ref = Ref3, winner = ?WINNER}, State3)),
+  ?assertEqual(State3,
+    elock_manager:handle_deadlock(#deadlock{ref = make_ref(), winner = ?WINNER}, State3)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -1844,7 +1850,7 @@ handle_deadlock_probe_test(Config)->
   C4 = elock_test_utils:collector(),
   OM = elock_test_utils:collector(),
   M3 = elock_test_utils:collector(),
-  OEdge = {origin_scope, origin_term, node()},
+  OEdge = {origin_scope, origin_term, 'origin@node'},
   K3 = {Scope, t3, node()},
   ORef = make_ref(),
   Probe = #deadlock_probe{
@@ -1872,7 +1878,7 @@ handle_deadlock_probe_test(Config)->
 
   State3 = elock_manager:handle_deadlock_probe(Probe, State2),
 
-  ?assertEqual([#deadlock{ref = Ref2}], elock_test_utils:collected(C2, 1)),
+  ?assertEqual([#deadlock{ref = Ref2, winner = OEdge}], elock_test_utils:collected(C2, 1)),
   ?assertEqual([Probe#deadlock_probe{ sent_to = #{ OM => true, M3 => true } }], elock_test_utils:collected(M3, 1)),
   #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State2,
   ?assertEqual(plain(State0#state{
@@ -1900,7 +1906,8 @@ handle_deadlock_probe_test(Config)->
 
   ?assertEqual(State4, elock_manager:handle_deadlock_probe(Probe, State4)),
 
-  ?assertEqual([#deadlock{ref = ORef}], elock_test_utils:collected(OM, 1)),
+  ?assertEqual([#deadlock{ref = ORef, winner = {Scope, ?TERM, node()}}],
+    elock_test_utils:collected(OM, 1)),
   ?NO_MESSAGE.
 
 %%=================================================================

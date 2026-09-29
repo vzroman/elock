@@ -423,7 +423,7 @@ probe_no_graph_test(_Config)->
   OM = elock_test_utils:collector(),
   Probe = probe(make_ref(), OM, 1),
 
-  ?assertEqual({forward, []}, elock_graph:probe(Probe, undefined)),
+  ?assertEqual({forward, []}, elock_graph:probe(Probe, ?EDGE, undefined)),
   ?assertEqual(ok, elock_graph:forward(Probe, undefined)),
   ?NO_MESSAGE.
 
@@ -441,7 +441,7 @@ probe_edge_not_held_test(_Config)->
   },
   Probe = probe(make_ref(), OM, 1),
 
-  ?assertEqual({forward, []}, elock_graph:probe(Probe, Graph)),
+  ?assertEqual({forward, []}, elock_graph:probe(Probe, ?EDGE, Graph)),
   ?NO_MESSAGE,
 
   % and the probe goes on to the managers of the locks the waiters hold
@@ -465,8 +465,8 @@ probe_origin_loses_test(_Config)->
     index = #{ CRef => {2, #{ ?ORIGIN_EDGE => OM }} }
   },
 
-  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 1), Graph)),
-  ?assertEqual([#deadlock{ref = ORef}], elock_test_utils:collected(OM, 1)),
+  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, Graph)),
+  ?assertEqual([#deadlock{ref = ORef, winner = ?EDGE}], elock_test_utils:collected(OM, 1)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -482,7 +482,7 @@ probe_closer_loses_test(_Config)->
     index = #{ CRef => {1, #{ ?ORIGIN_EDGE => OM }} }
   },
 
-  ?assertEqual({forward, [CRef]}, elock_graph:probe(probe(ORef, OM, 2), Graph)),
+  ?assertEqual({forward, [CRef]}, elock_graph:probe(probe(ORef, OM, 2), ?EDGE, Graph)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -499,15 +499,15 @@ probe_tie_test(_Config)->
     edges = #{ ?ORIGIN_EDGE => #{ Winner => 1 } },
     index = #{ Winner => {1, #{ ?ORIGIN_EDGE => OM }} }
   },
-  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 1), WinnerGraph)),
-  ?assertEqual([#deadlock{ref = ORef}], elock_test_utils:collected(OM, 1)),
+  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, WinnerGraph)),
+  ?assertEqual([#deadlock{ref = ORef, winner = ?EDGE}], elock_test_utils:collected(OM, 1)),
   ?NO_MESSAGE,
 
   LoserGraph = #graph{
     edges = #{ ?ORIGIN_EDGE => #{ Loser => 1 } },
     index = #{ Loser => {1, #{ ?ORIGIN_EDGE => OM }} }
   },
-  ?assertEqual({forward, [Loser]}, elock_graph:probe(probe(ORef, OM, 1), LoserGraph)),
+  ?assertEqual({forward, [Loser]}, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, LoserGraph)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -524,7 +524,7 @@ probe_stale_hold_test(_Config)->
     index = #{ CRef => {5, #{ ?ORIGIN_EDGE => Stale }} }
   },
 
-  ?assertEqual({forward, []}, elock_graph:probe(probe(ORef, OM, 1), Graph)),
+  ?assertEqual({forward, []}, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, Graph)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -539,7 +539,7 @@ probe_skips_origin_test(_Config)->
     index = #{ ORef => {5, #{ ?ORIGIN_EDGE => OM }} }
   },
 
-  ?assertEqual({forward, []}, elock_graph:probe(probe(ORef, OM, 1), Graph)),
+  ?assertEqual({forward, []}, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, Graph)),
   ?NO_MESSAGE,
 
   % the origin among real closers is skipped as well
@@ -551,7 +551,7 @@ probe_skips_origin_test(_Config)->
       CRef => {1, #{ ?ORIGIN_EDGE => OM }}
     }
   },
-  ?assertEqual({forward, [CRef]}, elock_graph:probe(probe(ORef, OM, 2), Graph2)),
+  ?assertEqual({forward, [CRef]}, elock_graph:probe(probe(ORef, OM, 2), ?EDGE, Graph2)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -579,7 +579,7 @@ probe_multiple_closers_test(_Config)->
     }
   },
 
-  {forward, Closers} = elock_graph:probe(probe(ORef, OM, 3), Graph),
+  {forward, Closers} = elock_graph:probe(probe(ORef, OM, 3), ?EDGE, Graph),
   ?assertEqual(lists:sort([C1, C2]), lists:sort(Closers)),
   ?NO_MESSAGE,
 
@@ -595,8 +595,8 @@ probe_multiple_closers_test(_Config)->
       W => {4, #{ K3 => M3 }}
     }
   },
-  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 3), Graph2)),
-  ?assertEqual([#deadlock{ref = ORef}], elock_test_utils:collected(OM, 1)),
+  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 3), ?EDGE, Graph2)),
+  ?assertEqual([#deadlock{ref = ORef, winner = ?EDGE}], elock_test_utils:collected(OM, 1)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------

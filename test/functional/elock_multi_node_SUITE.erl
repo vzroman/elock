@@ -597,7 +597,7 @@ multi_node_timeout_two_queued_test(Config)->
 %%-----------------------------------------------------------------
 %%  C1 (n1) holds t1 on n1, C2 (n2) holds t2 on n2; C1 asks t2 on
 %%  n2, C2 asks t1 on n1 - with either request closing the cycle:
-%%  exactly one {error, deadlock} within a second, the other keeps
+%%  exactly one {error, {deadlock, Winner}} within a second, the other keeps
 %%  waiting until the loser unlocks its term, then it is granted;
 %%  the loser is left with no context; idle after
 %%-----------------------------------------------------------------
@@ -617,8 +617,9 @@ multi_node_deadlock_test(Config)->
         end,
 
       {LoserR, Verdict} = any_result([ R || {_, R, _} <- Requests ], ?VERDICT),
-      ?assertEqual({error, deadlock}, Verdict),
       {value, {Loser, LoserR, [LoserHeld]}, [{Winner, WinnerR, [WinnerHeld]}]} = lists:keytake(LoserR, 2, Requests),
+      WinnerLock = case Winner of C1-> {Scope, t2, N2}; C2-> {Scope, t1, N1} end,
+      ?assertEqual({error, {deadlock, WinnerLock}}, Verdict),
       still_waiting(WinnerR),
       ?assertMatch(#context{ ref2lock = Ref2Lock } when map_size(Ref2Lock) =:= 1, elock_test_utils:context(Loser)),
 
@@ -656,8 +657,10 @@ cross_scope_multi_node_deadlock_test(Config)->
           c2_closes-> setup([Part1, Part2])
         end,
       Verdicts = resolve(Requests),
-      ?assertEqual(1, length(losers(Verdicts))),
-      ?assertEqual(1, length(winners(Verdicts))),
+      [Loser] = losers(Verdicts),
+      [Winner] = winners(Verdicts),
+      WinnerLock = case Winner of C1-> {Scope2, t2, N2}; C2-> {Scope1, t1, N1} end,
+      ?assertEqual({error, {deadlock, WinnerLock}}, maps:get(Loser, Verdicts)),
       wait_idle(Nodes, Scope1),
       wait_idle(Nodes, Scope2),
       stop([C1, C2])
@@ -682,7 +685,7 @@ ring_across_nodes_test(Config)->
       || {Client, I} <- lists:zip(Clients, lists:seq(1, N)) ],
   Requests = setup(Parts),
   {LoserR, Verdict} = any_result([ R || {_, R, _} <- Requests ], ?VERDICT),
-  ?assertEqual({error, deadlock}, Verdict),
+  ?assertMatch({error, {deadlock, {_, _, _}}}, Verdict),
   {value, {Loser, LoserR, [LoserHeld]}, Rest} = lists:keytake(LoserR, 2, Requests),
   [ still_waiting(R) || {_, R, _} <- Rest ],
 
@@ -734,7 +737,7 @@ same_term_opposite_order_deadlock_test(Config)->
                   holds_both(Other, OtherRef, Scope, N1, N2),
                   ?assertEqual(ok, elock_test_utils:unlock(Other, OtherRef)),
                   0;
-                {ok, {error, deadlock}}->
+                {ok, {error, {deadlock, {_, _, _}}}}->
                   % the other lost the cycle and released its node to the first
                   ?assertEqual(undefined, elock_test_utils:context(Other)),
                   ?assertEqual(ok, elock_test_utils:unlock(First, FirstRef)),
@@ -742,7 +745,7 @@ same_term_opposite_order_deadlock_test(Config)->
                 {ok, Unexpected}->
                   erlang:error({unexpected_verdict, Unexpected})
               end;
-            {error, deadlock}->
+            {error, {deadlock, {_, _, _}}}->
               % the first lost the cycle: the other is granted with what the loser released
               ?assertEqual(undefined, elock_test_utils:context(First)),
               OtherRef = granted(OtherR),
@@ -790,6 +793,7 @@ weight_across_nodes_test(Config)->
       Verdicts = resolve(Requests),
       ?assertEqual([Light], losers(Verdicts)),
       ?assertEqual([Heavy], winners(Verdicts)),
+      ?assertEqual({error, {deadlock, {Scope, u, N2}}}, maps:get(Light, Verdicts)),
       wait_idle(Nodes, Scope),
       stop([Heavy, Light])
     end,
@@ -802,7 +806,7 @@ weight_across_nodes_test(Config)->
 %%  t and y on n2 and waits for x on n1, held by C2 (n1); C2 asks t
 %%  on [n2, n3]: the copy on n2 closes the cycle with C1 - weight 2
 %%  against C2's 1 - and C2 loses, the copy on n3 waits behind C3.
-%%  {error, deadlock} comes back within the deadline, the copy
+%%  {error, {deadlock, Winner}} comes back within the deadline, the copy
 %%  queued on n3 is withdrawn (n3 shows C3's manager only, C2 is
 %%  not monitored there, no proxy is left waiting on n3), n2 shows
 %%  C1's managers for t and y only, C2 keeps x, C1 still waits for x and is
@@ -827,7 +831,7 @@ deadlock_withdraws_queued_copy_test(Config)->
   still_waiting(R1),
 
   R2 = elock_test_utils:lock_async(C2, Scope, t, [N2, N3], ?EXCLUSIVE),
-  ?assertEqual({error, deadlock}, verdict(C2, R2)),
+  ?assertEqual({error, {deadlock, {Scope, x, N1}}}, verdict(C2, R2)),
   ?assertEqual([{t, MT3, 2}], elock_test_utils:locks(N3, Scope)),
   ?WAIT(not monitors(MT3, C2)),
   ?WAIT(proxies(N3) =:= []),
@@ -1194,7 +1198,7 @@ ask(Client, {Scope, Term, Nodes, Options})->
   elock_test_utils:lock_queued(Nodes, Client, Scope, Term, Nodes, Options).
 
 % The verdicts of the requests of a scenario, collected as they come:
-% a loser ({error, deadlock}) releases what it holds, a winner
+% a loser ({error, {deadlock, Winner}}) releases what it holds, a winner
 % ({ok, Ref}) releases the granted lock and what it holds - so the
 % cycle resolves and the chain behind it drains. #{Client => Verdict}
 resolve(Requests)->
@@ -1207,7 +1211,7 @@ resolve(Requests, Verdicts)->
   case Verdict of
     {ok, LockRef}->
       ?assertEqual(ok, elock_test_utils:unlock(Client, LockRef));
-    {error, deadlock}->
+    {error, {deadlock, {_, _, _}}}->
       ok;
     Other->
       erlang:error({unexpected_verdict, Client, Other})
@@ -1216,7 +1220,7 @@ resolve(Requests, Verdicts)->
   resolve(Rest, Verdicts#{ Client => Verdict }).
 
 losers(Verdicts)->
-  [ Client || {Client, {error, deadlock}} <- maps:to_list(Verdicts) ].
+  [ Client || {Client, {error, {deadlock, {_, _, _}}}} <- maps:to_list(Verdicts) ].
 
 winners(Verdicts)->
   [ Client || {Client, {ok, _}} <- maps:to_list(Verdicts) ].

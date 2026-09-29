@@ -283,7 +283,7 @@ timeouts_under_load_test(Config)->
 %%-----------------------------------------------------------------
 %%  The deadlock storm: every client holds one random term while it
 %%  asks for another (no timeout), R times per round. Every request
-%%  ends with ok or {error, deadlock} - nothing hangs - and the
+%%  ends with ok or {error, {deadlock, Winner}} - nothing hangs - and the
 %%  scope is idle after every round. Rounds run until a deadlock has
 %%  been observed (capped), and at least one must have been
 %%-----------------------------------------------------------------
@@ -322,9 +322,16 @@ storm_rounds(_Clients, _Work, _Scopes, Cap, Round, Deadlocks) when Round > Cap; 
   Deadlocks;
 storm_rounds(Clients, Work, Scopes, Cap, Round, _Deadlocks)->
   Results = run(Clients, Work),
-  check_results(Results, [ok, {error, deadlock}]),
+  check_results(Results, fun
+    (ok)-> true;
+    ({error, {deadlock, {Scope, _Term, Node}}})->
+      lists:member(Scope, Scopes) andalso Node =:= node();
+    (_Unexpected)-> false
+  end),
   [ elock_test_utils:wait_idle(Scope) || Scope <- lists:usort(Scopes) ],
-  Deadlocks = length([ O || O <- lists:append(maps:values(Results)), O =:= {error, deadlock} ]),
+  Deadlocks = length([
+    O || O = {error, {deadlock, {_, _, _}}} <- lists:append(maps:values(Results))
+  ]),
   ct:pal("deadlock storm round ~p: ~p deadlocks", [Round, Deadlocks]),
   storm_rounds(Clients, Work, Scopes, Cap, Round + 1, Deadlocks).
 
@@ -471,11 +478,19 @@ collect(Requests, Deadline, Results)->
 run(Clients, Work)->
   collect(start(Clients, Work)).
 
-% Every result is a list of outcomes of the allowed shapes; a crash
-% of the work ({'EXIT', _}) or anything else is reported as is
+% Every result is a list of outcomes of the allowed shapes (a list
+% of outcomes, or a predicate); a crash of the work ({'EXIT', _}) or anything else is reported as is
 check_results(Results, Allowed)->
   ?assertEqual([], [ {Client, Result} || {Client, Result} <- maps:to_list(Results), not is_list(Result) ]),
-  ?assertEqual([], [ {Client, Outcome} || {Client, Outcomes} <- maps:to_list(Results), Outcome <- Outcomes, not lists:member(Outcome, Allowed) ]).
+  ?assertEqual([], [
+    {Client, Outcome} || {Client, Outcomes} <- maps:to_list(Results),
+    Outcome <- Outcomes, not allowed(Outcome, Allowed)
+  ]).
+
+allowed(Outcome, Allowed) when is_function(Allowed, 1)->
+  Allowed(Outcome);
+allowed(Outcome, Allowed)->
+  lists:member(Outcome, Allowed).
 
 % The end of every scenario: the scope is idle, no manager is left,
 % every client is alive without a context, then the clients are

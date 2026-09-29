@@ -63,6 +63,8 @@
 %%=================================================================
 %%  Client side
 %%=================================================================
+-spec lock(#request{}) ->
+  {ok, pid()} | {error, timeout | {deadlock, {atom(), term(), node()}}}.
 lock(#request{
   scope = Scope,
   term = Term
@@ -115,8 +117,8 @@ wait_verdict(
     #queued{ref = Ref} = Queued->
       catch ecall:send(ClientPID, Queued),
       wait_verdict(Manager, Request);
-    #deadlock{ref = Ref}->
-      {error, deadlock};
+    #deadlock{ref = Ref, winner = Winner}->
+      {error, {deadlock, Winner}};
     #timeout{ref = Ref}->
       {error, timeout};
     #retry{ref = Ref}->
@@ -253,8 +255,8 @@ loop(State0)->
         handle_request(Request, State0);
       {timeout, _TimerRef, {timeout, Ref}}->
         handle_timeout(Ref, State0);
-      #deadlock{ref = Ref}->
-        handle_deadlock(Ref, State0);
+      #deadlock{} = Deadlock->
+        handle_deadlock(Deadlock, State0);
       #deadlock_probe{} = Probe->
         handle_deadlock_probe(Probe, State0);
       #add_held_locks{} = Update->
@@ -565,7 +567,7 @@ handle_timeout(
 %%  that has got the lock or left meanwhile is ignored
 %%-----------------------------------------------------------------
 handle_deadlock(
-    Ref,
+    #deadlock{ref = Ref} = Deadlock,
     #state{
       requests = Requests
     } = State0
@@ -575,7 +577,7 @@ handle_deadlock(
       has_lock = false,
       proxy = Proxy
     }}->
-      catch Proxy ! #deadlock{ ref = Ref },
+      catch Proxy ! Deadlock,
       State = dequeue(Req, State0),
       next(State);
     _->
@@ -992,7 +994,9 @@ try_barging(
       holders = Holders,
       can_share = CanShare,
       barging = BargingRequest,
-      clients = Clients
+      clients = Clients,
+      scope = Scope,
+      term = Term
     } = State
 )->
   if
@@ -1024,7 +1028,7 @@ try_barging(
     true->
       % Client requested lock upgrade, but there is already another client
       % waiting for upgrade - deadlock. The first enqueued wins.
-      catch Proxy ! #deadlock{ref = Ref},
+      catch Proxy ! #deadlock{ref = Ref, winner = elock_graph:local_edge(Scope, Term)},
       State
   end.
 
@@ -1192,7 +1196,8 @@ handle_add_held_locks(
     #{Ref := #req{
       has_lock = false
     }}->
-      Graph = elock_graph:add_held_locks(Ref, {Scope, Term, node()}, Update, Graph0),
+      Edge = elock_graph:local_edge(Scope, Term),
+      Graph = elock_graph:add_held_locks(Ref, Edge, Update, Graph0),
       State#state{
         graph = Graph
       };
@@ -1216,14 +1221,23 @@ handle_add_held_locks(
 %%    depend on the origin any more and is not forwarded for
 %%-----------------------------------------------------------------
 handle_deadlock_probe(
-    Probe,
+    #deadlock_probe{edge = Winner} = Probe,
     #state{
-      graph = Graph0
+      graph = Graph0,
+      scope = Scope,
+      term = Term
     } = State0
 )->
-  case elock_graph:probe(Probe, Graph0) of
+  Edge = elock_graph:local_edge(Scope, Term),
+  case elock_graph:probe(Probe, Edge, Graph0) of
     {forward, AbortRefs}->
-      State = #state{graph = Graph} = lists:foldl(fun handle_deadlock/2, State0, AbortRefs),
+      State = #state{graph = Graph} = lists:foldl(
+        fun(Ref, Acc)->
+          handle_deadlock(#deadlock{ref = Ref, winner = Winner}, Acc)
+        end,
+        State0,
+        AbortRefs
+      ),
       elock_graph:forward(Probe, Graph),
       State;
     stop->

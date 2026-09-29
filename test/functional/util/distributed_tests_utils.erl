@@ -78,7 +78,7 @@ start_node(Config)->
 %%  Graceful stop: peer:stop/1 (init:stop on the node, killed after
 %%  the shutdown timeout). Returns once the node is gone from the
 %%  view of the controller and of every survivor, and the survivors
-%%  have dropped their ecall connection to it
+%%  have dropped their ecall connection to it or marked it down
 %%-----------------------------------------------------------------
 stop_node(Node)->
   Peer = take_node(Node),
@@ -92,8 +92,8 @@ stop_node(Node)->
 %%  applications, no goodbye to the other nodes. Returns once the
 %%  node is gone from the view of the controller and of every
 %%  survivor, the survivors have dropped their ecall connection to
-%%  it and still hold their connections to each other, and the peer
-%%  control process is gone
+%%  it or marked it down and still hold their connections to each
+%%  other, and the peer control process is gone
 %%-----------------------------------------------------------------
 kill_node(Node)->
   Peer = take_node(Node),
@@ -244,9 +244,8 @@ stop_peer(Peer)->
 
 %%-----------------------------------------------------------------
 %%  The node is gone for the controller and for every survivor, the
-%%  survivors have dropped the ecall connection to it (ecall does
-%%  that on the pg leave of the node) and keep the connections to
-%%  each other
+%%  survivors have dropped the ecall connection to it or marked it
+%%  down, and keep the connections to each other
 %%-----------------------------------------------------------------
 wait_gone(Node, Survivors)->
   wait_until(
@@ -273,6 +272,7 @@ gone_for(Node, Survivors)->
           false->
             case rpc(Survivor, ecall_connection, connection_info, [Node]) of
               {error, not_connected}-> true;
+              {ok, #{status := down}}-> true;
               Info-> {ecall_still_connected, Survivor, Node, Info}
             end
         end;

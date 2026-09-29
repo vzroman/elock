@@ -12,7 +12,8 @@
 %%  back as {'EXIT', _} and is reported as a bad result) and asserts
 %%  at the end: every result has an allowed shape, every node is
 %%  idle, no manager is left anywhere, every client's context is
-%%  undefined and no violation of the critical section was recorded.
+%%  undefined, its mailbox is empty, and no violation of the critical
+%%  section was recorded.
 %%
 %%  A multi node request may lose a cycle even when its client holds
 %%  nothing else: two requests for the same term granted on two
@@ -424,12 +425,17 @@ allowed(Outcome, Allowed)->
 
 % The end of every scenario: every scope is idle on every node, no
 % manager is left anywhere, every client is alive without a
-% context, then the clients are stopped
+% context and with an empty mailbox, then the clients are stopped
 finish(Scopes, Nodes, Clients)->
   [ elock_test_utils:wait_idle(Node, Scope) || Node <- Nodes, Scope <- Scopes ],
   ?assertEqual([], [ {Node, Manager} || Node <- Nodes, Manager <- elock_test_utils:managers(Node) ]),
   ?assertEqual([], [ Client || Client <- Clients, not alive(Client) ]),
   ?assertEqual([], [ {Client, Context} || Client <- Clients, Context <- [elock_test_utils:context(Client)], Context =/= undefined ]),
+  ?assertEqual([], [
+    {Client, Mailbox} || Client <- Clients,
+    Mailbox <- [rpc:call(node(Client), erlang, process_info, [Client, messages])],
+    Mailbox =/= {messages, []}
+  ]),
   [ elock_test_utils:stop(Client) || Client <- Clients ],
   ok.
 

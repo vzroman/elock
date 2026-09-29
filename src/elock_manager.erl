@@ -4,7 +4,7 @@
 %%
 %%  The lock itself is a single entry in the Scope ETS table:
 %%
-%%      { ?lock(Term), ManagerPID, LastTicket }
+%%      { Term, ManagerPID, LastTicket }
 %%
 %%  Taking a ticket with ets:update_counter/4 on the third element
 %%  is the only synchronization point between the clients:
@@ -64,7 +64,6 @@
 %%  Client side
 %%=================================================================
 lock(#request{
-  ref = Ref,
   scope = Scope,
   term = Term
 } = Request
@@ -88,24 +87,7 @@ lock(#request{
           % mailbox and nobody will ever answer - monitor it
           MonitorRef = erlang:monitor(process, Manager),
           Manager ! Request#request{ queue = RequestQueue, proxy = self() },
-          Verdict =
-            receive
-              #locked{ref = Ref}->
-                {ok, Manager};
-              #deadlock{ref = Ref}->
-                {error, deadlock};
-              #timeout{ref = Ref}->
-                {error, timeout};
-              #retry{ref = Ref}->
-                % The ticket is not valid any longer, start over
-                retry;
-              {'DOWN', MonitorRef, process, Manager, _Reason}->
-                % The manager is gone and the request went with it.
-                % The lock entry is removed before the manager exits,
-                % so the new ticket starts the next round
-                ets:match_delete(Scope, {Term, Manager, '_'}),
-                retry
-            end,
+          Verdict = wait_verdict(Manager, Request),
           erlang:demonitor(MonitorRef, [flush]),
           case Verdict of
             retry ->
@@ -116,6 +98,36 @@ lock(#request{
         _->
           lock(Request)
       end
+  end.
+
+wait_verdict(
+    Manager,
+    #request{
+      ref = Ref,
+      scope = Scope,
+      term = Term,
+      client = ClientPID
+    } = Request
+)->
+  receive
+    #locked{ref = Ref}->
+      {ok, Manager};
+    #queued{ref = Ref} = Queued->
+      catch ecall:send(ClientPID, Queued),
+      wait_verdict(Manager, Request);
+    #deadlock{ref = Ref}->
+      {error, deadlock};
+    #timeout{ref = Ref}->
+      {error, timeout};
+    #retry{ref = Ref}->
+      % The ticket is not valid any longer, start over
+      retry;
+    {'DOWN', _Ref, process, Manager, _Reason}->
+      % The manager is gone and the request went with it.
+      % The lock entry is removed before the manager exits,
+      % so the new ticket starts the next round
+      ets:match_delete(Scope, {Term, Manager, '_'}),
+      retry
   end.
 
 %%-----------------------------------------------------------------
@@ -440,7 +452,7 @@ arm_postpone_timer(State)->
   }.
 
 cancel_postpone_timer(#state{postpone_timer = Timer} = State) when is_reference(Timer)->
-  erlang:cancel_timer(Timer,[{async, true} | {info, false}]),
+  erlang:cancel_timer(Timer,[{async, true},{info, false}]),
   State#state{
     postpone_timer = undefined
   };
@@ -654,14 +666,19 @@ add_busy_request(
       client = ClientPID
     } = Request,
     #state{
-      clients = Clients0
+      clients = Clients,
+      requests = Requests
     } = State
 )->
-  if
-    is_map_key(ClientPID, Clients0)->
-      % The client already holds the lock
-      try_barging(Request, State);
-    true ->
+  case Clients of
+    #{ ClientPID := Client }->
+      case client_holds_lock(Client, Requests) of
+        true ->
+          try_barging(Request, State);
+        _->
+          enqueue(Request, State)
+      end;
+    _->
       enqueue(Request, State)
   end.
 
@@ -1257,6 +1274,22 @@ remove_client_request(ClientPID, Ref, Clients0)->
       }
   end.
 
+client_holds_lock(
+    #client{
+      requests = ClientRequests
+    },
+    Requests
+)->
+  lists:any(
+    fun(Ref)->
+      case Requests of
+        #{ Ref := #req{has_lock = true} } -> true;
+        _-> false
+      end
+    end,
+    maps:keys(ClientRequests)
+  ).
+
 %%-----------------------------------------------------------------
 %%  Does any client other than this one hold the lock?
 %%
@@ -1298,19 +1331,16 @@ stop_waiting(
 
 notify_queued(#request{
   ref = Ref,
-  client = ClientPID,
+  proxy = Proxy,
   nodes = Nodes
 })->
   if
     length(Nodes) > 1->
-      catch ecall:send(
-        ClientPID,
-        #queued{
-          ref = Ref,
-          manager = self(),
-          node = node()
-        }
-      );
+      Proxy ! #queued{
+        ref = Ref,
+        manager = self(),
+        node = node()
+      };
     true ->
       ignore
   end.
@@ -1339,7 +1369,7 @@ stop_timer(
 )->
   if
     is_reference(Timer)->
-      catch erlang:cancel_timer(Timer, [{async, true} | {info, false}]),
+      catch erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
       Req#req{
         timer = undefined
       };

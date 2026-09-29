@@ -910,13 +910,13 @@ ask(Client, Node, {Scope, Term, Options})->
 % An upgrade request: the client holds the term shared already, so
 % it is monitored since its first request and lock_queued/5 can not
 % tell whether the manager has taken the upgrade. It has once the
-% client waits for the verdict in elock_manager:lock/1 (i.e. the
+% client waits for the verdict in elock_manager:wait_verdict/2 (i.e. the
 % request is sent) and the manager's mailbox is empty
 upgrade_queued(Client, Scope, Term, Node)->
   Manager = elock_test_utils:wait_manager(Scope, Term),
   R = elock_test_utils:lock_async(Client, Scope, Term, [Node], #{}),
   ?WAIT(
-    process_info(Client, current_function) =:= {current_function, {elock_manager, lock, 1}}
+    process_info(Client, current_function) =:= {current_function, {elock_manager, wait_verdict, 2}}
     andalso process_info(Client, status) =:= {status, waiting}
     andalso process_info(Manager, message_queue_len) =:= {message_queue_len, 0}
   ),

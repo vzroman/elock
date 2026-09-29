@@ -36,6 +36,7 @@
 -export([
   lock_free_term_test/1,
   lock_busy_term_test/1,
+  lock_queued_notice_test/1,
   manager_dies_before_verdict_test/1,
   get_manager_test/1,
   add_request_shared_joins_test/1,
@@ -52,6 +53,7 @@
   handle_unlock_shared_batch_test/1,
   handle_unlock_unknown_ref_test/1,
   waiting_request_proxy_test/1,
+  waiting_client_requests_again_test/1,
   barging_exclusive_holder_test/1,
   barging_shared_again_with_exclusive_waiter_test/1,
   upgrade_only_holder_test/1,
@@ -144,6 +146,7 @@ groups()->
     {client_side, [], [
       lock_free_term_test,
       lock_busy_term_test,
+      lock_queued_notice_test,
       manager_dies_before_verdict_test,
       get_manager_test
     ]},
@@ -162,6 +165,7 @@ groups()->
       handle_unlock_shared_batch_test,
       handle_unlock_unknown_ref_test,
       waiting_request_proxy_test,
+      waiting_client_requests_again_test,
       barging_exclusive_holder_test,
       barging_shared_again_with_exclusive_waiter_test,
       upgrade_only_holder_test,
@@ -328,6 +332,35 @@ lock_busy_term_test(Config)->
 
   ?NO_MESSAGE,
   elock_test_utils:stop(C1).
+
+%%-----------------------------------------------------------------
+%%  A proxy forwards its own #queued{} to the client before the
+%%  grant, keeps waiting, and leaves another ref's notice alone
+%%-----------------------------------------------------------------
+lock_queued_notice_test(Config)->
+  Scope = ?config(scope, Config),
+  Self = self(),
+  true = ets:insert(Scope, {?TERM, Self, 1}),
+  Client = elock_test_utils:collector(),
+  Proxy = elock_test_utils:client(),
+  #request{ref = Ref} = Request = request(Scope, undefined, Client, false,
+    #{nodes => [node(), 'n2@host']}),
+  R = elock_test_utils:cast(Proxy, fun()-> elock_manager:lock(Request) end),
+  ?assertEqual(Request#request{queue = 2, proxy = Proxy}, ?RECEIVE(#request{})),
+  Foreign = #queued{ref = make_ref(), manager = Self, node = node()},
+  Queued = #queued{ref = Ref, manager = Self, node = node()},
+
+  Proxy ! Foreign,
+  Proxy ! Queued,
+  ?assertEqual([Queued], elock_test_utils:collected(Client, 1)),
+  ?assertEqual(timeout, elock_test_utils:result(R, ?QUIET)),
+  ?assertEqual({messages, [Foreign]}, process_info(Proxy, messages)),
+
+  Proxy ! #locked{ref = Ref},
+  ?assertEqual({ok, {ok, Self}}, elock_test_utils:result(R, ?DEADLINE)),
+  ?assertEqual({messages, [Foreign]}, process_info(Proxy, messages)),
+  ?NO_MESSAGE,
+  elock_test_utils:stop(Proxy).
 
 %%-----------------------------------------------------------------
 %%  The manager dies before the verdict: the client deletes the dead
@@ -857,7 +890,7 @@ handle_unlock_unknown_ref_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  The proxy of a waiting multi node request (a worker other than
-%%  the client): the client is told where the request queued up;
+%%  the client): the proxy is told where the request queued up;
 %%  the withdrawal of the request by #unlock{} kills the proxy and
 %%  drops the request and the client; a timeout and a deadlock leave
 %%  the proxy alive - it delivers the verdict; a dead client's
@@ -876,7 +909,8 @@ waiting_request_proxy_test(Config)->
   P2 = elock_test_utils:collector(),
   #request{ref = Ref2} = Req2 = request(Scope, 2, C2, false, #{proxy => P2, nodes => Nodes}),
   State1 = elock_manager:add_request(Req2, State0),
-  ?assertEqual([#queued{ ref = Ref2, manager = Self, node = node() }], elock_test_utils:collected(C2, 1)),
+  ?assertEqual([#queued{ ref = Ref2, manager = Self, node = node() }],
+    elock_test_utils:collected(P2, 1)),
   ?assertEqual([{2, Ref2}], gb_sets:to_list(State1#state.queue)),
   ?assertEqual(lists:sort([{process, C1}, {process, C2}]), monitors()),
   State2 = elock_manager:handle_unlock(Ref2, State1),
@@ -890,7 +924,7 @@ waiting_request_proxy_test(Config)->
   P3 = elock_test_utils:collector(),
   #request{ref = Ref3} = Req3 = request(Scope, 3, C3, false, #{proxy => P3, nodes => Nodes, timeout => 100}),
   State3 = elock_manager:add_request(Req3, State0),
-  [#queued{ref = Ref3}] = elock_test_utils:collected(C3, 1),
+  [#queued{ref = Ref3}] = elock_test_utils:collected(P3, 1),
   #state{requests = #{ Ref3 := #req{ timer = Timer3, proxy = P3 } }} = State3,
   ?assertEqual({timeout, Timer3, {timeout, Ref3}}, ?RECEIVE({timeout, Timer3, _})),
   State4 = elock_manager:handle_timeout(Ref3, State3),
@@ -904,7 +938,7 @@ waiting_request_proxy_test(Config)->
   P4 = elock_test_utils:collector(),
   #request{ref = Ref4} = Req4 = request(Scope, 4, C4, false, #{proxy => P4, nodes => Nodes}),
   State5 = elock_manager:add_request(Req4, State0),
-  [#queued{ref = Ref4}] = elock_test_utils:collected(C4, 1),
+  [#queued{ref = Ref4}] = elock_test_utils:collected(P4, 1),
   State6 = elock_manager:handle_deadlock(Ref4, State5),
   ?assertEqual([#deadlock{ref = Ref4}], elock_test_utils:collected(P4, 1)),
   ?assert(is_process_alive(P4)),
@@ -916,12 +950,53 @@ waiting_request_proxy_test(Config)->
   P5 = elock_test_utils:collector(),
   #request{ref = Ref5} = Req5 = request(Scope, 5, C5, false, #{proxy => P5, nodes => Nodes}),
   State7 = elock_manager:add_request(Req5, State0),
-  [#queued{ref = Ref5}] = elock_test_utils:collected(C5, 1),
+  [#queued{ref = Ref5}] = elock_test_utils:collected(P5, 1),
   State8 = elock_manager:handle_down(C5, State7),
   elock_test_utils:wait_dead(P5),
   ?assertEqual(plain(State0), plain(State8)),
   ?assertEqual([{process, C1}], monitors()),
   ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  A client that only waits asks again, shared or exclusive: both
+%%  requests stay queued behind the exclusive holder, in ticket order
+%%-----------------------------------------------------------------
+waiting_client_requests_again_test(Config)->
+  Scope = ?config(scope, Config),
+  C1 = elock_test_utils:collector(),
+  C2 = elock_test_utils:collector(),
+  #request{ref = Ref1} = Req1 = request(Scope, 1, C1, false),
+  #request{ref = Ref2} = Req2 = request(Scope, 2, C2, false),
+  State0 = initial_state(Scope, Req1),
+  State1 = elock_manager:add_request(Req2, State0),
+  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+
+  lists:foreach(
+    fun(Shared)->
+      #request{ref = Ref3} = Req3 = request(Scope, 3, C2, Shared),
+      State2 = elock_manager:add_request(Req3, State1),
+      ?assertEqual(plain(State1#state{
+        queue = gb_sets:from_list([{2, Ref2}, {3, Ref3}]),
+        requests = (State1#state.requests)#{
+          Ref3 => #req{
+            client = C2, ref = Ref3, queue = 3, proxy = C2,
+            shared = Shared, has_lock = false, timer = undefined
+          }
+        },
+        clients = (State1#state.clients)#{
+          C2 => #client{
+            requests = #{ Ref2 => false, Ref3 => Shared },
+            monitor_ref = Mon2
+          }
+        }
+      }), plain(State2)),
+      ?assertEqual(#{ Ref1 => {false, C1} }, State2#state.holders),
+      ?assertMatch(#req{has_lock = false}, maps:get(Ref2, State2#state.requests)),
+      ?assertEqual(lists:sort([{process, C1}, {process, C2}]), monitors()),
+      ?NO_MESSAGE
+    end,
+    [true, false]
+  ).
 
 %%-----------------------------------------------------------------
 %%  An exclusive holder asking again, shared or exclusive, is
@@ -1494,22 +1569,31 @@ kill_proxy_test(_Config)->
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  notify_queued/1: the client of a multi node request is told
+%%  notify_queued/1: the proxy of a multi node request is told
 %%  where the request queued up, a single node request tells nothing
 %%-----------------------------------------------------------------
 notify_queued_test(_Config)->
   Ref = make_ref(),
   Self = self(),
-  Client = elock_test_utils:collector(),
+  Proxy = elock_test_utils:collector(),
 
-  elock_manager:notify_queued(#request{ ref = Ref, client = Self, nodes = [a, b] }),
+  elock_manager:notify_queued(#request{
+    ref = Ref, client = Proxy, proxy = Self, nodes = [a, b]
+  }),
   ?assertEqual(#queued{ ref = Ref, manager = Self, node = node() }, ?RECEIVE(#queued{})),
 
-  elock_manager:notify_queued(#request{ ref = Ref, client = Client, nodes = [node(), 'n2@host', 'n3@host'] }),
-  ?assertEqual([#queued{ ref = Ref, manager = Self, node = node() }], elock_test_utils:collected(Client, 1)),
+  elock_manager:notify_queued(#request{
+    ref = Ref, client = Self, proxy = Proxy, nodes = [node(), 'n2@host', 'n3@host']
+  }),
+  ?assertEqual([#queued{ ref = Ref, manager = Self, node = node() }],
+    elock_test_utils:collected(Proxy, 1)),
 
-  elock_manager:notify_queued(#request{ ref = Ref, client = Self, nodes = [node()] }),
-  elock_manager:notify_queued(#request{ ref = Ref, client = Client, nodes = [a] }),
+  elock_manager:notify_queued(#request{
+    ref = Ref, client = Proxy, proxy = Self, nodes = [node()]
+  }),
+  elock_manager:notify_queued(#request{
+    ref = Ref, client = Self, proxy = Proxy, nodes = [a]
+  }),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------

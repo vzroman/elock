@@ -323,11 +323,6 @@ wait_verdict(#waiting{
           wait_unlock(Pending, Ref),
           Error
       end;
-    #queued{ref = Ref, node = Node} when is_map_key(Node, Nodes0)->
-      % The grant overtook the notification: the node is held already
-      % and there is nothing to notify. Should the request fail, the
-      % granted nodes are unlocked through unlock_nodes/2 anyway
-      wait_verdict(Waiting0);
     #queued{ref = Ref, manager = Manager, node = Node}->
       notify_queued(#{Node => Manager}, Nodes0, Scope, Term, Ref),
       Queued = Queued0#{
@@ -423,7 +418,9 @@ validate_option(timeout, Value)->
     Value =:= undefined-> ok;
     is_integer(Value), Value > 0 -> ok;
     true -> throw({invalid_timeout, Value})
-  end.
+  end;
+validate_option(Unexpected, _Value)->
+  throw({invalid_option, Unexpected}).
 
 get_context()->
   get(?context).

@@ -48,7 +48,6 @@
   wait_verdict_all_granted_test/1,
   wait_verdict_queued_then_granted_test/1,
   wait_verdict_granted_then_queued_test/1,
-  wait_verdict_queued_for_granted_node_ignored_test/1,
   wait_verdict_foreign_queued_left_in_mailbox_test/1,
   wait_verdict_failure_test/1,
   wait_verdict_failure_late_results_test/1,
@@ -137,7 +136,6 @@ groups()->
       wait_verdict_all_granted_test,
       wait_verdict_queued_then_granted_test,
       wait_verdict_granted_then_queued_test,
-      wait_verdict_queued_for_granted_node_ignored_test,
       wait_verdict_foreign_queued_left_in_mailbox_test,
       wait_verdict_failure_test,
       wait_verdict_failure_late_results_test,
@@ -239,8 +237,7 @@ validate_nodes_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  Options: the defaults, every invalid value, a non-map, and an
-%%  unknown key that crashes with function_clause (validate_option/2
-%%  has no clause for it - documented as it is)
+%%  unknown key that throws {invalid_option, Key}
 %%-----------------------------------------------------------------
 validate_options_test(Config)->
   Scope = ?config(scope, Config),
@@ -270,15 +267,17 @@ validate_options_test(Config)->
   ?assertThrow({invalid_timeout, {100, ms}}, elock:validate_options(#{timeout => {100, ms}})),
   ?assertThrow({invalid_timeout, 0}, elock:validate_options(#{is_shared => true, timeout => 0})),
 
-  ?assertError(function_clause, elock:validate_options(#{unknown => 1})),
-  ?assertError(function_clause, elock:validate_options(#{is_shared => true, timeout => 10, shared => true})),
+  ?assertThrow({invalid_option, unknown}, elock:validate_options(#{unknown => 1})),
+  ?assertThrow({invalid_option, shared},
+    elock:validate_options(#{is_shared => true, timeout => 10, shared => true})),
 
   % through the API
   ?assertThrow({invalid_options, []}, elock:lock(Scope, t, [Node], [])),
   ?assertThrow({invalid_is_shared, yes}, elock:lock(Scope, t, [Node], #{is_shared => yes})),
   ?assertThrow({invalid_timeout, 0}, elock:lock(Scope, t, [Node], #{timeout => 0})),
   ?assertThrow({invalid_timeout, infinity}, elock:lock(Scope, t, [Node], #{timeout => infinity})),
-  ?assertError(function_clause, elock:lock(Scope, t, [Node], #{is_shared => false, foo => bar})),
+  ?assertThrow({invalid_option, foo},
+    elock:lock(Scope, t, [Node], #{is_shared => false, foo => bar})),
 
   ?assertEqual([], elock_test_utils:locks(Scope)),
   ?assertEqual(undefined, get(?CONTEXT)).
@@ -905,24 +904,6 @@ wait_verdict_granted_then_queued_test(Config)->
     #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } },
     #add_held_locks{ ref = Ref, held = #{ {Scope, t, n3} => M3 } }
   ], elock_test_utils:collected(M2, 2)),
-  ?NO_MESSAGE.
-
-%%-----------------------------------------------------------------
-%%  #queued{} for a node that is granted already is ignored: nothing
-%%  is sent, the node is not queued (a later grant is not pushed)
-%%-----------------------------------------------------------------
-wait_verdict_queued_for_granted_node_ignored_test(Config)->
-  Scope = ?config(scope, Config),
-  Ref = make_ref(),
-  M1 = elock_test_utils:collector(),
-  M2 = elock_test_utils:collector(),
-  W1 = worker({ok, {ok, M1}}),
-  W2 = worker({ok, {ok, M2}}),
-
-  finish_worker(W1),
-  self() ! #queued{ref = Ref, manager = M1, node = n1},
-  finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------

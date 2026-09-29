@@ -15,10 +15,9 @@
 %%  A request that has to wait is issued asynchronously (lock_async
 %%  or lock_queued with the nodes to watch) and its verdict is
 %%  observed with result/2: no verdict within the quiet window means
-%%  the request is still waiting. A late #queued{} may stay in a
-%%  client's mailbox after its request completed (the grant may
-%%  overtake the notification), hence nothing asserts an empty
-%%  client mailbox
+%%  the request is still waiting. The proxy forwards #queued{}
+%%  before the grant through the same ecall worker, so a completed
+%%  request leaves no queued notice in the client's mailbox
 %%=================================================================
 -module(elock_multi_node_SUITE).
 
@@ -806,7 +805,7 @@ weight_across_nodes_test(Config)->
 %%  {error, deadlock} comes back within the deadline, the copy
 %%  queued on n3 is withdrawn (n3 shows C3's manager only, C2 is
 %%  not monitored there, no proxy is left waiting on n3), n2 shows
-%%  C1's manager only, C2 keeps x, C1 still waits for x and is
+%%  C1's managers for t and y only, C2 keeps x, C1 still waits for x and is
 %%  granted by C2's unlock; idle after
 %%-----------------------------------------------------------------
 deadlock_withdraws_queued_copy_test(Config)->
@@ -821,6 +820,7 @@ deadlock_withdraws_queued_copy_test(Config)->
   {ok, RefT2} = elock_test_utils:lock(C1, Scope, t, [N2]),
   {ok, RefY2} = elock_test_utils:lock(C1, Scope, y, [N2]),
   MT2 = elock_test_utils:wait_manager(N2, Scope, t),
+  MY2 = elock_test_utils:wait_manager(N2, Scope, y),
   {ok, RefX} = elock_test_utils:lock(C2, Scope, x, [N1]),
   MX = elock_test_utils:wait_manager(N1, Scope, x),
   R1 = elock_test_utils:lock_queued(N1, C1, Scope, x, [N1], ?EXCLUSIVE),
@@ -831,7 +831,8 @@ deadlock_withdraws_queued_copy_test(Config)->
   ?assertEqual([{t, MT3, 2}], elock_test_utils:locks(N3, Scope)),
   ?WAIT(not monitors(MT3, C2)),
   ?WAIT(proxies(N3) =:= []),
-  ?assertEqual([{t, MT2, 2}], elock_test_utils:locks(N2, Scope)),
+  ?assertEqual(lists:sort([{t, MT2, 2}, {y, MY2, 1}]),
+    lists:sort(elock_test_utils:locks(N2, Scope))),
   ?WAIT(not monitors(MT2, C2)),
   ?assertEqual(#context{
     ref2lock = #{ RefX => #lock{ scope = Scope, term = x, nodes = #{ N1 => MX } } },
@@ -1129,10 +1130,10 @@ monitors(Manager, Client)->
       false
   end.
 
-% The processes on the node waiting in elock_manager:lock/1: the
+% The processes on the node waiting in elock_manager:wait_verdict/2: the
 % proxies of the remote requests and the local clients that wait
 proxies(Node)->
-  rpc(Node, ?MODULE, processes_in, [{elock_manager, lock, 1}]).
+  rpc(Node, ?MODULE, processes_in, [{elock_manager, wait_verdict, 2}]).
 
 % The processes on the node waiting in ecall_connection:call/4: the
 % workers of the multi node requests, one per node of a request

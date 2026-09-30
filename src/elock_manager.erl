@@ -567,7 +567,6 @@ handle_unlock(
   case gb_sets:is_empty(Queue) of
     true->
       State = try_unlock(State0),
-      % TODO. Unregister lock
 
       % If here, then it's not unlocked: a new client has taken a ticket
       % and the state is already reset for it. The monitor of the leaving
@@ -988,7 +987,8 @@ locked(
   {Req, Graph} = stop_waiting(
     Req0#req{
       has_lock = true,
-      proxy = undefined
+      proxy = undefined,
+      tag = undefined
     },
     Graph0
   ),

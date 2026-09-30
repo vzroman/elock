@@ -4,6 +4,7 @@
 %%  announces the node to the other nodes of the scope.
 %%=================================================================
 -module(elock_scope).
+-moduledoc false.
 
 %%=================================================================
 %%	OTP API

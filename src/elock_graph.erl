@@ -30,6 +30,7 @@
 %%  holder does not depend on the origin.
 %%=================================================================
 -module(elock_graph).
+-moduledoc false.
 
 -include("elock.hrl").
 

@@ -19,6 +19,7 @@
 %%  The manager exits once it has removed the entry from ETS.
 %%=================================================================
 -module(elock_manager).
+-moduledoc false.
 
 -include("elock.hrl").
 

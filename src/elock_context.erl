@@ -5,6 +5,7 @@
 %%  client side of a request.
 %%=================================================================
 -module(elock_context).
+-moduledoc false.
 
 -include("elock.hrl").
 

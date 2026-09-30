@@ -6,50 +6,50 @@
 %% Types
 %%-------------------------------------------------------------------------------
 -record(request,{
-  queue,        % the ticket. Must stay the first field: the manager keeps
-                % the postponed requests in an ordset sorted by it
-  ref,
-  scope,
-  term,
-  client,
-  proxy,        % the process that waits for the verdict: the client or a worker
-  tag,          % the proxy's monitor on the manager, tags every reply to the proxy
-  shared,
-  held_count,   % the number of locks the client holds, the weight in a deadlock
-  nodes,
-  timeout
+  % The ticket must stay first: postponed requests are sorted by it.
+  queue :: pos_integer() | undefined,
+  ref :: reference(),
+  scope :: atom(),
+  term :: term(),
+  client :: pid(),
+  proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
+  tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
+  shared :: boolean(),
+  held_count :: non_neg_integer(), % held locks, the weight in a deadlock
+  nodes :: nonempty_list(node()),
+  timeout :: pos_integer() | undefined
 }).
 
 -record(unlock,{
-  manager,
-  ref
+  manager :: pid() | undefined,
+  ref :: reference()
 }).
 
 % Manager -> client: the request waits, send the held map
 -record(queued,{
-  ref,
-  manager,
-  node
+  ref :: reference(),
+  manager :: pid(),
+  node :: node()
 }).
 
 % Client -> manager: the answer to #queued{} and every later grant
 -record(add_held_locks,{
-  ref,
-  held      % #{ {Scope, Term, Node} => Manager }
+  ref :: reference(),
+  held :: elock:held_locks()
 }).
 
 % To the client, or to the origin manager as the answer to its probe
 -record(deadlock,{
-  ref,
-  winner    % {Scope, Term, Node} - the lock the winning request waits for
+  ref :: reference(),
+  winner :: elock:lock_key() % the lock the winning request waits for
 }).
 
 -record(deadlock_probe,{
-  ref,      % the origin request
-  edge,     % {Scope, Term, Node} - the lock the origin waits for
-  manager,  % the origin manager
-  weight,   % the held count of the origin
-  sent_to   % #{ ManagerPID => true } - the managers that have got the probe
+  ref :: reference(),       % the origin request
+  edge :: elock:lock_key(), % the lock the origin waits for
+  manager :: pid(),         % the origin manager
+  weight :: non_neg_integer(), % the held count of the origin
+  sent_to :: #{pid() => true} % the managers that have got the probe
 }).
 
 %%-------------------------------------------------------------------------------

@@ -29,6 +29,12 @@
   lock/1, lock/2
 ]).
 
+-type lock_result() ::
+  {ok, pid()} | {error, timeout | {deadlock, elock:lock_key()}}.
+-type holder() :: {boolean(), pid()}.
+-type holders() :: #{reference() => holder()}.
+-type client_requests() :: #{reference() => boolean()}.
+
 %%=================================================================
 %%  Client <-> manager protocol
 %%=================================================================
@@ -42,13 +48,13 @@
 %%  #deadlock{} is in elock.hrl
 %%-----------------------------------------------------------------
 -record(locked,{
-  ref
+  ref :: reference()
 }).
 -record(timeout,{
-  ref
+  ref :: reference()
 }).
 -record(retry,{
-  ref
+  ref :: reference()
 }).
 
 %%=================================================================
@@ -61,16 +67,14 @@
 %%  The worker of elock:run_request/3, remote apply. It does not have
 %%  the held locks
 %%-----------------------------------------------------------------
--spec lock(#request{}) ->
-  {ok, pid()} | {error, timeout | {deadlock, {atom(), term(), node()}}}.
+-spec lock(#request{}) -> lock_result().
 lock(Request)->
   lock(Request, undefined).
 
 %%-----------------------------------------------------------------
 %%  HeldLocks is undefined for a worker
 %%-----------------------------------------------------------------
--spec lock(#request{}, #{{atom(), term(), node()} => pid()} | undefined) ->
-  {ok, pid()} | {error, timeout | {deadlock, {atom(), term(), node()}}}.
+-spec lock(#request{}, elock:held_locks() | undefined) -> lock_result().
 lock(
     #request{
       scope = Scope,
@@ -110,6 +114,8 @@ lock(
 %%  another node. A worker passes #queued{} on to the client, the
 %%  client answers it with HeldLocks
 %%-----------------------------------------------------------------
+-spec wait_verdict(reference(), pid(), #request{}, elock:held_locks() | undefined) ->
+  lock_result() | retry.
 wait_verdict(
     MonitorRef,
     Manager,
@@ -147,6 +153,7 @@ wait_verdict(
 %%-----------------------------------------------------------------
 %%  Client side utilities
 %%-----------------------------------------------------------------
+-spec get_manager(atom(), term(), pos_integer()) -> pid() | retry.
 get_manager(Scope, Term, MyQueue)->
   case ets:lookup(Scope, Term) of
     [ { _Lock, Manager, Queue } ] when is_pid(Manager)->
@@ -167,6 +174,7 @@ get_manager(Scope, Term, MyQueue)->
 
 % High priority: every client of the Term waits for the manager.
 % Off heap mailbox: request bursts stay out of its garbage collection
+-spec start_manager(#request{}) -> pid().
 start_manager(Request)->
   spawn_opt(fun()->init(Request) end, [
     {priority, high},
@@ -180,38 +188,42 @@ start_manager(Request)->
 -define(POSTPONE_TIMEOUT, 100).
 
 -record(state,{
-  holders,          % #{ Ref => {Shared, ClientPID} }
-  queue,            % gb_sets of {Ticket, Ref}, the head is the smallest
-  requests,         % #{ Ref => #req{} }, the holders and the waiters
-  clients,          % #{ ClientPID => #client{} }
-  scope,
-  term,
-  can_share,        % every holder is shared
-  barging,          % #request{} of the pending upgrade, not in the queue
-  last,             % the last ticket taken in
-  postponed,        % ordset of #request{} that came ahead of a missing ticket
-  postpone_timer,
-  graph             % elock_graph
+  holders :: holders(),
+  queue :: gb_sets:set({pos_integer(), reference()}), % the head is the smallest
+  requests :: requests(), % the holders and the waiters
+  clients :: clients(),
+  scope :: atom(),
+  term :: term(),
+  can_share :: boolean(), % every holder is shared
+  barging :: #request{} | undefined, % the pending upgrade, not in the queue
+  last :: pos_integer(), % the last ticket taken in
+  postponed :: ordsets:ordset(#request{}), % ahead of a missing ticket
+  postpone_timer :: reference() | undefined,
+  graph :: elock_graph:graph() | undefined
 }).
 
 -record(req,{
-  client,
-  ref,
-  queue,            % the ticket
-  proxy,            % undefined once the lock is held
-  tag,              % undefined once the lock is held
-  shared,
-  held_count,
-  has_lock,
-  timer             % the timeout timer, while waiting
+  client :: pid(),
+  ref :: reference(),
+  queue :: pos_integer(), % the ticket
+  proxy :: pid() | undefined, % undefined once the lock is held
+  tag :: reference() | undefined, % undefined once the lock is held
+  shared :: boolean(),
+  held_count :: non_neg_integer() | undefined, % unused for the first holder
+  has_lock :: boolean(),
+  timer :: reference() | undefined % the timeout timer, while waiting
 }).
 
 -record(client,{
-  requests,         % #{ Ref => Shared }, the holders and the waiters
-  monitor_ref       % one monitor per client, while it has requests
+  requests :: client_requests(), % the holders and the waiters
+  monitor_ref :: reference() % one monitor per client, while it has requests
 }).
 
+-type requests() :: #{reference() => #req{}}.
+-type clients() :: #{pid() => #client{}}.
+
 % Started by the holder of ticket 1
+-spec init(#request{}) -> no_return().
 init(#request{
   ref = Ref,
   scope = Scope,
@@ -256,6 +268,7 @@ init(#request{
   loop(State).
 
 
+-spec loop(#state{}) -> no_return().
 loop(State0)->
   State =
     receive
@@ -288,6 +301,7 @@ loop(State0)->
 %%  postponed for at most POSTPONE_TIMEOUT: the missing client may be
 %%  descheduled or dead
 %%=================================================================
+-spec handle_request(#request{}, #state{}) -> #state{}.
 handle_request(
     #request{
       queue = Queue
@@ -331,6 +345,7 @@ handle_request(
   Proxy ! ?reply(Tag, #retry{ref = Ref}),
   State.
 
+-spec handle_postponed(#state{}) -> #state{}.
 handle_postponed(#state{
   postponed = [#request{
     queue = Queue
@@ -374,6 +389,7 @@ handle_postponed(State)->
 %%-----------------------------------------------------------------
 %%  Step over the missing tickets, they will get #retry{}
 %%-----------------------------------------------------------------
+-spec handle_postpone_timeout(reference(), #state{}) -> #state{}.
 handle_postpone_timeout(
     TimerRef,
     #state{
@@ -419,6 +435,7 @@ handle_postpone_timeout(_TimerRef, State)->
 %%  One timer for all the postponed requests, it is not restarted
 %%  while any ticket is missing
 %%-----------------------------------------------------------------
+-spec arm_postpone_timer(#state{}) -> #state{}.
 arm_postpone_timer(#state{postpone_timer = Timer} = State) when is_reference(Timer)->
   State;
 arm_postpone_timer(State)->
@@ -426,6 +443,7 @@ arm_postpone_timer(State)->
     postpone_timer = erlang:start_timer(?POSTPONE_TIMEOUT, self(), postpone_timeout)
   }.
 
+-spec cancel_postpone_timer(#state{}) -> #state{}.
 cancel_postpone_timer(#state{postpone_timer = Timer} = State) when is_reference(Timer)->
   erlang:cancel_timer(Timer,[{async, true},{info, false}]),
   State#state{
@@ -436,6 +454,7 @@ cancel_postpone_timer(State)->
 
 %% A cancelled timer may have fired already, hence the reference guard
 %% of handle_postpone_timeout/2
+-spec postpone_timer_fired(#state{}) -> #state{}.
 postpone_timer_fired(State)->
   State#state{
     postpone_timer = undefined
@@ -448,6 +467,7 @@ postpone_timer_fired(State)->
 %%  The only holder, no barging request, and in the body no queue:
 %%  nobody needs the Term
 %%-----------------------------------------------------------------
+-spec handle_unlock(reference(), #state{}) -> #state{}.
 handle_unlock(
     Ref,
     #state{
@@ -477,6 +497,7 @@ handle_unlock(
 handle_unlock(Ref, State)->
   leave_lock(Ref, State).
 
+-spec leave_lock(reference(), #state{}) -> #state{}.
 leave_lock(
     Ref,
     #state{
@@ -493,6 +514,7 @@ leave_lock(
 %%-----------------------------------------------------------------
 %%  A timer cancelled on the grant may have fired already: ignored
 %%-----------------------------------------------------------------
+-spec handle_timeout(reference(), #state{}) -> #state{}.
 handle_timeout(
     Ref,
     #state{
@@ -513,6 +535,7 @@ handle_timeout(
 %%  The answer to this manager's probe, or a local closer that has
 %%  lost to a foreign probe (see handle_deadlock_probe/2)
 %%-----------------------------------------------------------------
+-spec handle_deadlock(#deadlock{}, #state{}) -> #state{}.
 handle_deadlock(
     #deadlock{ref = Ref} = Deadlock,
     #state{
@@ -533,6 +556,7 @@ handle_deadlock(
       State0
   end.
 
+-spec handle_down(pid(), #state{}) -> #state{}.
 handle_down(
     ClientPID,
     #state{
@@ -560,6 +584,7 @@ handle_down(
 %%  A shared request joins a shared lock only if nobody waits: it must
 %%  not overtake a queued or barging exclusive request
 %%-----------------------------------------------------------------
+-spec add_request(#request{}, #state{}) -> #state{}.
 add_request(
     #request{
       shared = true
@@ -580,6 +605,7 @@ add_request(
 add_request(Request, State)->
   add_busy_request(Request, State).
 
+-spec add_busy_request(#request{}, #state{}) -> #state{}.
 add_busy_request(
     Request,
     #state{
@@ -613,6 +639,7 @@ add_busy_request(
       enqueue(Request, State)
   end.
 
+-spec remove_request(#req{}, #state{}) -> #state{}.
 remove_request(
     #req{has_lock = false} = Req,
     State0
@@ -629,6 +656,7 @@ remove_request(
   State = unlocked(Req, State0),
   next(State).
 
+-spec kill_proxy(#req{}) -> ok.
 kill_proxy(#req{
   client = ClientPID,
   proxy = Proxy
@@ -642,6 +670,7 @@ kill_proxy(#req{
   end,
   ok.
 
+-spec new_req(#request{}) -> #req{}.
 new_req(#request{
   client = ClientPID,
   ref = Ref,
@@ -662,6 +691,7 @@ new_req(#request{
     has_lock = false
   }.
 
+-spec enqueue(#request{}, #state{}) -> #state{}.
 enqueue(
     #request{
       client = ClientPID,
@@ -693,6 +723,7 @@ enqueue(
 %%  The upgrade waits out of the queue until its client is the only
 %%  holder (see next/1). One at a time (see try_barging/2)
 %%-----------------------------------------------------------------
+-spec enqueue_barging(#request{}, #state{}) -> #state{}.
 enqueue_barging(
     #request{
       client = ClientPID,
@@ -718,6 +749,7 @@ enqueue_barging(
 %%-----------------------------------------------------------------
 %%  A waiting request leaves: timeout, deadlock or a dead client
 %%-----------------------------------------------------------------
+-spec dequeue(#req{}, #state{}) -> #state{}.
 dequeue(
     #req{
       client = ClientPID,
@@ -771,6 +803,7 @@ dequeue(
 %%-----------------------------------------------------------------
 %%  Grants a request that has never waited
 %%-----------------------------------------------------------------
+-spec get_lock(#request{}, #state{}) -> #state{}.
 get_lock(
     #request{
       client = ClientPID,
@@ -788,6 +821,7 @@ get_lock(
     clients = Clients
   }.
 
+-spec locked(#req{}, #state{}) -> #state{}.
 locked(
     #req{
       client = ClientPID,
@@ -833,6 +867,7 @@ locked(
     graph = Graph
   }.
 
+-spec unlocked(#req{}, #state{}) -> #state{}.
 unlocked(
     #req{
       client = ClientPID,
@@ -869,6 +904,7 @@ unlocked(
 %%-----------------------------------------------------------------
 %%  The client already holds the lock
 %%-----------------------------------------------------------------
+-spec try_barging(#request{}, #state{}) -> #state{}.
 try_barging(
     #request{
       ref = Ref,
@@ -917,6 +953,7 @@ try_barging(
 %%-----------------------------------------------------------------
 %%  The barging request goes first
 %%-----------------------------------------------------------------
+-spec next(#state{}) -> #state{}.
 next(#state{
   barging = #request{
     client = ClientPID,
@@ -984,6 +1021,7 @@ next(State)->
 %%  The entry is removed only if no ticket has been taken after the
 %%  last one known here
 %%-----------------------------------------------------------------
+-spec try_unlock(#state{}) -> #state{}.
 try_unlock(#state{
   scope = Scope,
   term = Term,
@@ -1013,6 +1051,7 @@ try_unlock(#state{
 %%  A waiting request joins the graph in handle_add_held_locks/2 and
 %%  leaves it in stop_waiting/2
 %%=================================================================
+-spec handle_add_held_locks(#add_held_locks{}, #state{}) -> #state{}.
 handle_add_held_locks(
     #add_held_locks{
       ref = Ref,
@@ -1044,6 +1083,7 @@ handle_add_held_locks(
 %%  closer, which handle_deadlock/2 then skips. The probe is forwarded
 %%  on the graph after the aborts
 %%-----------------------------------------------------------------
+-spec handle_deadlock_probe(#deadlock_probe{}, #state{}) -> #state{}.
 handle_deadlock_probe(
     #deadlock_probe{edge = Winner} = Probe,
     #state{
@@ -1070,6 +1110,7 @@ handle_deadlock_probe(
 %%=================================================================
 %%  Utilities
 %%=================================================================
+-spec add_client_request(pid(), reference(), boolean(), clients()) -> clients().
 add_client_request(ClientPID, Ref, Shared, Clients)->
   Client =
     case Clients of
@@ -1088,6 +1129,7 @@ add_client_request(ClientPID, Ref, Shared, Clients)->
     ClientPID => Client
   }.
 
+-spec remove_client_request(pid(), reference(), clients()) -> clients().
 remove_client_request(ClientPID, Ref, Clients0)->
   Client0 = maps:get(ClientPID, Clients0),
   #client{
@@ -1108,6 +1150,7 @@ remove_client_request(ClientPID, Ref, Clients0)->
       }
   end.
 
+-spec client_holds_lock(#client{}, requests()) -> boolean().
 client_holds_lock(
     #client{
       requests = ClientRequests
@@ -1129,15 +1172,19 @@ client_holds_lock(
 %%  add_busy_request/2), so all its requests are holders except the
 %%  barging one, counted in Waiting
 %%-----------------------------------------------------------------
+-spec only_holder(client_requests(), holders(), 0 | 1) -> boolean().
 only_holder(ClientRequests, Holders, Waiting)->
   map_size(ClientRequests) - Waiting =:= map_size(Holders).
 
+-spec start_waiting(#request{}) -> #req{}.
 start_waiting(#request{
   timeout = Timeout
 } = Request)->
   notify_queued(Request),
   start_timer(new_req(Request), Timeout).
 
+-spec stop_waiting(#req{}, elock_graph:graph() | undefined) ->
+  {#req{}, elock_graph:graph() | undefined}.
 stop_waiting(
     #req{
       ref = Ref
@@ -1153,6 +1200,7 @@ stop_waiting(
 %%  wait. A single node request of a client that holds nothing can
 %%  not be on a cycle
 %%-----------------------------------------------------------------
+-spec notify_queued(#request{}) -> {reference(), #queued{}} | ignore.
 notify_queued(#request{
   ref = Ref,
   proxy = Proxy,
@@ -1171,6 +1219,7 @@ notify_queued(#request{
       ignore
   end.
 
+-spec start_timer(#req{}, pos_integer() | undefined) -> #req{}.
 start_timer(
     #req{
       ref = Ref
@@ -1188,6 +1237,7 @@ start_timer(
     timer = Timer
   }.
 
+-spec stop_timer(#req{}) -> #req{}.
 stop_timer(
     #req{
       timer = Timer
@@ -1203,9 +1253,12 @@ stop_timer(
       Req
   end.
 
+-spec can_share(holders()) -> boolean().
 can_share(Holders)->
   can_share_loop( maps:next( maps:iterator(Holders) ) ).
 
+-spec can_share_loop(none | {reference(), holder(),
+                             maps:iterator(reference(), holder())}) -> boolean().
 can_share_loop({_Ref, {_Shared = false, _ClientPID}, _Iterator})->
   false;
 can_share_loop({_Ref, {_Shared, _ClientPID}, Iterator})->

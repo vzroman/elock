@@ -22,26 +22,46 @@
 % lock/4 is not listed: only its boolean form is deprecated
 -deprecated([{lock, 5, "Use lock/3 or lock/4 with nodes and options, then unlock/1"}]).
 
+-export_type([lock_key/0, held_locks/0, lock_options/0]).
+
+-type lock_key() :: {atom(), term(), node()}.
+-type held_locks() :: #{lock_key() => pid()}.
+-type lock_options() :: #{
+  is_shared => boolean(),
+  timeout => pos_integer() | undefined
+}.
+-type validated_options() :: #{
+  is_shared := boolean(),
+  timeout := pos_integer() | undefined
+}.
+-type lock_result() :: {ok, reference()} | {error, term()}.
+-type node_managers() :: #{node() => pid()}.
+-type lock_counts() :: #{lock_key() => pos_integer()}.
+-type pending_workers() :: #{reference() => node()}.
+-type request_result() :: {ok, node_managers()} | {error, term()}.
+
 -define(context,'$elock_context$').
 -define(pg_scope(Scope),list_to_atom(atom_to_list(Scope)++"_$pg$")).
 
--record(context,{
-  ref2lock,   % #{ Ref => #lock{} }
-  locked,     % #{ {Scope, Term, Node} => Manager } - the held map, sent to
-              % the managers as is. Scope is in the key: the same Term in two
-              % scopes is two locks
-  counts      % #{ {Scope, Term, Node} => N }, N >= 2: the re-entered keys only
+-record(lock,{
+  scope :: atom(),
+  term :: term(),
+  nodes :: node_managers()
 }).
 
--record(lock,{
-  scope,
-  term,
-  nodes
+-record(context,{
+  ref2lock :: #{reference() => #lock{}},
+  % Sent to managers as is. The same Term in two scopes is two locks.
+  locked :: held_locks(),
+  counts :: lock_counts() % N >= 2: the re-entered keys only
 }).
+
+-type context() :: #context{} | undefined.
 
 %%=================================================================
 %%	OTP API
 %%=================================================================
+-spec start_link(atom()) -> {ok, pid()}.
 start_link(Scope)->
   {ok, spawn_link(fun()->
 
@@ -68,9 +88,13 @@ start_link(Scope)->
 %%=================================================================
 %%	API
 %%=================================================================
+-spec lock(atom(), term(), nonempty_list(node())) -> lock_result().
 lock(Scope, Term, Nodes)->
   lock(Scope, Term, Nodes, _Options = #{}).
 % Deprecated boolean form, see lock/5
+-spec lock(atom(), term(), boolean(), timeout()) ->
+    {ok, fun(() -> ok)} | {error, term()};
+  (atom(), term(), nonempty_list(node()), lock_options()) -> lock_result().
 lock(Scope, Term, IsShared, Timeout) when is_boolean(IsShared)->
   lock(Scope, Term, IsShared, Timeout, [node()]);
 lock(Scope, Term, Nodes, Options)->
@@ -123,6 +147,7 @@ lock(Scope, Term, IsShared, Timeout, Nodes)->
       Error
   end.
 
+-spec locked(#request{}, node_managers(), context()) -> context().
 locked(
     #request{
       ref = Ref,
@@ -161,8 +186,10 @@ locked(Request, Nodes, _NoContext)->
   },
   locked(Request, Nodes, Context).
 
+-spec unlock(reference()) -> ok.
 unlock(Ref)->
   unlock(Ref, erase_context()).
+-spec unlock(reference(), context()) -> ok.
 unlock(
     Ref,
     #context{
@@ -196,6 +223,8 @@ unlock(_Ref, _NoContext)->
 
 % {Locked, Counts} as in #context{}. A key held by another Manager is
 % stale: its manager has died and a new one has taken the Term
+-spec add_lock(#lock{}, {held_locks(), lock_counts()}) ->
+  {held_locks(), lock_counts()}.
 add_lock(
     #lock{
       scope = Scope,
@@ -222,6 +251,8 @@ add_lock(
     Nodes
   ).
 
+-spec remove_lock(#lock{}, {held_locks(), lock_counts()}) ->
+  {held_locks(), lock_counts()}.
 remove_lock(
     #lock{
       scope = Scope,
@@ -254,14 +285,17 @@ remove_lock(
     Nodes
   ).
 
+-spec held_locks(context()) -> held_locks().
 held_locks(#context{locked = Locked})->
   Locked;
 held_locks(_NoContext)->
   #{}.
 
+-spec held_count(context()) -> non_neg_integer().
 held_count(Context)->
   map_size(held_locks(Context)).
 
+-spec ready_nodes(atom()) -> [node()].
 ready_nodes(Scope)->
   [node(PID)|| PID <- pg:get_members(?pg_scope(Scope), {?MODULE,'$members$'})].
 
@@ -269,16 +303,17 @@ ready_nodes(Scope)->
 %%	REQUEST
 %%=================================================================
 -record(waiting,{
-  ref,
-  scope,
-  term,
-  held,       % #{ {Scope, Term, Node} => Manager } - the locks the client holds
-  pending,    % #{ MonRef => Node } - the workers that have not returned yet
-  nodes,      % #{ Node => Manager } - the grants so far
-  queued      % #{ Node => Manager } - the managers the request waits at
+  ref :: reference(),
+  scope :: atom(),
+  term :: term(),
+  held :: held_locks(),         % the locks the client holds
+  pending :: pending_workers(), % the workers that have not returned yet
+  nodes :: node_managers(),     % the grants so far
+  queued :: node_managers()     % the managers the request waits at
 }).
 
 % The local node alone: the client is the proxy itself
+-spec run_request(reference(), #request{}, held_locks()) -> request_result().
 run_request(
     _Ref,
     #request{
@@ -331,6 +366,7 @@ run_request(
 % Every clause matches Ref, a plain argument from make_ref/0 in lock/4:
 % the receive skips the older messages. Ref taken from #waiting{} would
 % break the optimization
+-spec wait_verdict(reference(), #waiting{}) -> request_result().
 wait_verdict(
     Ref,
     #waiting{
@@ -398,6 +434,7 @@ wait_verdict(
 
 % The request has failed: release the late grants and withdraw the
 % request from the managers that report it queued
+-spec wait_unlock(reference(), pending_workers()) -> ok.
 wait_unlock(Ref, Pending0)
   when map_size(Pending0) > 0->
   receive
@@ -417,6 +454,7 @@ wait_unlock(Ref, Pending0)
 wait_unlock(_Ref, _Pending)->
   ok.
 
+-spec notify_queued(node_managers(), held_locks(), reference()) -> ok.
 notify_queued(Queued, Held, Ref)
   when map_size(Queued) > 0, map_size(Held) > 0->
   Message = #add_held_locks{
@@ -431,6 +469,7 @@ notify_queued(_Queued, _Held, _Ref)->
 %%=================================================================
 %%	UTILITIES
 %%=================================================================
+-spec validate_nodes(term()) -> ok.
 validate_nodes(Nodes)->
   if
     is_list(Nodes), length(Nodes) > 0 -> ok;
@@ -446,6 +485,7 @@ validate_nodes(Nodes)->
     Nodes
   ).
 
+-spec validate_options(term()) -> validated_options().
 validate_options(Options)->
   if
     is_map(Options) -> ok;
@@ -458,6 +498,7 @@ validate_options(Options)->
   maps:foreach(fun validate_option/2, WithDefaults),
   WithDefaults.
 
+-spec validate_option(term(), term()) -> boolean() | ok.
 validate_option(is_shared, Value)->
   if
     is_boolean(Value) -> Value;
@@ -472,13 +513,18 @@ validate_option(timeout, Value)->
 validate_option(Unexpected, _Value)->
   throw({invalid_option, Unexpected}).
 
+% The process dictionary holds only this process's lock context.
+-spec get_context() -> context().
 get_context()->
   get(?context).
+-spec put_context(#context{}) -> context().
 put_context(Context)->
   put(?context, Context).
+-spec erase_context() -> context().
 erase_context()->
   erase(?context).
 
+-spec unlock_nodes(node_managers(), reference()) -> ok.
 unlock_nodes(Nodes, Ref) when map_size(Nodes) > 0->
   [ ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes) ],
   ok;

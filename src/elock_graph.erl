@@ -284,7 +284,7 @@ probe(
     #{ Edge := Holders }->
       case check_cycles(maps:to_list(Holders), Probe, Index, []) of
         origin->
-          catch ecall:send(Manager, #deadlock{ref = Ref, winner = LocalEdge}),
+          ecall:send(Manager, #deadlock{ref = Ref, winner = LocalEdge}),
           stop;
         Closers->
           {forward, Closers}
@@ -410,7 +410,7 @@ run_probe(Ref, Edge, Held, Weight)->
   },
   maps:foreach(
     fun(Manager, _)->
-      catch ecall:send(Manager, Probe)
+      ecall:send(Manager, Probe)
     end,
     maps:remove(Self, SentTo)
   ).
@@ -448,7 +448,7 @@ forward(
   },
   maps:foreach(
     fun(Manager, _)->
-      catch ecall:send(Manager, Probe)
+      ecall:send(Manager, Probe)
     end,
     Targets
   );

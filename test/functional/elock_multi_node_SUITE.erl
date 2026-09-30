@@ -226,7 +226,7 @@ end_per_testcase(_TestCase, Config)->
   Holders = ?config(holders, Config) ++ proplists:get_value(holders2, Config, []),
   Alive = distributed_tests_utils:nodes(),
   Results = [ elock_test_utils:finish_scope(Holder) || {Node, Holder} <- Holders, lists:member(Node, Alive) ],
-  [ catch distributed_tests_utils:stop_node(Extra) || Extra <- extra_nodes() ],
+  [ ?safe(distributed_tests_utils:stop_node(Extra)) || Extra <- extra_nodes() ],
   case [ Fail || {fail, _} = Fail <- Results ] of
     []-> ok;
     [Fail | _]-> Fail

@@ -23,6 +23,8 @@
 %%=================================================================
 -module(distributed_tests_utils).
 
+-include("../elock_test.hrl").
+
 -compile({no_auto_import, [nodes/0]}).
 
 %% API
@@ -38,7 +40,7 @@
 -define(STATE_KEY, {?MODULE, state}).
 -define(HOST, "127.0.0.1").
 -define(RPC_TIMEOUT, 30000).
--define(DEADLINE, 30000).
+-define(NODE_DEADLINE, 30000).
 
 %%=================================================================
 %%  API
@@ -228,16 +230,16 @@ ecall_connected(From, To)->
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  Stop the peer control process. After a kill it may be gone
-%%  already (it exits when it loses the node), hence the catch and
+%%  already (it exits when it loses the node), hence ?safe and
 %%  the wait for its death either way
 %%-----------------------------------------------------------------
 stop_peer(Peer)->
   MonRef = erlang:monitor(process, Peer),
-  catch peer:stop(Peer),
+  ?safe(peer:stop(Peer)),
   receive
     {'DOWN', MonRef, process, Peer, _Reason}->
       ok
-  after ?DEADLINE->
+  after ?NODE_DEADLINE->
     erlang:demonitor(MonRef, [flush]),
     erlang:error({peer_did_not_stop, Peer})
   end.
@@ -321,4 +323,4 @@ rpc(Node, Module, Function, Args)->
   end.
 
 wait_until(Fun)->
-  elock_test_utils:wait_until(Fun, ?DEADLINE).
+  elock_test_utils:wait_until(Fun, ?NODE_DEADLINE).

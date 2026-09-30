@@ -226,7 +226,9 @@ end_per_testcase(_TestCase, Config)->
   elock_test_utils:stop_collectors(),
   case ?config(holder, Config) of
     undefined->
-      Left = (catch elock_test_utils:wait_until(fun()-> elock_test_utils:managers() =:= [] end, ?DEADLINE)),
+      Left = ?safe(elock_test_utils:wait_until(
+        fun()-> elock_test_utils:managers() =:= [] end, ?DEADLINE
+      )),
       elock_test_utils:kill_managers(),
       case Left of
         ok-> ok;
@@ -579,7 +581,7 @@ multi_node_context_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  unlock/1 when the managers of the lock are dead is harmless
-%%  (catch ecall:send): ok, the context is erased, a surviving
+%%  (sending to a dead pid is safe): ok, the context is erased, a surviving
 %%  manager still gets its #unlock{}. Multi node through locked/3
 %%  with collectors as managers (one dead, then both), and single
 %%  node with a real manager killed under the client: the client's

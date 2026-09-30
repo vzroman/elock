@@ -437,13 +437,13 @@ wait_unlock(Ref, Pending0)
       Pending = maps:remove(MonRef, Pending0),
       case NodeResult of
         {ok, {ok, Manager}} ->
-          catch ecall:send(Manager, #unlock{ref = Ref});
+          ecall:send(Manager, #unlock{ref = Ref});
         _->
           ignore
       end,
       wait_unlock(Ref, Pending);
     #queued{ref = Ref, manager = Manager}->
-      catch ecall:send(Manager, #unlock{ref = Ref}),
+      ecall:send(Manager, #unlock{ref = Ref}),
       wait_unlock(Ref, Pending0)
   end;
 wait_unlock(_Ref, _Pending)->
@@ -456,7 +456,7 @@ notify_queued(Queued, Held, Ref)
     ref = Ref,
     held = Held
   },
-  [ catch ecall:send(Manager, Message) || Manager <- maps:values(Queued) ],
+  [ ecall:send(Manager, Message) || Manager <- maps:values(Queued) ],
   ok;
 notify_queued(_Queued, _Held, _Ref)->
   ok.
@@ -513,7 +513,7 @@ erase_context()->
   erase(?context).
 
 unlock_nodes(Nodes, Ref) when map_size(Nodes) > 0->
-  [catch ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes)],
+  [ ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes) ],
   ok;
 unlock_nodes(_Locked, _Ref)->
   ok.

@@ -258,9 +258,11 @@ end_per_testcase(_TestCase, Config)->
   Scope = ?config(scope, Config),
   elock_test_utils:stop_clients(),
   elock_test_utils:stop_collectors(),
-  Left = (catch elock_test_utils:wait_until(fun()-> elock_test_utils:managers() =:= [] end, ?DEADLINE)),
+  Left = ?safe(elock_test_utils:wait_until(
+    fun()-> elock_test_utils:managers() =:= [] end, ?DEADLINE
+  )),
   elock_test_utils:kill_managers(),
-  catch ets:delete(Scope),
+  ?safe(ets:delete(Scope)),
   case Left of
     ok-> ok;
     Error-> {fail, {managers_left, Error}}

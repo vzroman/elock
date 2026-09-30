@@ -4,6 +4,19 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% The result of the deprecated catch expression, including error stacks.
+%% The fun keeps exception variables local to each macro expansion.
+-define(safe(Expr),
+  (fun()->
+    try Expr
+    catch
+      throw:__SafeReason__ -> __SafeReason__;
+      exit:__SafeReason__ -> {'EXIT', __SafeReason__};
+      error:__SafeReason__:__SafeStack__ ->
+        {'EXIT', {__SafeReason__, __SafeStack__}}
+    end
+  end)()).
+
 %% The deadline of every wait, ms
 -define(DEADLINE, 5000).
 

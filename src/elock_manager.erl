@@ -178,7 +178,7 @@ wait_verdict(
     ?reply(MonitorRef, #queued{} = Queued)->
       case HeldLocks of
         undefined ->
-          catch ecall:send(ClientPID, Queued);
+          ecall:send(ClientPID, Queued);
         _->
           Manager ! #add_held_locks{ref = Ref, held = HeldLocks}
       end,
@@ -407,7 +407,7 @@ handle_request(
     },
     State
 )->
-  catch Proxy ! ?reply(Tag, #retry{ref = Ref}),
+  Proxy ! ?reply(Tag, #retry{ref = Ref}),
   State.
 
 %%-----------------------------------------------------------------
@@ -454,7 +454,7 @@ handle_postponed(#state{
     tag = Tag
   }|Rest]
 } = State)->
-  catch Proxy ! ?reply(Tag, #retry{ref = Ref}),
+  Proxy ! ?reply(Tag, #retry{ref = Ref}),
   handle_postponed(State#state{
     postponed = Rest
   });
@@ -618,7 +618,7 @@ handle_timeout(
 )->
   case Requests of
     #{Ref := #req{ has_lock = false, proxy = Proxy, tag = Tag } = Req}->
-      catch Proxy ! ?reply(Tag, #timeout{ref = Ref}),
+      Proxy ! ?reply(Tag, #timeout{ref = Ref}),
       % The timer has just fired, there is nothing to cancel. Cancelling
       % it here would cost a round trip to the scheduler that owns it -
       % a fired timer is no longer in the manager's own timer tree
@@ -647,7 +647,7 @@ handle_deadlock(
       proxy = Proxy,
       tag = Tag
     }}->
-      catch Proxy ! ?reply(Tag, Deadlock),
+      Proxy ! ?reply(Tag, Deadlock),
       State = dequeue(Req, State0),
       next(State);
     _->
@@ -983,7 +983,7 @@ locked(
       graph = Graph0
     } = State)->
 
-  catch Proxy ! ?reply(Tag, #locked{ref = Ref}),
+  Proxy ! ?reply(Tag, #locked{ref = Ref}),
   {Req, Graph} = stop_waiting(
     Req0#req{
       has_lock = true,
@@ -1102,7 +1102,7 @@ try_barging(
     true->
       % Client requested lock upgrade, but there is already another client
       % waiting for upgrade - deadlock. The first enqueued wins.
-      catch Proxy ! ?reply(Tag, #deadlock{ref = Ref, winner = {Scope, Term, node()}}),
+      Proxy ! ?reply(Tag, #deadlock{ref = Ref, winner = {Scope, Term, node()}}),
       State
   end.
 
@@ -1471,7 +1471,7 @@ stop_timer(
 )->
   if
     is_reference(Timer)->
-      catch erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
+      erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
       Req#req{
         timer = undefined
       };

@@ -17,6 +17,7 @@
 %% scenarios. Stage 3: the multi node scenarios on peer nodes (see
 %% util/distributed_tests_utils.erl)
 {suites, 'FUNCTIONAL_TEST', [
+  elock_test_utils_SUITE,
   elock_SUITE,
   elock_graph_SUITE,
   elock_manager_SUITE,

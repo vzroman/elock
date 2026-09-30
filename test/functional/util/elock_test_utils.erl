@@ -9,6 +9,8 @@
 %%=================================================================
 -module(elock_test_utils).
 
+-include("../elock_test.hrl").
+
 %% Scopes
 -export([
   start_scope/1, start_scope/2,
@@ -79,7 +81,6 @@
 ]).
 
 -define(POLL, 10).
--define(DEADLINE, 5000).
 -define(CONTEXT, '$elock_context$').
 -define(HOLDER_SCOPE, '$elock_test_scope$').
 -define(CALL, '$elock_test_call$').
@@ -161,9 +162,9 @@ finish_scope(Holder)->
     case holder_scope(Holder) of
       undefined->
         % the scope is stopped already
-        catch wait_until(fun()-> managers(Node) =:= [] end, ?DEADLINE);
+        ?safe(wait_until(fun()-> managers(Node) =:= [] end, ?DEADLINE));
       Scope->
-        catch wait_idle(Node, Scope)
+        ?safe(wait_idle(Node, Scope))
     end,
   stop_scope(Holder),
   kill_managers(Node),
@@ -191,7 +192,7 @@ wait_ready(Scope, Nodes)->
     fun()->
       lists:all(
         fun(Node)->
-          case catch rpc(Node, elock, ready_nodes, [Scope]) of
+          case ?safe(rpc(Node, elock, ready_nodes, [Scope])) of
             Ready when is_list(Ready)->
               lists:sort(Ready) =:= Expected;
             _->
@@ -205,7 +206,7 @@ wait_ready(Scope, Nodes)->
   ).
 
 is_ready(Node, Scope)->
-  case catch rpc(Node, elock, ready_nodes, [Scope]) of
+  case ?safe(rpc(Node, elock, ready_nodes, [Scope])) of
     Ready when is_list(Ready)->
       lists:member(Node, Ready);
     _->

@@ -104,25 +104,21 @@
 %%-----------------------------------------------------------------
 %%  The holds of a waiting request come in: Update is a held map,
 %%  Edge is the lock of this manager, the one the request waits
-%%  for, Weight is the held count of the request
+%%  for, Weight is the held count of the request. They join its
+%%  held map and are probed: they add wait-for edges and may be the
+%%  very edge that closes a cycle, and only the request that has
+%%  them can see that. A request that is not in the graph yet joins
+%%  with the given weight, one that is there keeps the weight it has
+%%  joined with (see the header).
+%%
+%%  The update is taken as it is. It is never empty, the senders
+%%  see to that (see elock:notify_queued/3 and
+%%  elock_manager:notify_queued/1). An entry the held map has
+%%  already is probed once more - a multi node request is granted a
+%%  lock its client held before. The second probe is redundant, not
+%%  harmful: it weighs the same requests the same way. A fresh PID
+%%  for a key replaces the stale one
 %%  the guard:
-%%  * the update is empty - nothing to add, nothing to probe. The
-%%    graph stays as it is, whether it exists or not: a request that
-%%    holds nothing does not start it
-%%-----------------------------------------------------------------
-add_edges(_Ref, _Edge, Update, _Weight, Graph) when map_size(Update) =:= 0->
-  % TODO. Is it redundant?
-  Graph;
-
-%%-----------------------------------------------------------------
-%%  The entries of the update the held map does not have yet join it
-%%  and are probed alone: they add wait-for edges and may be the very
-%%  edge that closes a cycle, and only the request that has them can
-%%  see that. A request that is not in the graph yet joins with the
-%%  given weight, one that is there keeps the weight it has joined
-%%  with (see the header)
-%%  the guard:
-%%  * the update is not empty (the clause above)
 %%  * the graph exists
 %%-----------------------------------------------------------------
 add_edges(
@@ -135,52 +131,28 @@ add_edges(
       index = Index0
     } = Graph0
 )->
-  % TODO. Is new_held_locks redundant
   {Weight0, Held0} = maps:get(Ref, Index0, {Weight, #{}}),
-  case new_held_locks(Update, Held0) of
-    New when map_size(New) =:= 0->
-      Graph0;
-    New->
-      run_probe(Ref, Edge, New, Weight0),
+  run_probe(Ref, Edge, Update, Weight0),
 
-      Edges = add_holder(Ref, Weight0, maps:keys(New), Edges0),
-      Index = Index0#{
-        Ref => {Weight0, maps:merge(Held0, New)}
-      },
-      Graph0#graph{
-        edges = Edges,
-        index = Index
-      }
-  end;
+  Edges = add_holder(Ref, Weight0, maps:keys(Update), Edges0),
+  Index = Index0#{
+    Ref => {Weight0, maps:merge(Held0, Update)}
+  },
+  Graph0#graph{
+    edges = Edges,
+    index = Index
+  };
 
 %%-----------------------------------------------------------------
 %%  The first waiter that holds something - the graph starts with it
 %%  the guard:
-%%  * the update is not empty
-%%  * there is no graph yet (the clauses above)
+%%  * there is no graph yet (the clause above)
 %%-----------------------------------------------------------------
 add_edges(Ref, Edge, Update, Weight, _Graph)->
   add_edges(Ref, Edge, Update, Weight, #graph{
     edges = #{},
     index = #{}
   }).
-
-%%-----------------------------------------------------------------
-%%  The entries of the update the held map does not have yet: a new
-%%  key, or a fresh PID for a key whose old one is stale
-%%-----------------------------------------------------------------
-new_held_locks(Update, Held)->
-  maps:filter(
-    fun(Key, Manager)->
-      case Held of
-        #{Key := Manager}->
-          false;
-        _->
-          true
-      end
-    end,
-    Update
-  ).
 
 %%-----------------------------------------------------------------
 %%  The request joins the edges of the locks as their holder

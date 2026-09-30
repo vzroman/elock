@@ -19,8 +19,7 @@
   ready_nodes/1
 ]).
 
-% lock/4 also serves the current API, so only its boolean form is
-% deprecated (documented below); an attribute would mark both forms.
+% lock/4 is not listed: only its boolean form is deprecated
 -deprecated([{lock, 5, "Use lock/3 or lock/4 with nodes and options, then unlock/1"}]).
 
 -define(context,'$elock_context$').
@@ -28,10 +27,10 @@
 
 -record(context,{
   ref2lock,   % #{ Ref => #lock{} }
-  locked,     % #{ {Scope, Term, Node} => Manager } - the held map, sent as is
-  counts      % #{ {Scope, Term, Node} => N } for N >= 2 only: the keys held
-              % by more than one request of the client. A key absent here
-              % is held once
+  locked,     % #{ {Scope, Term, Node} => Manager } - the held map, sent to
+              % the managers as is. Scope is in the key: the same Term in two
+              % scopes is two locks
+  counts      % #{ {Scope, Term, Node} => N }, N >= 2: the re-entered keys only
 }).
 
 -record(lock,{
@@ -71,8 +70,7 @@ start_link(Scope)->
 %%=================================================================
 lock(Scope, Term, Nodes)->
   lock(Scope, Term, Nodes, _Options = #{}).
-% Deprecated compatibility form returning {ok, UnlockFun}.
-% Use lock(Scope, Term, [node()], Options) and unlock/1 instead.
+% Deprecated boolean form, see lock/5
 lock(Scope, Term, IsShared, Timeout) when is_boolean(IsShared)->
   lock(Scope, Term, IsShared, Timeout, [node()]);
 lock(Scope, Term, Nodes, Options)->
@@ -94,9 +92,8 @@ lock(Scope, Term, Nodes, Options)->
     timeout = Timeout,
     shared = IsShared
   },
-  % Ref goes as an argument of its own, not as the copy in the request:
-  % it marks the mailbox position for the receives of the wait (see
-  % wait_verdict/2)
+  % Ref is passed as a plain argument for the receive marker optimization
+  % (see wait_verdict/2)
   case run_request(Ref, Request, HeldLocks) of
     {ok, LockedNodes} ->
       locked(Request, LockedNodes, Context),
@@ -105,9 +102,7 @@ lock(Scope, Term, Nodes, Options)->
       Error
   end.
 
-% Deprecated compatibility API; use lock/3 or lock/4 and unlock/1 instead.
-% Call UnlockFun() in the process that acquired the lock.
-% infinity means no timeout; deadlocks retain the previous atom verdict.
+% Deprecated. UnlockFun() must be called by the locking process
 -spec lock(atom(), term(), boolean(), timeout(), [node()]) ->
   {ok, fun(() -> ok)} | {error, term()}.
 lock(_Scope, _Term, _IsShared, _Timeout, [])->
@@ -199,22 +194,8 @@ unlock(_UnexpectedRef, #context{} = Context)->
 unlock(_Ref, _NoContext)->
   ok.
 
-% The locks the process holds in every scope, {Locked, Counts}:
-% Locked = #{
-%   {Scope, Term, Node} => Manager
-% },
-% Counts = #{
-%   {Scope, Term, Node} => Count
-% }
-% A lock is keyed by its scope as well: the same Term may be locked
-% in several scopes on a node and those are different locks with
-% different managers. Locked is the held map in the form the managers
-% take it: it is sent as it is when a request has to wait (see
-% held_locks/1), hence a deadlock through several scopes is seen
-% like one within a scope (see elock_graph). The re-entries are
-% counted aside for that: Counts has only the keys locked by more
-% than one request of the process, a key locked once is in Locked
-% alone
+% {Locked, Counts} as in #context{}. A key held by another Manager is
+% stale: its manager has died and a new one has taken the Term
 add_lock(
     #lock{
       scope = Scope,
@@ -273,7 +254,6 @@ remove_lock(
     Nodes
   ).
 
-% The held map is kept ready to send, no copy is made
 held_locks(#context{locked = Locked})->
   Locked;
 held_locks(_NoContext)->
@@ -298,8 +278,7 @@ ready_nodes(Scope)->
   queued      % #{ Node => Manager } - the managers the request waits at
 }).
 
-% The lock of this node alone: the client runs the request itself and
-% answers its manager from HeldLocks (see elock_manager:lock/2)
+% The local node alone: the client is the proxy itself
 run_request(
     _Ref,
     #request{
@@ -313,11 +292,9 @@ run_request(
     Error ->
       Error
   end;
-% A remote node or several nodes: a worker per node makes the call and
-% exits with its result, the client itself stays in the receive to
-% answer the managers the request waits at (see wait_verdict/2). The
-% workers are monitored with Ref as the tag, hence every message of
-% the wait carries Ref
+% A worker per node is the proxy, it exits with the result. The client
+% answers #queued{} meanwhile. The monitor tag is Ref, so every message
+% of the wait carries Ref
 run_request(
     Ref,
     #request{
@@ -351,10 +328,9 @@ run_request(
     queued = #{}
   }).
 
-% Ref is an argument of its own and every clause of the receive matches
-% it: the receive skips the messages that were in the mailbox before
-% the request was made (see make_ref/0 in lock/4). Taken out of
-% #waiting{} it would not do, the record is opaque to the compiler
+% Every clause matches Ref, a plain argument from make_ref/0 in lock/4:
+% the receive skips the older messages. Ref taken from #waiting{} would
+% break the optimization
 wait_verdict(
     Ref,
     #waiting{
@@ -371,9 +347,7 @@ wait_verdict(
       {Node, Pending} = maps:take(MonRef, Pending0),
       case NodeResult of
         {ok, {ok,Manager}} ->
-
-          % The grant alone, the managers have got the rest with
-          % the answers to their #queued{}
+          % The queued managers already have the rest
           Queued = maps:remove(Node, Queued0),
           notify_queued(Queued, #{ {Scope, Term, Node} => Manager }, Ref),
 
@@ -388,17 +362,13 @@ wait_verdict(
           wait_verdict(Ref, Waiting);
         Error ->
           unlock_nodes(Nodes0, Ref),
-          % The copies still queued elsewhere are withdrawn as well,
-          % otherwise they hold the queue behind them and carry the
-          % held locks the client has released into the probes
+          % Otherwise they block their queues and probe with the released locks
           unlock_nodes(Queued0, Ref),
           wait_unlock(Ref, Pending),
           Error
       end;
     #queued{ref = Ref, manager = Manager, node = Node}->
-      % The request waits at the Manager and it asks what the request
-      % holds: the locks of the client and the grants so far. The few
-      % grants are put into the map of the client, it is not rebuilt
+      % The locks of the client and the grants so far
       Held =
         maps:fold(
           fun(N, M, Acc)->
@@ -426,10 +396,8 @@ wait_verdict(
 )->
   {ok, Nodes}.
 
-% The request has failed, the workers that have not returned yet are
-% waited for: a grant is released, a manager that reports the request
-% queued is told to drop it - the held locks are of no use to it.
-% The receive is marked by Ref like the one of wait_verdict/2
+% The request has failed: release the late grants and withdraw the
+% request from the managers that report it queued
 wait_unlock(Ref, Pending0)
   when map_size(Pending0) > 0->
   receive
@@ -449,7 +417,6 @@ wait_unlock(Ref, Pending0)
 wait_unlock(_Ref, _Pending)->
   ok.
 
-% Send the held map to the queued managers
 notify_queued(Queued, Held, Ref)
   when map_size(Queued) > 0, map_size(Held) > 0->
   Message = #add_held_locks{

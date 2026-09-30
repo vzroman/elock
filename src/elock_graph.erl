@@ -1,92 +1,47 @@
 %%=================================================================
 %%  The wait-for graph of a manager and the deadlock probes
 %%
-%%  A waiter depends on every holder of its Term, and a holder that
-%%  is itself waiting for another Term carries the dependency on - a
-%%  deadlock is a cycle of such dependencies. The held map of a
-%%  request is the set of the locks it holds while it waits. A lock
-%%  is {Scope, Term, Node}: the scopes are separate heaps of locks,
-%%  but a cycle through several of them blocks like any other, hence
-%%  the held map spans the scopes and the key carries the scope -
-%%  the same Term in two scopes is two locks.
+%%  A lock is {Scope, Term, Node}. A held map spans all the scopes,
+%%  so a cycle through several scopes is found like any other.
 %%
-%%  The held map does not come with the request: most of the
-%%  requests never wait. The manager asks the client for it when the
-%%  request has to wait, and every hold of a waiting request comes
-%%  in as #add_held_locks{} through add_edges/5: the locks the
-%%  client held when it made the request, and the grants of a multi
-%%  node request, which is granted node by node, as the client gets
-%%  them while the request still waits. The request is in the graph
-%%  from its first hold on. Until then it is a request that has not
-%%  asked yet, and one that holds nothing can not be on a cycle - it
-%%  stays out of the graph, no probe.
+%%  A waiting request joins the graph with its first hold: the held
+%%  map comes in as #add_held_locks{} only after the request queues.
+%%  A request that holds nothing can not be on a cycle.
 %%
-%%  The weight of a request is its #request.held_count, the number
-%%  of the locks the client held when it made the request. It is the
-%%  same for the whole life of the request, the grants it gains do
-%%  not change it: every probe and every entry of the request carry
-%%  the same number at every manager it waits at, hence the managers
-%%  of a cycle, which weigh at different moments, name the same
-%%  loser.
+%%  Weight is #request.held_count. It is fixed for the life of the
+%%  request, so every manager of a cycle picks the same loser: the
+%%  lighter one, or the coin on a tie (see drop_coin/2).
 %%
-%%  There are no checker processes, the managers probe each other.
-%%  Every hold of a waiting request (the origin) is probed as it
-%%  comes in: it adds wait-for edges and may be the one that closes
-%%  a cycle. The probe goes to the manager of the lock, except the
-%%  origin manager itself (a barging request holds the term it waits
-%%  for).
+%%  Each new hold of a waiting request (the origin) is probed at the
+%%  manager of the held lock (run_probe/4). Every edge is probed as
+%%  it appears, so the probe of the edge that closes a cycle finds
+%%  the rest of the cycle in place. The waiters of the receiving
+%%  manager depend on the origin: it holds their lock, or a forwarded
+%%  probe has come through the holders:
+%%    * a waiter that holds the origin's lock closes a cycle
+%%      (probe/3). If a closer beats the origin, #deadlock{} goes to
+%%      the origin manager and the probe stops. Otherwise every
+%%      closer is aborted.
+%%    * the probe goes on to the managers of the locks the remaining
+%%      waiters hold (forward/2). sent_to keeps the flood finite.
 %%
-%%  A manager that receives the probe looks at its own waiters:
-%%    * a waiter that holds the lock the origin waits for closes a
-%%      cycle - the same incarnation of it, i.e. by the origin
-%%      manager's PID, a hold by another PID is a stale one, not an
-%%      edge. The origin itself is skipped: a multi node request
-%%      waits at several managers and a barging one holds the term
-%%      it waits for, a request can not close a cycle with itself.
-%%      The lighter request loses, the coin settles the equal
-%%      weights (see drop_coin/2). If any closer beats the origin
-%%      then the origin loses: #deadlock{} goes back to the origin
-%%      manager and the probe stops - the abort of the origin breaks
-%%      every cycle through it, the lighter closers are left alone.
-%%      Otherwise every closer loses, the manager aborts them.
-%%    * the probe is passed on to the managers of the locks held by
-%%      the waiters that are left: they depend on the holders of
-%%      this Term, which depend on the origin. The managers that have
-%%      already seen the probe are skipped, hence the flood is finite.
-%%
-%%  Every edge is probed as soon as it appears, hence the probe of
-%%  the edge that completes a cycle finds the rest of the cycle
-%%  already in place.
-%%
-%%  The graph is changed by the manager alone: a request joins it
-%%  when its holds come in and leaves it when it stops waiting (see
-%%  add_edges/5 and remove_edges/2). probe/3 only names the closers
-%%  to abort and forward/2 is called after the aborts, on the graph
-%%  as it is then - an abort pushes the queue and may grant the lock
-%%  to a later waiter, from then on it is a holder, it does not
-%%  depend on the origin and is not forwarded for
+%%  Only the manager changes the graph. forward/2 runs after the
+%%  aborts: an abort may grant the lock to a later waiter, and a
+%%  holder does not depend on the origin.
 %%=================================================================
 -module(elock_graph).
 
 -include("elock.hrl").
 
--record(graph,{
-  edges,            % by the lock: the waiters that hold it and their weights
-  index             % by the waiter: its frozen weight and its held map
-}).
-% Graph structure:
 % #graph{
-%   edges = #{
-%     {Scope, Term, Node} => #{
-%       Ref => Weight
-%     }
-%   },
-%   index = #{
-%     Ref => {Weight, #{
-%       {Scope, Term, Node} => Manager
-%     }}
-%   }
+%   edges = #{ {Scope, Term, Node} => #{ Ref => Weight } }, - the waiters holding the lock
+%   index = #{ Ref => {Weight, HeldMap} }                  - HeldMap as in #add_held_locks{}
 % }
+% undefined while no waiter holds anything, so index is never empty
+-record(graph,{
+  edges,
+  index
+}).
 
 %%=================================================================
 %%	API
@@ -102,24 +57,10 @@
 %%  The edges
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The holds of a waiting request come in: Update is a held map,
-%%  Edge is the lock of this manager, the one the request waits
-%%  for, Weight is the held count of the request. They join its
-%%  held map and are probed: they add wait-for edges and may be the
-%%  very edge that closes a cycle, and only the request that has
-%%  them can see that. A request that is not in the graph yet joins
-%%  with the given weight, one that is there keeps the weight it has
-%%  joined with (see the header).
-%%
-%%  The update is taken as it is. It is never empty, the senders
-%%  see to that (see elock:notify_queued/3 and
-%%  elock_manager:notify_queued/1). An entry the held map has
-%%  already is probed once more - a multi node request is granted a
-%%  lock its client held before. The second probe is redundant, not
-%%  harmful: it weighs the same requests the same way. A fresh PID
-%%  for a key replaces the stale one
-%%  the guard:
-%%  * the graph exists
+%%  Adds and probes the new holds of a waiting request. Edge is this
+%%  manager's lock. A request already in the graph keeps its weight.
+%%  Update is never empty (see elock:notify_queued/3 and
+%%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
 add_edges(
     Ref,
@@ -148,11 +89,6 @@ add_edges(
       }
   end;
 
-%%-----------------------------------------------------------------
-%%  The first waiter that holds something - the graph starts with it
-%%  the guard:
-%%  * there is no graph yet (the clause above)
-%%-----------------------------------------------------------------
 add_edges(Ref, Edge, Update, Weight, _Graph)->
   add_edges(Ref, Edge, Update, Weight, #graph{
     edges = #{},
@@ -160,8 +96,7 @@ add_edges(Ref, Edge, Update, Weight, _Graph)->
   }).
 
 %%-----------------------------------------------------------------
-%%  The entries of the update the held map does not have yet: a new
-%%  key, or a fresh PID for a key whose old one is stale
+%%  A new key, or a new manager PID for a stale key
 %%-----------------------------------------------------------------
 new_held_locks(Update, Held) when map_size(Held) =:= 0->
   Update;
@@ -178,9 +113,6 @@ new_held_locks(Update, Held)->
     Update
   ).
 
-%%-----------------------------------------------------------------
-%%  The request joins the edges of the locks as their holder
-%%-----------------------------------------------------------------
 add_holder(Ref, Weight, Locks, Edges)->
   lists:foldl(
     fun(Edge, Acc)->
@@ -196,12 +128,6 @@ add_holder(Ref, Weight, Locks, Edges)->
     Locks
   ).
 
-%%-----------------------------------------------------------------
-%%  A request stops waiting: it leaves the index and the edges of the
-%%  locks it holds, a lock nobody holds any more leaves the edges.
-%%  The graph goes with the last waiter, hence a #graph{} never has
-%%  an empty index
-%%-----------------------------------------------------------------
 remove_edges(
     Ref,
     #graph{
@@ -237,16 +163,9 @@ remove_edges(
         index = Index
       };
     _->
-      % the request has never been in the graph: it holds nothing,
-      % or its holds have not come in yet
+      % Holds nothing, or its holds have not come in yet
       Graph0
   end;
-
-%%-----------------------------------------------------------------
-%%  Nobody waits here holding anything
-%%  the guard:
-%%  * there is no graph (the clause above)
-%%-----------------------------------------------------------------
 remove_edges(_Ref, Graph)->
   Graph.
 
@@ -254,17 +173,9 @@ remove_edges(_Ref, Graph)->
 %%  The probes
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  A probe from another manager. The waiters that hold the lock the
-%%  origin waits for close a cycle with it and are weighed against
-%%  it (see check_cycles/4):
-%%  * a closer beats the origin - the origin loses. The verdict goes
-%%    to the origin manager and the probe stops here: the abort of
-%%    the origin breaks every cycle through it, the lighter closers
-%%    are left alone
-%%  * otherwise every closer loses. They are handed to the manager
-%%    to abort, it passes the probe on after that (see forward/2)
-%%  LocalEdge is this manager's lock, which the winning closer
-%%  waits for when the origin loses. The graph is not changed here
+%%  Returns the closers to abort, or stop if the origin loses: its
+%%  abort breaks every cycle through it, the lighter closers stay.
+%%  LocalEdge is this manager's lock, the one the winner waits for
 %%-----------------------------------------------------------------
 -spec probe(#deadlock_probe{}, {atom(), term(), node()}, #graph{} | undefined) ->
   stop | {forward, [reference()]}.
@@ -290,28 +201,16 @@ probe(
           {forward, Closers}
       end;
     _->
-      % nobody here holds the lock the origin waits for
       {forward, []}
   end;
-
-%%-----------------------------------------------------------------
-%%  Nobody waits here holding anything - nothing closes a cycle
-%%  the guard:
-%%  * there is no graph (the clause above)
-%%-----------------------------------------------------------------
 probe(_Probe, _LocalEdge, _Graph)->
   {forward, []}.
 
 %%-----------------------------------------------------------------
-%%  Weigh the waiters that hold the origin's edge against the origin:
-%%  the lighter one loses, the coin settles a tie. The result is the
-%%  closers that lose, or origin as soon as one of them beats it.
-%%  The origin itself is skipped: a multi node request waits at
-%%  several managers and a barging one holds the term it waits for.
-%%  A request can not close a cycle with itself, and the equal
-%%  weights could make it lose to itself
-%%  the guard:
-%%  * the waiter is the origin
+%%  Returns the losing closers, or origin as soon as a closer beats it.
+%%  The origin itself is skipped: a multi node request waits at several
+%%  managers, a barging one holds the term it waits for. On a tie it
+%%  could lose to itself
 %%-----------------------------------------------------------------
 check_cycles(
     [{Ref, _Weight}|Rest],
@@ -324,11 +223,8 @@ check_cycles(
   check_cycles(Rest, Probe, Index, Acc);
 
 %%-----------------------------------------------------------------
-%%  A hold on the same incarnation of the lock, i.e. by the origin
-%%  manager's PID, closes a cycle. Another PID is a stale hold - the
-%%  manager died and a new one took the term - not an edge
-%%  the guard:
-%%  * the waiter is not the origin (the clause above)
+%%  Only a hold by the origin manager's PID closes a cycle. Another PID
+%%  is a stale hold: that manager has died and a new one took the term
 %%-----------------------------------------------------------------
 check_cycles(
     [{CloserRef, CloserWeight}|Rest],
@@ -361,15 +257,12 @@ check_cycles(
       check_cycles(Rest, Probe, Index, Acc)
   end;
 
-%%-----------------------------------------------------------------
-%%  No closer beats the origin
-%%-----------------------------------------------------------------
 check_cycles([], _Probe, _Index, Acc)->
   Acc.
 
 %%-----------------------------------------------------------------
-%%  The tie. The pair is sorted and hashed, hence both managers of a
-%%  cycle come to the same winner whichever probe gets there first
+%%  The pair is sorted before hashing, so every manager of a cycle
+%%  picks the same winner whatever the argument order
 %%-----------------------------------------------------------------
 drop_coin(Ref1, Ref2)->
   Tie =
@@ -383,13 +276,8 @@ drop_coin(Ref1, Ref2)->
   element(Winner, Tie).
 
 %%-----------------------------------------------------------------
-%%  The probe of a waiting request for the holds that have just come
-%%  in: the locks of its client, the grants as it gains them (see
-%%  add_edges/5). It goes to the manager of each of them, except
-%%  this very manager: a barging request holds the term it waits
-%%  for. Edge is the lock of this manager, the one the origin waits
-%%  for. sent_to names every manager the probe has been sent to,
-%%  this one included, before it goes
+%%  Sends the probe to the managers of the new holds, except this one:
+%%  a barging request holds the term it waits for
 %%-----------------------------------------------------------------
 run_probe(Ref, Edge, Held, Weight)->
   Self = self(),
@@ -416,15 +304,8 @@ run_probe(Ref, Edge, Held, Weight)->
   ).
 
 %%-----------------------------------------------------------------
-%%  Pass the probe on: the waiters of this Term depend on its
-%%  holders, which depend on the origin - so do the waiters of the
-%%  locks they hold. It goes to the managers of every lock held by
-%%  the waiters that are left, except those it has been sent to
-%%  already, and they join sent_to before it goes. The manager calls
-%%  this after the aborts of the closers (see probe/3), on the graph
-%%  as it is then: an abort pushes the queue and may grant the lock
-%%  to a later waiter, from then on it is a holder and does not
-%%  depend on the origin
+%%  The waiters here depend on the origin, and so do the waiters of
+%%  the locks they hold
 %%-----------------------------------------------------------------
 forward(
     #deadlock_probe{
@@ -453,10 +334,5 @@ forward(
     Targets
   );
 
-%%-----------------------------------------------------------------
-%%  Nobody waits here holding anything - the probe stops
-%%  the guard:
-%%  * there is no graph (the clause above)
-%%-----------------------------------------------------------------
 forward(_Probe, _Graph)->
   ok.

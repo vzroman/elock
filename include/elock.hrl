@@ -6,15 +6,16 @@
 %% Types
 %%-------------------------------------------------------------------------------
 -record(request,{
-  queue,
+  queue,        % the ticket. Must stay the first field: the manager keeps
+                % the postponed requests in an ordset sorted by it
   ref,
   scope,
   term,
   client,
-  proxy,
-  tag,
+  proxy,        % the process that waits for the verdict: the client or a worker
+  tag,          % the proxy's monitor on the manager, tags every reply to the proxy
   shared,
-  held_count,
+  held_count,   % the number of locks the client holds, the weight in a deadlock
   nodes,
   timeout
 }).
@@ -24,18 +25,20 @@
   ref
 }).
 
+% Manager -> client: the request waits, send the held map
 -record(queued,{
   ref,
   manager,
   node
 }).
 
+% Client -> manager: the answer to #queued{} and every later grant
 -record(add_held_locks,{
   ref,
-  held
+  held      % #{ {Scope, Term, Node} => Manager }
 }).
 
-% The deadlock verdict: to the client, and to the origin manager in reply to its probe (see elock_graph)
+% To the client, or to the origin manager as the answer to its probe
 -record(deadlock,{
   ref,
   winner    % {Scope, Term, Node} - the lock the winning request waits for
@@ -44,9 +47,9 @@
 -record(deadlock_probe,{
   ref,      % the origin request
   edge,     % {Scope, Term, Node} - the lock the origin waits for
-  manager,  % the origin manager, the verdict is sent back to it
-  weight,   % the held count of the origin - the lighter loses, the coin settles a tie
-  sent_to   % #{ ManagerPID => true } - managers this probe has already been sent to
+  manager,  % the origin manager
+  weight,   % the held count of the origin
+  sent_to   % #{ ManagerPID => true } - the managers that have got the probe
 }).
 
 %%-------------------------------------------------------------------------------

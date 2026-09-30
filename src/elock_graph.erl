@@ -132,16 +132,21 @@ add_edges(
     } = Graph0
 )->
   {Weight0, Held0} = maps:get(Ref, Index0, {Weight, #{}}),
-  run_probe(Ref, Edge, Update, Weight0),
+  case new_held_locks(Update, Held0) of
+    New when map_size(New) =:= 0->
+      Graph0;
+    New->
+      run_probe(Ref, Edge, New, Weight0),
 
-  Edges = add_holder(Ref, Weight0, maps:keys(Update), Edges0),
-  Index = Index0#{
-    Ref => {Weight0, maps:merge(Held0, Update)}
-  },
-  Graph0#graph{
-    edges = Edges,
-    index = Index
-  };
+      Edges = add_holder(Ref, Weight0, maps:keys(New), Edges0),
+      Index = Index0#{
+        Ref => {Weight0, maps:merge(Held0, New)}
+      },
+      Graph0#graph{
+        edges = Edges,
+        index = Index
+      }
+  end;
 
 %%-----------------------------------------------------------------
 %%  The first waiter that holds something - the graph starts with it
@@ -153,6 +158,25 @@ add_edges(Ref, Edge, Update, Weight, _Graph)->
     edges = #{},
     index = #{}
   }).
+
+%%-----------------------------------------------------------------
+%%  The entries of the update the held map does not have yet: a new
+%%  key, or a fresh PID for a key whose old one is stale
+%%-----------------------------------------------------------------
+new_held_locks(Update, Held) when map_size(Held) =:= 0->
+  Update;
+new_held_locks(Update, Held)->
+  maps:filter(
+    fun(Key, Manager)->
+      case Held of
+        #{Key := Manager}->
+          false;
+        _->
+          true
+      end
+    end,
+    Update
+  ).
 
 %%-----------------------------------------------------------------
 %%  The request joins the edges of the locks as their holder

@@ -83,7 +83,7 @@
   processes_in/1
 ]).
 
-% mirrors elock.erl
+% mirrors elock_context.erl
 -record(context,{
   ref2lock,
   locked,
@@ -409,7 +409,7 @@ context_spans_nodes_test(Config)->
     {Scope, t, N1} => MT1,
     {Scope, t, N2} => MT2,
     {Scope, u, N3} => MU3
-  }, elock:held_locks(Context)),
+  }, elock_context:held_locks(Context)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, RefT)),
   ?assertEqual(#context{
@@ -1268,12 +1268,12 @@ single_remote_node_worker_test(Config)->
   ?assertEqual([], proxies(N2)),
 
   % granted. The worker is a process of its own: the client waits
-  % for it in elock:wait_verdict/2, where it answers #queued{}
+  % for it in elock_context:wait_verdict/2, where it answers #queued{}
   R1 = elock_test_utils:lock_queued(N2, C1, Scope, t, [N2], ?EXCLUSIVE),
   still_waiting(R1),
   ?WAIT(length(workers(N1)) =:= 1),
   ?assertNotEqual([C1], workers(N1)),
-  ?assertEqual({current_function, {elock, wait_verdict, 2}}, rpc(N1, erlang, process_info, [C1, current_function])),
+  ?assertEqual({current_function, {elock_context, wait_verdict, 2}}, rpc(N1, erlang, process_info, [C1, current_function])),
   ?assertMatch([_Proxy], proxies(N2)),
   ?assertEqual([], proxies(N1)),
   ?assertEqual(ok, elock_test_utils:unlock(C2, Ref2)),

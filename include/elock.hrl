@@ -5,6 +5,9 @@
 %%-------------------------------------------------------------------------------
 %% Types
 %%-------------------------------------------------------------------------------
+-type lock_key() :: {atom(), term(), node()}.
+-type held_locks() :: #{lock_key() => pid()}.
+
 -record(request,{
   % The ticket must stay first: postponed requests are sorted by it.
   queue :: pos_integer() | undefined,
@@ -35,18 +38,18 @@
 % Client -> manager: the answer to #queued{} and every later grant
 -record(add_held_locks,{
   ref :: reference(),
-  held :: elock:held_locks()
+  held :: held_locks()
 }).
 
 % To the client, or to the origin manager as the answer to its probe
 -record(deadlock,{
   ref :: reference(),
-  winner :: elock:lock_key() % the lock the winning request waits for
+  winner :: lock_key() % the lock the winning request waits for
 }).
 
 -record(deadlock_probe,{
   ref :: reference(),       % the origin request
-  edge :: elock:lock_key(), % the lock the origin waits for
+  edge :: lock_key(), % the lock the origin waits for
   manager :: pid(),         % the origin manager
   weight :: non_neg_integer(), % the held count of the origin
   sent_to :: #{pid() => true} % the managers that have got the probe

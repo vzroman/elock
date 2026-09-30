@@ -35,8 +35,8 @@
 
 -export_type([graph/0]).
 
--type edges() :: #{elock:lock_key() => #{reference() => non_neg_integer()}}.
--type index() :: #{reference() => {non_neg_integer(), elock:held_locks()}}.
+-type edges() :: #{lock_key() => #{reference() => non_neg_integer()}}.
+-type index() :: #{reference() => {non_neg_integer(), held_locks()}}.
 
 % #graph{
 %   edges = #{ {Scope, Term, Node} => #{ Ref => Weight } }, - the waiters holding the lock
@@ -66,10 +66,10 @@
 %%-----------------------------------------------------------------
 %%  Adds and probes the new holds of a waiting request. Edge is this
 %%  manager's lock. A request already in the graph keeps its weight.
-%%  Update is never empty (see elock:notify_queued/3 and
+%%  Update is never empty (see elock_context:notify_queued/3 and
 %%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
--spec add_edges(reference(), elock:lock_key(), elock:held_locks(),
+-spec add_edges(reference(), lock_key(), held_locks(),
                 non_neg_integer(), graph() | undefined) -> graph().
 add_edges(
     Ref,
@@ -107,7 +107,7 @@ add_edges(Ref, Edge, Update, Weight, _Graph)->
 %%-----------------------------------------------------------------
 %%  A new key, or a new manager PID for a stale key
 %%-----------------------------------------------------------------
--spec new_held_locks(elock:held_locks(), elock:held_locks()) -> elock:held_locks().
+-spec new_held_locks(held_locks(), held_locks()) -> held_locks().
 new_held_locks(Update, Held) when map_size(Held) =:= 0->
   Update;
 new_held_locks(Update, Held)->
@@ -123,7 +123,7 @@ new_held_locks(Update, Held)->
     Update
   ).
 
--spec add_holder(reference(), non_neg_integer(), [elock:lock_key()], edges()) ->
+-spec add_holder(reference(), non_neg_integer(), [lock_key()], edges()) ->
   edges().
 add_holder(Ref, Weight, Locks, Edges)->
   lists:foldl(
@@ -190,7 +190,7 @@ remove_edges(_Ref, Graph)->
 %%  abort breaks every cycle through it, the lighter closers stay.
 %%  LocalEdge is this manager's lock, the one the winner waits for
 %%-----------------------------------------------------------------
--spec probe(#deadlock_probe{}, elock:lock_key(), graph() | undefined) ->
+-spec probe(#deadlock_probe{}, lock_key(), graph() | undefined) ->
   stop | {forward, [reference()]}.
 probe(
     #deadlock_probe{
@@ -295,7 +295,7 @@ drop_coin(Ref1, Ref2)->
 %%  Sends the probe to the managers of the new holds, except this one:
 %%  a barging request holds the term it waits for
 %%-----------------------------------------------------------------
--spec run_probe(reference(), elock:lock_key(), elock:held_locks(),
+-spec run_probe(reference(), lock_key(), held_locks(),
                 non_neg_integer()) -> ok.
 run_probe(Ref, Edge, Held, Weight)->
   Self = self(),

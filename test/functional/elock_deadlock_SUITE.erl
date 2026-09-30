@@ -65,7 +65,7 @@
   ring_test/1
 ]).
 
-% mirrors elock.erl
+% mirrors elock_context.erl
 -record(context,{
   ref2lock,
   locked,

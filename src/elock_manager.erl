@@ -30,7 +30,7 @@
 ]).
 
 -type lock_result() ::
-  {ok, pid()} | {error, timeout | {deadlock, elock:lock_key()}}.
+  {ok, pid()} | {error, timeout | {deadlock, lock_key()}}.
 -type holder() :: {boolean(), pid()}.
 -type holders() :: #{reference() => holder()}.
 -type client_requests() :: #{reference() => boolean()}.
@@ -64,8 +64,8 @@
 %%  itself (lock/2) or a worker on its behalf (lock/1)
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The worker of elock:run_request/3, remote apply. It does not have
-%%  the held locks
+%%  The worker of elock_context:run_request/3, remote apply. It does
+%%  not have the held locks
 %%-----------------------------------------------------------------
 -spec lock(#request{}) -> lock_result().
 lock(Request)->
@@ -74,7 +74,7 @@ lock(Request)->
 %%-----------------------------------------------------------------
 %%  HeldLocks is undefined for a worker
 %%-----------------------------------------------------------------
--spec lock(#request{}, elock:held_locks() | undefined) -> lock_result().
+-spec lock(#request{}, held_locks() | undefined) -> lock_result().
 lock(
     #request{
       scope = Scope,
@@ -110,11 +110,11 @@ lock(
 %%-----------------------------------------------------------------
 %%  Every clause matches MonitorRef, a plain argument from
 %%  erlang:monitor/2 in lock/2: the receive skips the older messages.
-%%  The request Ref can not do it: it is made in elock, maybe on
-%%  another node. A worker passes #queued{} on to the client, the
+%%  The request Ref can not do it: it is made in elock_context, maybe
+%%  on another node. A worker passes #queued{} on to the client, the
 %%  client answers it with HeldLocks
 %%-----------------------------------------------------------------
--spec wait_verdict(reference(), pid(), #request{}, elock:held_locks() | undefined) ->
+-spec wait_verdict(reference(), pid(), #request{}, held_locks() | undefined) ->
   lock_result() | retry.
 wait_verdict(
     MonitorRef,

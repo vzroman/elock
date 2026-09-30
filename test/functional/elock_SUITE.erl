@@ -1,8 +1,8 @@
 %%=================================================================
-%%  Module tests of elock: the client API, the context of a client
-%%  process, the request a client sends to a manager and the client
-%%  side of a remote or a multi node request (wait_verdict/2), the
-%%  scope.
+%%  Module tests of elock, elock_context and elock_scope: the client
+%%  API and the logic behind it - the context of a client process,
+%%  the request a client sends to a manager and the client side of a
+%%  remote or a multi node request (wait_verdict/2), the scope.
 %%
 %%  Techniques:
 %%  * fake manager: the test process poses as the manager of a term
@@ -80,7 +80,7 @@
   many_scopes_test/1
 ]).
 
-% mirrors elock.erl
+% mirrors elock_context.erl
 -record(context,{
   ref2lock,
   locked,
@@ -250,20 +250,20 @@ validate_nodes_test(Config)->
   Scope = ?config(scope, Config),
   Node = node(),
 
-  ?assertEqual(ok, elock:validate_nodes([Node])),
-  ?assertEqual(ok, elock:validate_nodes([n1, n2, n1])),
+  ?assertEqual(ok, elock_context:validate_nodes([Node])),
+  ?assertEqual(ok, elock_context:validate_nodes([n1, n2, n1])),
 
-  ?assertThrow({invalid_nodes, []}, elock:validate_nodes([])),
-  ?assertThrow({invalid_nodes, Node}, elock:validate_nodes(Node)),
-  ?assertThrow({invalid_nodes, {Node}}, elock:validate_nodes({Node})),
-  ?assertThrow({invalid_nodes, #{}}, elock:validate_nodes(#{})),
-  ?assertThrow({invalid_nodes, <<"n1">>}, elock:validate_nodes(<<"n1">>)),
-  ?assertThrow({invalid_nodes, undefined}, elock:validate_nodes(undefined)),
+  ?assertThrow({invalid_nodes, []}, elock_context:validate_nodes([])),
+  ?assertThrow({invalid_nodes, Node}, elock_context:validate_nodes(Node)),
+  ?assertThrow({invalid_nodes, {Node}}, elock_context:validate_nodes({Node})),
+  ?assertThrow({invalid_nodes, #{}}, elock_context:validate_nodes(#{})),
+  ?assertThrow({invalid_nodes, <<"n1">>}, elock_context:validate_nodes(<<"n1">>)),
+  ?assertThrow({invalid_nodes, undefined}, elock_context:validate_nodes(undefined)),
 
-  ?assertThrow({invalid_node, "n1"}, elock:validate_nodes(["n1"])),
-  ?assertThrow({invalid_node, 1}, elock:validate_nodes([Node, 1])),
-  ?assertThrow({invalid_node, {Node}}, elock:validate_nodes([{Node}])),
-  ?assertThrow({invalid_node, <<"n1">>}, elock:validate_nodes([n1, <<"n1">>, n2])),
+  ?assertThrow({invalid_node, "n1"}, elock_context:validate_nodes(["n1"])),
+  ?assertThrow({invalid_node, 1}, elock_context:validate_nodes([Node, 1])),
+  ?assertThrow({invalid_node, {Node}}, elock_context:validate_nodes([{Node}])),
+  ?assertThrow({invalid_node, <<"n1">>}, elock_context:validate_nodes([n1, <<"n1">>, n2])),
 
   % through the API
   ?assertThrow({invalid_nodes, []}, elock:lock(Scope, t, [])),
@@ -283,33 +283,33 @@ validate_options_test(Config)->
   Scope = ?config(scope, Config),
   Node = node(),
 
-  ?assertEqual(#{is_shared => false, timeout => undefined}, elock:validate_options(#{})),
-  ?assertEqual(#{is_shared => true, timeout => undefined}, elock:validate_options(#{is_shared => true})),
-  ?assertEqual(#{is_shared => false, timeout => 1}, elock:validate_options(#{timeout => 1})),
-  ?assertEqual(#{is_shared => false, timeout => undefined}, elock:validate_options(#{timeout => undefined})),
-  ?assertEqual(#{is_shared => true, timeout => 5000}, elock:validate_options(#{is_shared => true, timeout => 5000})),
+  ?assertEqual(#{is_shared => false, timeout => undefined}, elock_context:validate_options(#{})),
+  ?assertEqual(#{is_shared => true, timeout => undefined}, elock_context:validate_options(#{is_shared => true})),
+  ?assertEqual(#{is_shared => false, timeout => 1}, elock_context:validate_options(#{timeout => 1})),
+  ?assertEqual(#{is_shared => false, timeout => undefined}, elock_context:validate_options(#{timeout => undefined})),
+  ?assertEqual(#{is_shared => true, timeout => 5000}, elock_context:validate_options(#{is_shared => true, timeout => 5000})),
 
-  ?assertThrow({invalid_options, []}, elock:validate_options([])),
-  ?assertThrow({invalid_options, [{timeout, 1}]}, elock:validate_options([{timeout, 1}])),
-  ?assertThrow({invalid_options, undefined}, elock:validate_options(undefined)),
-  ?assertThrow({invalid_options, {is_shared, true}}, elock:validate_options({is_shared, true})),
+  ?assertThrow({invalid_options, []}, elock_context:validate_options([])),
+  ?assertThrow({invalid_options, [{timeout, 1}]}, elock_context:validate_options([{timeout, 1}])),
+  ?assertThrow({invalid_options, undefined}, elock_context:validate_options(undefined)),
+  ?assertThrow({invalid_options, {is_shared, true}}, elock_context:validate_options({is_shared, true})),
 
-  ?assertThrow({invalid_is_shared, yes}, elock:validate_options(#{is_shared => yes})),
-  ?assertThrow({invalid_is_shared, 1}, elock:validate_options(#{is_shared => 1})),
-  ?assertThrow({invalid_is_shared, undefined}, elock:validate_options(#{is_shared => undefined})),
-  ?assertThrow({invalid_is_shared, "true"}, elock:validate_options(#{is_shared => "true"})),
+  ?assertThrow({invalid_is_shared, yes}, elock_context:validate_options(#{is_shared => yes})),
+  ?assertThrow({invalid_is_shared, 1}, elock_context:validate_options(#{is_shared => 1})),
+  ?assertThrow({invalid_is_shared, undefined}, elock_context:validate_options(#{is_shared => undefined})),
+  ?assertThrow({invalid_is_shared, "true"}, elock_context:validate_options(#{is_shared => "true"})),
 
-  ?assertThrow({invalid_timeout, infinity}, elock:validate_options(#{timeout => infinity})),
-  ?assertThrow({invalid_timeout, 0}, elock:validate_options(#{timeout => 0})),
-  ?assertThrow({invalid_timeout, -1}, elock:validate_options(#{timeout => -1})),
-  ?assertThrow({invalid_timeout, 1.5}, elock:validate_options(#{timeout => 1.5})),
-  ?assertThrow({invalid_timeout, "100"}, elock:validate_options(#{timeout => "100"})),
-  ?assertThrow({invalid_timeout, {100, ms}}, elock:validate_options(#{timeout => {100, ms}})),
-  ?assertThrow({invalid_timeout, 0}, elock:validate_options(#{is_shared => true, timeout => 0})),
+  ?assertThrow({invalid_timeout, infinity}, elock_context:validate_options(#{timeout => infinity})),
+  ?assertThrow({invalid_timeout, 0}, elock_context:validate_options(#{timeout => 0})),
+  ?assertThrow({invalid_timeout, -1}, elock_context:validate_options(#{timeout => -1})),
+  ?assertThrow({invalid_timeout, 1.5}, elock_context:validate_options(#{timeout => 1.5})),
+  ?assertThrow({invalid_timeout, "100"}, elock_context:validate_options(#{timeout => "100"})),
+  ?assertThrow({invalid_timeout, {100, ms}}, elock_context:validate_options(#{timeout => {100, ms}})),
+  ?assertThrow({invalid_timeout, 0}, elock_context:validate_options(#{is_shared => true, timeout => 0})),
 
-  ?assertThrow({invalid_option, unknown}, elock:validate_options(#{unknown => 1})),
+  ?assertThrow({invalid_option, unknown}, elock_context:validate_options(#{unknown => 1})),
   ?assertThrow({invalid_option, shared},
-    elock:validate_options(#{is_shared => true, timeout => 10, shared => true})),
+    elock_context:validate_options(#{is_shared => true, timeout => 10, shared => true})),
 
   % through the API
   ?assertThrow({invalid_options, []}, elock:lock(Scope, t, [Node], [])),
@@ -473,7 +473,7 @@ reentrant_context_count_test(Config)->
     counts = #{ {Scope, t1, Node} => 2 }
   }, elock_test_utils:context(C1)),
   % the key is held once as the managers see it
-  ?assertEqual(1, elock:held_count(elock_test_utils:context(C1))),
+  ?assertEqual(1, elock_context:held_count(elock_test_utils:context(C1))),
   ?assertEqual([{t1, Manager, 2}], elock_test_utils:locks(Scope)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
@@ -526,14 +526,14 @@ multi_scope_context_test(Config)->
   ?assertEqual(#{
     {Scope1, t, Node} => M1,
     {Scope2, t, Node} => M2
-  }, elock:held_locks(Context)),
-  ?assertEqual(2, elock:held_count(Context)),
-  ?assertEqual(#{}, elock:held_locks(undefined)),
-  ?assertEqual(0, elock:held_count(undefined)),
+  }, elock_context:held_locks(Context)),
+  ?assertEqual(2, elock_context:held_count(Context)),
+  ?assertEqual(#{}, elock_context:held_locks(undefined)),
+  ?assertEqual(0, elock_context:held_count(undefined)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
-  ?assertEqual(#{ {Scope2, t, Node} => M2 }, elock:held_locks(elock_test_utils:context(C1))),
-  ?assertEqual(1, elock:held_count(elock_test_utils:context(C1))),
+  ?assertEqual(#{ {Scope2, t, Node} => M2 }, elock_context:held_locks(elock_test_utils:context(C1))),
+  ?assertEqual(1, elock_context:held_count(elock_test_utils:context(C1))),
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref2)),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
 
@@ -555,7 +555,7 @@ multi_node_context_test(Config)->
   Ref = make_ref(),
   ?assertEqual(undefined, get(?CONTEXT)),
 
-  elock:locked(multi_node_request(Ref, Scope, ['n1@host', 'n2@host']), #{ 'n1@host' => M1, 'n2@host' => M2 }, get(?CONTEXT)),
+  elock_context:locked(multi_node_request(Ref, Scope, ['n1@host', 'n2@host']), #{ 'n1@host' => M1, 'n2@host' => M2 }, get(?CONTEXT)),
 
   ?assertEqual(#context{
     ref2lock = #{
@@ -570,8 +570,8 @@ multi_node_context_test(Config)->
   ?assertEqual(#{
     {Scope, t, 'n1@host'} => M1,
     {Scope, t, 'n2@host'} => M2
-  }, elock:held_locks(get(?CONTEXT))),
-  ?assertEqual(2, elock:held_count(get(?CONTEXT))),
+  }, elock_context:held_locks(get(?CONTEXT))),
+  ?assertEqual(2, elock_context:held_count(get(?CONTEXT))),
 
   ?assertEqual(ok, elock:unlock(Ref)),
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
@@ -596,7 +596,7 @@ unlock_dead_managers_test(Config)->
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
   Ref1 = make_ref(),
-  elock:locked(multi_node_request(Ref1, Scope, Nodes), #{ 'n1@host' => M1, 'n2@host' => M2 }, get(?CONTEXT)),
+  elock_context:locked(multi_node_request(Ref1, Scope, Nodes), #{ 'n1@host' => M1, 'n2@host' => M2 }, get(?CONTEXT)),
   ?assertEqual(ok, elock_test_utils:stop(M1)),
   ?assertEqual(ok, elock:unlock(Ref1)),
   ?assertEqual(undefined, get(?CONTEXT)),
@@ -607,7 +607,7 @@ unlock_dead_managers_test(Config)->
   M3 = elock_test_utils:collector(),
   M4 = elock_test_utils:collector(),
   Ref2 = make_ref(),
-  elock:locked(multi_node_request(Ref2, Scope, Nodes), #{ 'n1@host' => M3, 'n2@host' => M4 }, get(?CONTEXT)),
+  elock_context:locked(multi_node_request(Ref2, Scope, Nodes), #{ 'n1@host' => M3, 'n2@host' => M4 }, get(?CONTEXT)),
   ?assertEqual(ok, elock_test_utils:stop(M3)),
   ?assertEqual(ok, elock_test_utils:stop(M4)),
   ?assertEqual(ok, elock:unlock(Ref2)),
@@ -665,18 +665,18 @@ add_lock_remove_lock_test(_Config)->
   N1Lock = #lock{ scope = s, term = t2, nodes = #{ n1 => Ma } },
 
   % the first hold: the key is in the held map, nothing is counted
-  Held1 = elock:add_lock(Lock, {#{}, #{}}),
+  Held1 = elock_context:add_lock(Lock, {#{}, #{}}),
   ?assertEqual({#{ Key => M1 }, #{}}, Held1),
   % a re-entry from 1 and from 2: the held map is the same
-  Held2 = elock:add_lock(Lock, Held1),
+  Held2 = elock_context:add_lock(Lock, Held1),
   ?assertEqual({#{ Key => M1 }, #{ Key => 2 }}, Held2),
-  Held3 = elock:add_lock(Lock, Held2),
+  Held3 = elock_context:add_lock(Lock, Held2),
   ?assertEqual({#{ Key => M1 }, #{ Key => 3 }}, Held3),
 
   % a stale manager: the pid is replaced, the count is dropped
-  ?assertEqual({#{ Key => M2 }, #{}}, elock:add_lock(StaleLock, Held3)),
-  ?assertEqual({#{ Key => M2 }, #{}}, elock:add_lock(StaleLock, Held2)),
-  ?assertEqual({#{ Key => M2 }, #{}}, elock:add_lock(StaleLock, Held1)),
+  ?assertEqual({#{ Key => M2 }, #{}}, elock_context:add_lock(StaleLock, Held3)),
+  ?assertEqual({#{ Key => M2 }, #{}}, elock_context:add_lock(StaleLock, Held2)),
+  ?assertEqual({#{ Key => M2 }, #{}}, elock_context:add_lock(StaleLock, Held1)),
 
   % one key per node, the other entries and their counts kept
   ?assertEqual({
@@ -686,10 +686,10 @@ add_lock_remove_lock_test(_Config)->
       {s, t2, n2} => Mb
     },
     #{ Key => 2 }
-  }, elock:add_lock(MultiLock, Held2)),
+  }, elock_context:add_lock(MultiLock, Held2)),
   % a multi node lock over a node that is held already: that node is
   % a re-entry, the other one the first hold
-  Multi1 = elock:add_lock(MultiLock, elock:add_lock(N1Lock, {#{}, #{}})),
+  Multi1 = elock_context:add_lock(MultiLock, elock_context:add_lock(N1Lock, {#{}, #{}})),
   ?assertEqual({
     #{
       {s, t2, n1} => Ma,
@@ -700,22 +700,22 @@ add_lock_remove_lock_test(_Config)->
 
   % the removal from 3, from 2 (the count is dropped) and of a key
   % held once (the key is dropped)
-  ?assertEqual(Held2, elock:remove_lock(Lock, Held3)),
-  ?assertEqual(Held1, elock:remove_lock(Lock, Held2)),
-  ?assertEqual({#{}, #{}}, elock:remove_lock(Lock, Held1)),
+  ?assertEqual(Held2, elock_context:remove_lock(Lock, Held3)),
+  ?assertEqual(Held1, elock_context:remove_lock(Lock, Held2)),
+  ?assertEqual({#{}, #{}}, elock_context:remove_lock(Lock, Held1)),
 
   % a stale manager keeps the entry and its count, an unknown key is a no-op
-  ?assertEqual(Held3, elock:remove_lock(StaleLock, Held3)),
-  ?assertEqual(Held2, elock:remove_lock(StaleLock, Held2)),
-  ?assertEqual(Held1, elock:remove_lock(StaleLock, Held1)),
-  ?assertEqual(Held2, elock:remove_lock(OtherLock, Held2)),
-  ?assertEqual(Held1, elock:remove_lock(OtherLock, Held1)),
-  ?assertEqual({#{}, #{}}, elock:remove_lock(Lock, {#{}, #{}})),
+  ?assertEqual(Held3, elock_context:remove_lock(StaleLock, Held3)),
+  ?assertEqual(Held2, elock_context:remove_lock(StaleLock, Held2)),
+  ?assertEqual(Held1, elock_context:remove_lock(StaleLock, Held1)),
+  ?assertEqual(Held2, elock_context:remove_lock(OtherLock, Held2)),
+  ?assertEqual(Held1, elock_context:remove_lock(OtherLock, Held1)),
+  ?assertEqual({#{}, #{}}, elock_context:remove_lock(Lock, {#{}, #{}})),
 
   % every node of a multi node lock is removed, each by its own count
-  ?assertEqual(Held2, elock:remove_lock(MultiLock, elock:add_lock(MultiLock, Held2))),
-  ?assertEqual({#{ {s, t2, n1} => Ma }, #{}}, elock:remove_lock(MultiLock, Multi1)),
-  ?assertEqual({#{ {s, t2, n2} => Mb }, #{}}, elock:remove_lock(N1Lock, elock:remove_lock(N1Lock, Multi1))),
+  ?assertEqual(Held2, elock_context:remove_lock(MultiLock, elock_context:add_lock(MultiLock, Held2))),
+  ?assertEqual({#{ {s, t2, n1} => Ma }, #{}}, elock_context:remove_lock(MultiLock, Multi1)),
+  ?assertEqual({#{ {s, t2, n2} => Mb }, #{}}, elock_context:remove_lock(N1Lock, elock_context:remove_lock(N1Lock, Multi1))),
 
   ?NO_MESSAGE.
 
@@ -856,7 +856,7 @@ request_fields_test(Config)->
   ?assertEqual(#{
     {Scope, t0, Node} => M0,
     {Scope, t1, Node} => Self
-  }, elock:held_locks(elock_test_utils:context(C1))),
+  }, elock_context:held_locks(elock_test_utils:context(C1))),
 
   % the defaults of lock/3, duplicated nodes collapse to the single node path
   true = ets:insert(Scope, {t2, Self, 1}),
@@ -1066,7 +1066,7 @@ queued_answered_with_held_locks_test(Config)->
   ?assert(elock_test_utils:pending(R3)),
   C1 ! ?reply(Tag3, #locked{ref = Ref3}),
   ?assertEqual({ok, {ok, Ref3}}, elock_test_utils:result(R3, ?DEADLINE)),
-  ?assertEqual(Held#{ {Scope, t2, Node} => Self }, elock:held_locks(elock_test_utils:context(C1))),
+  ?assertEqual(Held#{ {Scope, t2, Node} => Self }, elock_context:held_locks(elock_test_utils:context(C1))),
   ?assertEqual({messages, []}, process_info(C1, messages)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref3)),
@@ -1136,7 +1136,7 @@ wait_verdict_all_granted_test(Config)->
 
   finish_worker(W1),
   finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -1156,7 +1156,7 @@ wait_verdict_queued_then_granted_test(Config)->
   self() ! #queued{ref = Ref, manager = M2, node = n2},
   finish_worker(W1),
   finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
 
   ?assertEqual([#add_held_locks{
     ref = Ref,
@@ -1184,7 +1184,7 @@ wait_verdict_granted_then_queued_test(Config)->
   finish_worker(W3),
   finish_worker(W2),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2, n3 => M3 }},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } },
@@ -1213,7 +1213,7 @@ wait_verdict_foreign_queued_left_in_mailbox_test(Config)->
   finish_worker(W1),
   self() ! #queued{ref = Ref, manager = M2, node = n2},
   finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
 
   ?assertEqual([#add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } }], elock_test_utils:collected(M2, 1)),
   ?assertEqual(Foreign, elock_test_utils:flush()),
@@ -1243,7 +1243,7 @@ wait_verdict_failure_test(Config)->
   self() ! #queued{ref = Ref, manager = M5, node = n5},
   finish_worker(W4),
   ?assertEqual({error, {deadlock, ?WINNER}},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W4 => n4 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W4 => n4 }))),
 
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
   ?assertEqual([
@@ -1273,7 +1273,7 @@ wait_verdict_failure_late_results_test(Config)->
   finish_worker(W3),
   finish_worker(W4),
   ?assertEqual({error, timeout},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3, W4 => n4 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3, W4 => n4 }))),
 
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M3, 1)),
   ?NO_MESSAGE.
@@ -1292,7 +1292,7 @@ wait_verdict_failure_reasons_test(Config)->
       W2 = worker(Ref, Reason),
       finish_worker(W1),
       finish_worker(W2),
-      ?assertEqual(Reason, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+      ?assertEqual(Reason, elock_context:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
       ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
       ?NO_MESSAGE
     end,
@@ -1331,7 +1331,7 @@ wait_verdict_held_queued_first_test(Config)->
   finish_worker(W1),
   finish_worker(W2),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref, held = Held },
@@ -1362,7 +1362,7 @@ wait_verdict_held_queued_after_grant_test(Config)->
   self() ! #queued{ref = Ref, manager = M2, node = n2},
   finish_worker(W2),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref, held = Held#{ {Scope, t, n1} => M1 } }
@@ -1393,7 +1393,7 @@ wait_verdict_held_grant_after_queued_test(Config)->
   finish_worker(W2),
   finish_worker(W3),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2, n3 => M3 }},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W3 => n3 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W3 => n3 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref, held = Held },
@@ -1433,7 +1433,7 @@ wait_verdict_held_failure_test(Config)->
   self() ! #queued{ref = Ref, manager = M5, node = n5},
   finish_worker(W4),
   ?assertEqual({error, {deadlock, ?WINNER}},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W4 => n4 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W4 => n4 }))),
 
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
   ?assertEqual([
@@ -1468,7 +1468,7 @@ wait_verdict_held_lock_granted_again_test(Config)->
   finish_worker(W1),
   finish_worker(W2),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
-    elock:wait_verdict(Ref1, waiting(Ref1, Scope, Held, #{ W1 => n1, W2 => n2 }))),
+    elock_context:wait_verdict(Ref1, waiting(Ref1, Scope, Held, #{ W1 => n1, W2 => n2 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref1, held = Held },
@@ -1484,7 +1484,7 @@ wait_verdict_held_lock_granted_again_test(Config)->
   self() ! #queued{ref = Ref2, manager = M2, node = n2},
   finish_worker(W4),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
-    elock:wait_verdict(Ref2, waiting(Ref2, Scope, Held, #{ W3 => n1, W4 => n2 }))),
+    elock_context:wait_verdict(Ref2, waiting(Ref2, Scope, Held, #{ W3 => n1, W4 => n2 }))),
 
   ?assertEqual([#add_held_locks{ ref = Ref2, held = Held }], elock_test_utils:collected(M2, 1)),
   ?NO_MESSAGE.
@@ -1515,7 +1515,7 @@ wait_verdict_requeued_test(Config)->
   finish_worker(W3),
   finish_worker(W2),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2b, n3 => M3 }},
-    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W3 => n3 }))),
+    elock_context:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W3 => n3 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref, held = Held },
@@ -1541,12 +1541,12 @@ notify_queued_test(_Config)->
   ok = elock_test_utils:stop(Dead),
   Held = #{ {s, a, node()} => H1, {s, t, n1} => M1 },
 
-  ?assertEqual(ok, elock:notify_queued(#{}, Held, Ref)),
-  ?assertEqual(ok, elock:notify_queued(#{ n2 => M2 }, #{}, Ref)),
-  ?assertEqual(ok, elock:notify_queued(#{}, #{}, Ref)),
+  ?assertEqual(ok, elock_context:notify_queued(#{}, Held, Ref)),
+  ?assertEqual(ok, elock_context:notify_queued(#{ n2 => M2 }, #{}, Ref)),
+  ?assertEqual(ok, elock_context:notify_queued(#{}, #{}, Ref)),
   ?NO_MESSAGE,
 
-  ?assertEqual(ok, elock:notify_queued(#{ n1 => M1, n2 => M2, n3 => Dead }, Held, Ref)),
+  ?assertEqual(ok, elock_context:notify_queued(#{ n1 => M1, n2 => M2, n3 => Dead }, Held, Ref)),
   ?assertEqual([#add_held_locks{ ref = Ref, held = Held }], elock_test_utils:collected(M1, 1)),
   ?assertEqual([#add_held_locks{ ref = Ref, held = Held }], elock_test_utils:collected(M2, 1)),
   ?NO_MESSAGE.
@@ -1567,7 +1567,7 @@ receive_marker_test(_Config)->
     {{lock, 4}, passed_marker},
     {{wait_verdict, 2}, {used_receive_marker, {parameter, 1}}},
     {{wait_unlock, 2}, {used_receive_marker, {parameter, 1}}}
-  ], elock_test_utils:recv_opt_info(elock)).
+  ], elock_test_utils:recv_opt_info(elock_context)).
 
 %%-----------------------------------------------------------------
 %%  A single remote node that can not be reached: {error, {badrpc, _}}

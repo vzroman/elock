@@ -23,7 +23,6 @@
 ]).
 
 -export([
-  add_edges_holds_nothing_test/1,
   add_edges_new_graph_test/1,
   add_edges_self_held_test/1,
   add_edges_second_waiter_test/1,
@@ -65,7 +64,6 @@ all()->
 groups()->
   [
     {edges, [], [
-      add_edges_holds_nothing_test,
       add_edges_new_graph_test,
       add_edges_self_held_test,
       add_edges_second_waiter_test,
@@ -113,29 +111,9 @@ end_per_testcase(_TestCase, _Config)->
 %%  The edges
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  A request that holds nothing stays out of the graph: undefined
-%%  stays undefined, an existing graph is not changed, no probe
-%%-----------------------------------------------------------------
-add_edges_holds_nothing_test(_Config)->
-  M1 = elock_test_utils:collector(),
-  Request = request(make_ref(), #{}),
-
-  ?assertEqual(undefined, elock_graph:add_edges(Request, undefined)),
-
-  Ref = make_ref(),
-  K1 = {s1, t1, node()},
-  Graph = #graph{
-    edges = #{ K1 => #{ Ref => 1 } },
-    index = #{ Ref => {1, #{ K1 => M1 }} }
-  },
-  ?assertEqual(Graph, elock_graph:add_edges(Request, Graph)),
-
-  ?NO_MESSAGE.
-
-%%-----------------------------------------------------------------
-%%  The first waiter that holds something starts the graph: the
-%%  exact edges and index, and exactly one probe per held manager
-%%  with every field asserted
+%%  The first waiter whose holds come in starts the graph: the
+%%  exact edges and index with the weight that is passed, and
+%%  exactly one probe per held manager with every field asserted
 %%-----------------------------------------------------------------
 add_edges_new_graph_test(_Config)->
   M1 = elock_test_utils:collector(),
@@ -145,7 +123,7 @@ add_edges_new_graph_test(_Config)->
   Held = #{ K1 => M1, K2 => M2 },
   Ref = make_ref(),
 
-  Graph = elock_graph:add_edges(request(Ref, Held), undefined),
+  Graph = elock_graph:add_edges(Ref, ?EDGE, Held, 2, undefined),
 
   ?assertEqual(#graph{
     edges = #{
@@ -179,7 +157,7 @@ add_edges_self_held_test(_Config)->
   Held = #{ K1 => self(), K2 => M2 },
   Ref = make_ref(),
 
-  Graph = elock_graph:add_edges(request(Ref, Held), undefined),
+  Graph = elock_graph:add_edges(Ref, ?EDGE, Held, 2, undefined),
 
   ?assertEqual(#graph{
     edges = #{
@@ -211,7 +189,7 @@ add_edges_self_held_test(_Config)->
       Ref => {2, Held},
       Ref2 => {1, #{ K1 => self() }}
     }
-  }, elock_graph:add_edges(request(Ref2, #{ K1 => self() }), Graph)),
+  }, elock_graph:add_edges(Ref2, ?EDGE, #{ K1 => self() }, 1, Graph)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -226,10 +204,10 @@ add_edges_second_waiter_test(_Config)->
   Ref1 = make_ref(),
   Ref2 = make_ref(),
 
-  Graph1 = elock_graph:add_edges(request(Ref1, #{ K1 => M1 }), undefined),
+  Graph1 = elock_graph:add_edges(Ref1, ?EDGE, #{ K1 => M1 }, 1, undefined),
   [_Probe1] = elock_test_utils:collected(M1, 1),
 
-  Graph2 = elock_graph:add_edges(request(Ref2, #{ K1 => M1, K2 => M2 }), Graph1),
+  Graph2 = elock_graph:add_edges(Ref2, ?EDGE, #{ K1 => M1, K2 => M2 }, 2, Graph1),
 
   ?assertEqual(#graph{
     edges = #{
@@ -254,17 +232,21 @@ add_edges_second_waiter_test(_Config)->
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  A hold gained by a request that is not in the index yet (it
-%%  held nothing when it asked): it joins with the weight 0, the
-%%  probe carries the weight 0 and the given edge
+%%  A request that is not in the index joins with the weight that
+%%  is passed, whatever the size of the update: 0 (a multi node
+%%  request whose client held nothing reports a grant) and a
+%%  positive one (the client held three locks, here comes one), the
+%%  probe carries the same weight and the given edge. Without a
+%%  graph and in a graph of other requests alike
 %%-----------------------------------------------------------------
 add_held_locks_new_request_test(_Config)->
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
+  M3 = elock_test_utils:collector(),
   K1 = {s1, t1, 'n1@host'},
   Ref = make_ref(),
 
-  Graph = elock_graph:add_held_locks(Ref, ?EDGE, #{ K1 => M1 }, undefined),
+  Graph = elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1 }, 0, undefined),
 
   ?assertEqual(#graph{
     edges = #{ K1 => #{ Ref => 0 } },
@@ -282,6 +264,7 @@ add_held_locks_new_request_test(_Config)->
   % the same for a ref unknown to an existing graph
   Ref2 = make_ref(),
   K2 = {s1, t1, 'n2@host'},
+  Graph2 = elock_graph:add_edges(Ref2, ?EDGE, #{ K2 => M2 }, 0, Graph),
   ?assertEqual(#graph{
     edges = #{
       K1 => #{ Ref => 0 },
@@ -291,7 +274,7 @@ add_held_locks_new_request_test(_Config)->
       Ref => {0, #{ K1 => M1 }},
       Ref2 => {0, #{ K2 => M2 }}
     }
-  }, elock_graph:add_held_locks(Ref2, ?EDGE, #{ K2 => M2 }, Graph)),
+  }, Graph2),
   ?assertEqual([#deadlock_probe{
     ref = Ref2,
     edge = ?EDGE,
@@ -299,62 +282,121 @@ add_held_locks_new_request_test(_Config)->
     weight = 0,
     sent_to = #{ self() => true, M2 => true }
   }], elock_test_utils:collected(M2, 1)),
+  ?NO_MESSAGE,
+
+  % a positive weight: the one passed, not the size of the update
+  Ref3 = make_ref(),
+  K3 = {s2, t3, node()},
+  ?assertEqual(#graph{
+    edges = #{
+      K1 => #{ Ref => 0 },
+      K2 => #{ Ref2 => 0 },
+      K3 => #{ Ref3 => 3 }
+    },
+    index = #{
+      Ref => {0, #{ K1 => M1 }},
+      Ref2 => {0, #{ K2 => M2 }},
+      Ref3 => {3, #{ K3 => M3 }}
+    }
+  }, elock_graph:add_edges(Ref3, ?EDGE, #{ K3 => M3 }, 3, Graph2)),
+  ?assertEqual([#deadlock_probe{
+    ref = Ref3,
+    edge = ?EDGE,
+    manager = self(),
+    weight = 3,
+    sent_to = #{ self() => true, M3 => true }
+  }], elock_test_utils:collected(M3, 1)),
+  ?NO_MESSAGE,
+
+  % and without a graph: the update is larger than the weight (the
+  % held lock of the client and the grants of two nodes in one answer)
+  Ref4 = make_ref(),
+  Held4 = #{ K1 => M1, K2 => M2, K3 => M3 },
+  ?assertEqual(#graph{
+    edges = #{
+      K1 => #{ Ref4 => 1 },
+      K2 => #{ Ref4 => 1 },
+      K3 => #{ Ref4 => 1 }
+    },
+    index = #{ Ref4 => {1, Held4} }
+  }, elock_graph:add_edges(Ref4, ?EDGE, Held4, 1, undefined)),
+  Probe4 = #deadlock_probe{
+    ref = Ref4,
+    edge = ?EDGE,
+    manager = self(),
+    weight = 1,
+    sent_to = #{ self() => true, M1 => true, M2 => true, M3 => true }
+  },
+  ?assertEqual([Probe4], elock_test_utils:collected(M1, 1)),
+  ?assertEqual([Probe4], elock_test_utils:collected(M2, 1)),
+  ?assertEqual([Probe4], elock_test_utils:collected(M3, 1)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  The update of a known waiter: the known entries are ignored (no
-%%  probe, graph identical), a new key is probed alone, a known key
-%%  with a fresh pid replaces the pid and is probed, an empty update
-%%  changes nothing. The weight stays as it was
+%%  The update of a known waiter. It keeps the weight it has joined
+%%  with whatever weight is passed, in the index, in the edges and
+%%  in the probes. An entry it has already leaves the graph
+%%  identical and is not probed; of an update with known and new
+%%  keys only the new ones are merged and probed; a known key with
+%%  a fresh pid replaces the pid and is probed, alone
 %%-----------------------------------------------------------------
 add_held_locks_update_test(_Config)->
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
+  M3 = elock_test_utils:collector(),
   K1 = {s1, t1, node()},
   K2 = {s1, t2, node()},
+  K3 = {s2, t1, 'n3@host'},
   Ref = make_ref(),
 
-  Graph0 = elock_graph:add_edges(request(Ref, #{ K1 => M1 }), undefined),
+  Graph0 = elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1 }, 1, undefined),
   [_Probe0] = elock_test_utils:collected(M1, 1),
 
-  % known entry: identical, no probe
-  ?assertEqual(Graph0, elock_graph:add_held_locks(Ref, ?EDGE, #{ K1 => M1 }, Graph0)),
+  % known entry: identical, no probe, with the same weight and with another one
+  ?assertEqual(Graph0, elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1 }, 1, Graph0)),
+  ?assertEqual(Graph0, elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1 }, 5, Graph0)),
   ?NO_MESSAGE,
 
-  % empty update: identical
-  ?assertEqual(Graph0, elock_graph:add_held_locks(Ref, ?EDGE, #{}, Graph0)),
-  ?NO_MESSAGE,
-
-  % a new key among known ones: only the new one is probed
-  Graph1 = elock_graph:add_held_locks(Ref, ?EDGE, #{ K1 => M1, K2 => M2 }, Graph0),
+  % new keys among known ones: only the new ones are merged and probed,
+  % the weight stays 1 though 5 is passed
+  Graph1 = elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1, K2 => M2, K3 => M3 }, 5, Graph0),
   ?assertEqual(#graph{
     edges = #{
       K1 => #{ Ref => 1 },
-      K2 => #{ Ref => 1 }
+      K2 => #{ Ref => 1 },
+      K3 => #{ Ref => 1 }
     },
     index = #{
-      Ref => {1, #{ K1 => M1, K2 => M2 }}
+      Ref => {1, #{ K1 => M1, K2 => M2, K3 => M3 }}
     }
   }, Graph1),
-  ?assertEqual([#deadlock_probe{
+  Probe1 = #deadlock_probe{
     ref = Ref,
     edge = ?EDGE,
     manager = self(),
     weight = 1,
-    sent_to = #{ self() => true, M2 => true }
-  }], elock_test_utils:collected(M2, 1)),
+    sent_to = #{ self() => true, M2 => true, M3 => true }
+  },
+  ?assertEqual([Probe1], elock_test_utils:collected(M2, 1)),
+  ?assertEqual([Probe1], elock_test_utils:collected(M3, 1)),
   ?NO_MESSAGE,
 
-  % a known key with a fresh pid: the pid is replaced and probed
+  % the whole held map once more: every entry is known by now
+  ?assertEqual(Graph1, elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1, K2 => M2, K3 => M3 }, 3, Graph1)),
+  ?NO_MESSAGE,
+
+  % a known key with a fresh pid among known entries: the pid is
+  % replaced and probed alone, a lighter weight is not taken either
   M1b = elock_test_utils:collector(),
-  Graph2 = elock_graph:add_held_locks(Ref, ?EDGE, #{ K1 => M1b }, Graph1),
+  Graph2 = elock_graph:add_edges(Ref, ?EDGE, #{ K1 => M1b, K2 => M2 }, 0, Graph1),
   ?assertEqual(#graph{
     edges = #{
       K1 => #{ Ref => 1 },
-      K2 => #{ Ref => 1 }
+      K2 => #{ Ref => 1 },
+      K3 => #{ Ref => 1 }
     },
     index = #{
-      Ref => {1, #{ K1 => M1b, K2 => M2 }}
+      Ref => {1, #{ K1 => M1b, K2 => M2, K3 => M3 }}
     }
   }, Graph2),
   ?assertEqual([#deadlock_probe{
@@ -364,26 +406,55 @@ add_held_locks_update_test(_Config)->
     weight = 1,
     sent_to = #{ self() => true, M1b => true }
   }], elock_test_utils:collected(M1b, 1)),
+  ?NO_MESSAGE,
+
+  % the other waiters are not touched by the update of this one
+  Ref2 = make_ref(),
+  Graph3 = elock_graph:add_edges(Ref2, ?EDGE, #{ K2 => M2 }, 4, Graph2),
+  [_Probe2] = elock_test_utils:collected(M2, 1),
+  ?assertEqual(Graph3, elock_graph:add_edges(Ref2, ?EDGE, #{ K2 => M2 }, 1, Graph3)),
+  ?NO_MESSAGE,
+  ?assertEqual(#graph{
+    edges = #{
+      K1 => #{ Ref => 1, Ref2 => 4 },
+      K2 => #{ Ref => 1, Ref2 => 4 },
+      K3 => #{ Ref => 1 }
+    },
+    index = #{
+      Ref => {1, #{ K1 => M1b, K2 => M2, K3 => M3 }},
+      Ref2 => {4, #{ K1 => M1b, K2 => M2 }}
+    }
+  }, elock_graph:add_edges(Ref2, ?EDGE, #{ K1 => M1b }, 1, Graph3)),
+  ?assertEqual([#deadlock_probe{
+    ref = Ref2,
+    edge = ?EDGE,
+    manager = self(),
+    weight = 4,
+    sent_to = #{ self() => true, M1b => true }
+  }], elock_test_utils:collected(M1b, 1)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
 %%  A request stops waiting: the last waiter takes the graph with it
 %%  (undefined), one of two leaves the shared keys to the other and
-%%  its own keys vanish, an unknown ref changes nothing, undefined
-%%  stays undefined
+%%  its own keys vanish, the keys that came in with a later update
+%%  go as well, an unknown ref changes nothing, undefined stays
+%%  undefined
 %%-----------------------------------------------------------------
 remove_edges_test(_Config)->
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
+  M3 = elock_test_utils:collector(),
   K1 = {s1, t1, node()},
   K2 = {s1, t2, node()},
+  K3 = {s1, t3, node()},
   Ref1 = make_ref(),
   Ref2 = make_ref(),
 
   ?assertEqual(undefined, elock_graph:remove_edges(Ref1, undefined)),
 
-  Graph1 = elock_graph:add_edges(request(Ref1, #{ K1 => M1 }), undefined),
-  Graph2 = elock_graph:add_edges(request(Ref2, #{ K1 => M1, K2 => M2 }), Graph1),
+  Graph1 = elock_graph:add_edges(Ref1, ?EDGE, #{ K1 => M1 }, 1, undefined),
+  Graph2 = elock_graph:add_edges(Ref2, ?EDGE, #{ K1 => M1, K2 => M2 }, 2, Graph1),
   [_, _] = elock_test_utils:collected(M1, 2),
   [_] = elock_test_utils:collected(M2, 1),
 
@@ -407,6 +478,11 @@ remove_edges_test(_Config)->
       Ref2 => {2, #{ K1 => M1, K2 => M2 }}
     }
   }, elock_graph:remove_edges(Ref1, Graph2)),
+
+  % the keys of a later update leave with the waiter as well
+  Graph3 = elock_graph:add_edges(Ref2, ?EDGE, #{ K3 => M3 }, 2, Graph2),
+  [_] = elock_test_utils:collected(M3, 1),
+  ?assertEqual(Graph1, elock_graph:remove_edges(Ref2, Graph3)),
 
   % the last waiter takes the graph with it
   ?assertEqual(undefined, elock_graph:remove_edges(Ref1, Graph1)),
@@ -672,19 +748,6 @@ drop_coin_test(_Config)->
 %%=================================================================
 %%  Utilities
 %%=================================================================
-% A request that waits at this manager holding Held
-request(Ref, Held)->
-  #request{
-    ref = Ref,
-    scope = ?SCOPE,
-    term = ?TERM,
-    client = self(),
-    shared = false,
-    held = Held,
-    nodes = [node()],
-    timeout = undefined
-  }.
-
 % A probe of the origin request Ref waiting at the origin manager OM
 probe(Ref, OM, Weight)->
   #deadlock_probe{

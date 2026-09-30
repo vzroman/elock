@@ -6,13 +6,22 @@
 %%
 %%  A scenario is a list of participants {Client, Held, Want}: every
 %%  client takes its Held locks, then the Want requests are issued
-%%  one by one with lock_queued/5, so that every request stands in
-%%  its manager's queue - and its probes have been sent - before the
-%%  next one is issued. The probe of the request that closes the
-%%  cycle finds the rest of the cycle in place, hence the cycle gets
-%%  exactly one verdict. The property asserted everywhere: exactly
-%%  one loser per cycle, and every winner is granted once the loser
-%%  releases what it holds
+%%  one by one with lock_queued/5. A request does not bring the
+%%  held locks with it, only their number: the manager asks the
+%%  client for them when the request is queued (#queued{}), and it
+%%  is the answer of the client that puts the request into the
+%%  wait-for graph and sends its probes. Every cycle of this suite
+%%  is found through that answer. lock_queued/5 returns when all of
+%%  it is over: the request stands in its manager's queue, its
+%%  client has answered, and the managers have handled the answer
+%%  and every probe it set off (see elock_test_utils:lock_queued/6;
+%%  on one node that is exact). So nothing of a request is on its
+%%  way when the next one is issued: the probes of the requests
+%%  before the last find no cycle, the probe of the request that
+%%  closes the cycle finds the rest of the cycle in place, hence
+%%  the cycle gets exactly one verdict. The property asserted
+%%  everywhere: exactly one loser per cycle, and every winner is
+%%  granted once the loser releases what it holds
 %%=================================================================
 -module(elock_deadlock_SUITE).
 
@@ -59,7 +68,8 @@
 % mirrors elock.erl
 -record(context,{
   ref2lock,
-  locked
+  locked,
+  counts
 }).
 -record(lock,{
   scope,
@@ -576,9 +586,10 @@ loser_keeps_other_locks_test(Config)->
       OtherRef => #lock{ scope = Scope, term = OtherTerm, nodes = #{ Node => OtherManager } }
     },
     locked = #{
-      {Scope, CycleTerm, Node} => {CycleManager, 1},
-      {Scope, OtherTerm, Node} => {OtherManager, 1}
-    }
+      {Scope, CycleTerm, Node} => CycleManager,
+      {Scope, OtherTerm, Node} => OtherManager
+    },
+    counts = #{}
   }, elock_test_utils:context(Loser)),
 
   RE = elock_test_utils:lock_queued(E, Scope, OtherTerm, [Node], #{}),
@@ -837,11 +848,13 @@ deadlock_and_timeout_test(Config)->
   M2 = elock_test_utils:wait_manager(Scope, t2),
   ?assertEqual(#context{
     ref2lock = #{ RefA => #lock{ scope = Scope, term = t1, nodes = #{ Node => M1 } } },
-    locked = #{ {Scope, t1, Node} => {M1, 1} }
+    locked = #{ {Scope, t1, Node} => M1 },
+    counts = #{}
   }, elock_test_utils:context(A)),
   ?assertEqual(#context{
     ref2lock = #{ RefB => #lock{ scope = Scope, term = t2, nodes = #{ Node => M2 } } },
-    locked = #{ {Scope, t2, Node} => {M2, 1} }
+    locked = #{ {Scope, t2, Node} => M2 },
+    counts = #{}
   }, elock_test_utils:context(B)),
   ?assertEqual([{t1, M1, 2}, {t2, M2, 2}], lists:sort(elock_test_utils:locks(Scope))),
 
@@ -853,8 +866,9 @@ deadlock_and_timeout_test(Config)->
 %%-----------------------------------------------------------------
 %%  A ring of ten: every client holds its own term and asks for the
 %%  next one, the last request closes the cycle. Exactly one loser
-%%  (the requests are issued one after another, so only the closing
-%%  request's probe finds a cycle), every other client is granted
+%%  (the requests are issued one after another, each one when the
+%%  probes of the one before are handled, so only the probe of the
+%%  closing request finds a cycle), every other client is granted
 %%  as the ring drains from the loser on
 %%-----------------------------------------------------------------
 ring_test(Config)->
@@ -892,9 +906,10 @@ stop(Clients)->
 
 % A scenario: every participant {Client, Held, Want} takes its Held
 % locks, then the Want requests are issued in the order of the list,
-% each one taken by its manager before the next is issued. A lock is
-% {Scope, Term} (exclusive) or {Scope, Term, Options}. The result is
-% [{Client, Request, HeldRefs}]
+% each one settled at its manager (queued, answered, probed - see
+% elock_test_utils:lock_queued/6) before the next is issued. A lock
+% is {Scope, Term} (exclusive) or {Scope, Term, Options}. The result
+% is [{Client, Request, HeldRefs}]
 setup(Node, Participants)->
   Holding =
     [ {Client, [ take(Client, Node, Lock) || Lock <- Held ], Want}
@@ -912,18 +927,32 @@ ask(Client, Node, {Scope, Term})->
 ask(Client, Node, {Scope, Term, Options})->
   elock_test_utils:lock_queued(Client, Scope, Term, [Node], Options).
 
-% An upgrade request: the client holds the term shared already, so
-% it is monitored since its first request and lock_queued/5 can not
-% tell whether the manager has taken the upgrade. It has once the
-% client waits for the verdict in elock_manager:wait_verdict/2 (i.e. the
-% request is sent) and the manager's mailbox is empty
+% An upgrade request that has settled like one of lock_queued/5: the
+% upgrade is pending at the manager, the client has answered with its
+% locks and the probes of the answer are handled. The client holds
+% the term shared already, so it is monitored since its first request
+% and the monitor can not tell whether the manager has taken the
+% upgrade. Awaited instead, in this order - each step is what makes
+% the next one conclusive:
+% * the client waits in elock_manager:wait_verdict/4 - the request
+%   is sent, hence it is in the mailbox of the manager
+% * the managers are quiet - the request is handled: the upgrade is
+%   pending and the manager has asked the client for its locks (an
+%   upgrade holds at least the term itself), #queued{} is in the
+%   mailbox of the client
+% * the request has settled - the client is suspended again, it has
+%   answered, and the managers are quiet once more: the answer and
+%   its probes are handled
+% or the verdict is in already: a second upgrade loses at once
 upgrade_queued(Client, Scope, Term, Node)->
-  Manager = elock_test_utils:wait_manager(Scope, Term),
   R = elock_test_utils:lock_async(Client, Scope, Term, [Node], #{}),
   ?WAIT(
-    process_info(Client, current_function) =:= {current_function, {elock_manager, wait_verdict, 2}}
-    andalso process_info(Client, status) =:= {status, waiting}
-    andalso process_info(Manager, message_queue_len) =:= {message_queue_len, 0}
+    not elock_test_utils:pending(R)
+    orelse (
+      process_info(Client, current_function) =:= {current_function, {elock_manager, wait_verdict, 4}}
+      andalso elock_test_utils:quiet([Node]) =:= true
+      andalso elock_test_utils:settled(Client, [Node]) =:= true
+    )
   ),
   R.
 

@@ -1,16 +1,20 @@
 %%=================================================================
 %%  Module tests of elock: the client API, the context of a client
 %%  process, the request a client sends to a manager and the client
-%%  side of a multi node request (wait_verdict/1), the scope.
+%%  side of a remote or a multi node request (wait_verdict/2), the
+%%  scope.
 %%
 %%  Techniques:
 %%  * fake manager: the test process poses as the manager of a term
 %%    by inserting {Term, self(), 1} into the scope table. A client
 %%    then takes ticket 2 and sends its #request{} to the test
-%%    process, which answers with any verdict
+%%    process, which answers with any verdict or with #queued{} as
+%%    the manager does: ?reply(Tag, Message) with the tag of the
+%%    request it got
 %%  * fake nodes: a #waiting{} built by hand, the pending workers
-%%    are spawned processes that exit with a crafted result, the
-%%    managers are collectors that forward what they get
+%%    are spawned processes monitored with the request ref as the
+%%    tag, like the ones of run_request/3, that exit with a crafted
+%%    result, the managers are collectors that forward what they get
 %%=================================================================
 -module(elock_SUITE).
 
@@ -50,6 +54,7 @@
   unlock_by_another_process_test/1,
   request_fields_test/1,
   verdicts_test/1,
+  queued_answered_with_held_locks_test/1,
   fake_manager_dies_test/1,
   wait_verdict_all_granted_test/1,
   wait_verdict_queued_then_granted_test/1,
@@ -58,6 +63,14 @@
   wait_verdict_failure_test/1,
   wait_verdict_failure_late_results_test/1,
   wait_verdict_failure_reasons_test/1,
+  wait_verdict_held_queued_first_test/1,
+  wait_verdict_held_queued_after_grant_test/1,
+  wait_verdict_held_grant_after_queued_test/1,
+  wait_verdict_held_failure_test/1,
+  wait_verdict_held_lock_granted_again_test/1,
+  wait_verdict_requeued_test/1,
+  notify_queued_test/1,
+  receive_marker_test/1,
   single_remote_node_unreachable_test/1,
   unreachable_node_releases_granted_node_test/1,
   start_link_test/1,
@@ -70,7 +83,8 @@
 % mirrors elock.erl
 -record(context,{
   ref2lock,
-  locked
+  locked,
+  counts
 }).
 -record(lock,{
   scope,
@@ -81,6 +95,7 @@
   ref,
   scope,
   term,
+  held,
   pending,
   nodes,
   queued
@@ -96,6 +111,7 @@
 -record(retry,{
   ref
 }).
+-define(reply(Tag, Message), {Tag, Message}).
 
 -define(CONTEXT, '$elock_context$').
 -define(PG_SCOPE(Scope), list_to_atom(atom_to_list(Scope) ++ "_$pg$")).
@@ -143,6 +159,7 @@ groups()->
     {request, [], [
       request_fields_test,
       verdicts_test,
+      queued_answered_with_held_locks_test,
       fake_manager_dies_test
     ]},
     {multi_node_client, [], [
@@ -153,6 +170,14 @@ groups()->
       wait_verdict_failure_test,
       wait_verdict_failure_late_results_test,
       wait_verdict_failure_reasons_test,
+      wait_verdict_held_queued_first_test,
+      wait_verdict_held_queued_after_grant_test,
+      wait_verdict_held_grant_after_queued_test,
+      wait_verdict_held_failure_test,
+      wait_verdict_held_lock_granted_again_test,
+      wait_verdict_requeued_test,
+      notify_queued_test,
+      receive_marker_test,
       single_remote_node_unreachable_test,
       unreachable_node_releases_granted_node_test
     ]},
@@ -371,8 +396,8 @@ legacy_deadlock_test(Config)->
   ],
   lists:foreach(fun(Call)->
     Pending = elock_test_utils:cast(C1, Call),
-    #request{ref = Ref} = ?RECEIVE(#request{}),
-    C1 ! #deadlock{ref = Ref, winner = ?WINNER},
+    #request{ref = Ref, tag = Tag} = ?RECEIVE(#request{}),
+    C1 ! ?reply(Tag, #deadlock{ref = Ref, winner = ?WINNER}),
     ?assertEqual({ok, {error, deadlock}}, elock_test_utils:result(Pending, ?DEADLINE)),
     ?assertEqual(undefined, elock_test_utils:context(C1))
   end, Calls),
@@ -383,8 +408,9 @@ legacy_deadlock_test(Config)->
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  The exact context after one lock: the ref maps to the lock with
-%%  the manager from the table, the key counts one hold. Erased
-%%  after the unlock, the scope is idle
+%%  the manager from the table, the held map names the manager of
+%%  the key, nothing is counted for a key held once. Erased after
+%%  the unlock, the scope is idle
 %%-----------------------------------------------------------------
 context_after_lock_test(Config)->
   Scope = ?config(scope, Config),
@@ -407,8 +433,9 @@ context_after_lock_test(Config)->
       }
     },
     locked = #{
-      {Scope, t1, Node} => {Manager, 1}
-    }
+      {Scope, t1, Node} => Manager
+    },
+    counts = #{}
   }, elock_test_utils:context(C1)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref)),
@@ -417,9 +444,10 @@ context_after_lock_test(Config)->
   elock_test_utils:stop(C1).
 
 %%-----------------------------------------------------------------
-%%  The same term twice: two refs, one key with the count 2. The
-%%  first unlock leaves the count 1, the manager and the entry stay;
-%%  the second erases the context and the scope is idle
+%%  The same term twice: two refs, one key in the held map and the
+%%  count 2 for it aside. The first unlock drops the count, the
+%%  held map is the same throughout, the manager and the entry
+%%  stay; the second erases the context and the scope is idle
 %%-----------------------------------------------------------------
 reentrant_context_count_test(Config)->
   Scope = ?config(scope, Config),
@@ -428,6 +456,7 @@ reentrant_context_count_test(Config)->
 
   {ok, Ref1} = elock_test_utils:lock(C1, Scope, t1, [Node]),
   Manager = elock_test_utils:wait_manager(Scope, t1),
+  Locked = #{ {Scope, t1, Node} => Manager },
   {ok, Ref2} = elock_test_utils:lock(C1, Scope, t1, [Node]),
   ?assertNotEqual(Ref1, Ref2),
 
@@ -438,14 +467,18 @@ reentrant_context_count_test(Config)->
   },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => Lock, Ref2 => Lock },
-    locked = #{ {Scope, t1, Node} => {Manager, 2} }
+    locked = Locked,
+    counts = #{ {Scope, t1, Node} => 2 }
   }, elock_test_utils:context(C1)),
+  % the key is held once as the managers see it
+  ?assertEqual(1, elock:held_count(elock_test_utils:context(C1))),
   ?assertEqual([{t1, Manager, 2}], elock_test_utils:locks(Scope)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
   ?assertEqual(#context{
     ref2lock = #{ Ref2 => Lock },
-    locked = #{ {Scope, t1, Node} => {Manager, 1} }
+    locked = Locked,
+    counts = #{}
   }, elock_test_utils:context(C1)),
   ?assertEqual([{t1, Manager, 2}], elock_test_utils:locks(Scope)),
   ?assert(is_process_alive(Manager)),
@@ -458,7 +491,9 @@ reentrant_context_count_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  The same term in two scopes is two locks: two keys, two
-%%  managers; held_locks/1 maps both, held_locks(undefined) is empty
+%%  managers; held_locks/1 is the locked map of the context itself
+%%  and held_count/1 the number of its keys, without a context the
+%%  map is empty and the count is 0
 %%-----------------------------------------------------------------
 multi_scope_context_test(Config)->
   Scope1 = ?config(scope, Config),
@@ -480,19 +515,23 @@ multi_scope_context_test(Config)->
       Ref2 => #lock{ scope = Scope2, term = t, nodes = #{ Node => M2 } }
     },
     locked = #{
-      {Scope1, t, Node} => {M1, 1},
-      {Scope2, t, Node} => {M2, 1}
-    }
+      {Scope1, t, Node} => M1,
+      {Scope2, t, Node} => M2
+    },
+    counts = #{}
   }, Context),
 
   ?assertEqual(#{
     {Scope1, t, Node} => M1,
     {Scope2, t, Node} => M2
   }, elock:held_locks(Context)),
+  ?assertEqual(2, elock:held_count(Context)),
   ?assertEqual(#{}, elock:held_locks(undefined)),
+  ?assertEqual(0, elock:held_count(undefined)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
   ?assertEqual(#{ {Scope2, t, Node} => M2 }, elock:held_locks(elock_test_utils:context(C1))),
+  ?assertEqual(1, elock:held_count(elock_test_utils:context(C1))),
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref2)),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
 
@@ -521,14 +560,16 @@ multi_node_context_test(Config)->
       Ref => #lock{ scope = Scope, term = t, nodes = #{ 'n1@host' => M1, 'n2@host' => M2 } }
     },
     locked = #{
-      {Scope, t, 'n1@host'} => {M1, 1},
-      {Scope, t, 'n2@host'} => {M2, 1}
-    }
+      {Scope, t, 'n1@host'} => M1,
+      {Scope, t, 'n2@host'} => M2
+    },
+    counts = #{}
   }, get(?CONTEXT)),
   ?assertEqual(#{
     {Scope, t, 'n1@host'} => M1,
     {Scope, t, 'n2@host'} => M2
   }, elock:held_locks(get(?CONTEXT))),
+  ?assertEqual(2, elock:held_count(get(?CONTEXT))),
 
   ?assertEqual(ok, elock:unlock(Ref)),
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
@@ -583,7 +624,8 @@ unlock_dead_managers_test(Config)->
   ?assertEqual(ok, elock_test_utils:unlock(C1, RefT1)),
   ?assertEqual(#context{
     ref2lock = #{ RefT2 => #lock{ scope = Scope, term = t2, nodes = #{ Node => ManagerT2 } } },
-    locked = #{ {Scope, t2, Node} => {ManagerT2, 1} }
+    locked = #{ {Scope, t2, Node} => ManagerT2 },
+    counts = #{}
   }, elock_test_utils:context(C1)),
   ?assertEqual(ok, elock_test_utils:unlock(C1, RefT2)),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
@@ -597,11 +639,15 @@ unlock_dead_managers_test(Config)->
   elock_test_utils:stop(C1).
 
 %%-----------------------------------------------------------------
-%%  add_lock/2 and remove_lock/2 on hand-built maps: a hold counts
-%%  up, a different manager for a known key is stale and restarts
-%%  the count at 1, a multi node lock adds one key per node; the
-%%  removal counts down and deletes the key at 0, a stale manager
-%%  keeps the entry, an unknown key is a no-op
+%%  add_lock/2 and remove_lock/2 on hand-built pairs {Locked, Counts}.
+%%  Locked is the held map, Key => Manager, Counts has a key only
+%%  while it is held by two or more requests. The first hold adds
+%%  the key to Locked alone, a re-entry counts from 2 up, a
+%%  different manager for a known key is stale: the pid is replaced
+%%  and the count dropped; a multi node lock goes node by node. The
+%%  removal counts down, drops the count at 2 and the key when it
+%%  is held once; a stale manager keeps everything, an unknown key
+%%  is a no-op
 %%-----------------------------------------------------------------
 add_lock_remove_lock_test(_Config)->
   Node = node(),
@@ -614,33 +660,60 @@ add_lock_remove_lock_test(_Config)->
   StaleLock = #lock{ scope = s, term = t, nodes = #{ Node => M2 } },
   OtherLock = #lock{ scope = s, term = other, nodes = #{ Node => M1 } },
   MultiLock = #lock{ scope = s, term = t2, nodes = #{ n1 => Ma, n2 => Mb } },
+  N1Lock = #lock{ scope = s, term = t2, nodes = #{ n1 => Ma } },
 
-  Locked1 = elock:add_lock(Lock, #{}),
-  ?assertEqual(#{ Key => {M1, 1} }, Locked1),
-  Locked2 = elock:add_lock(Lock, Locked1),
-  ?assertEqual(#{ Key => {M1, 2} }, Locked2),
+  % the first hold: the key is in the held map, nothing is counted
+  Held1 = elock:add_lock(Lock, {#{}, #{}}),
+  ?assertEqual({#{ Key => M1 }, #{}}, Held1),
+  % a re-entry from 1 and from 2: the held map is the same
+  Held2 = elock:add_lock(Lock, Held1),
+  ?assertEqual({#{ Key => M1 }, #{ Key => 2 }}, Held2),
+  Held3 = elock:add_lock(Lock, Held2),
+  ?assertEqual({#{ Key => M1 }, #{ Key => 3 }}, Held3),
 
-  % a stale manager: the count restarts
-  ?assertEqual(#{ Key => {M2, 1} }, elock:add_lock(StaleLock, Locked2)),
+  % a stale manager: the pid is replaced, the count is dropped
+  ?assertEqual({#{ Key => M2 }, #{}}, elock:add_lock(StaleLock, Held3)),
+  ?assertEqual({#{ Key => M2 }, #{}}, elock:add_lock(StaleLock, Held2)),
+  ?assertEqual({#{ Key => M2 }, #{}}, elock:add_lock(StaleLock, Held1)),
 
-  % one key per node, the other entries kept
-  ?assertEqual(#{
-    Key => {M1, 2},
-    {s, t2, n1} => {Ma, 1},
-    {s, t2, n2} => {Mb, 1}
-  }, elock:add_lock(MultiLock, Locked2)),
+  % one key per node, the other entries and their counts kept
+  ?assertEqual({
+    #{
+      Key => M1,
+      {s, t2, n1} => Ma,
+      {s, t2, n2} => Mb
+    },
+    #{ Key => 2 }
+  }, elock:add_lock(MultiLock, Held2)),
+  % a multi node lock over a node that is held already: that node is
+  % a re-entry, the other one the first hold
+  Multi1 = elock:add_lock(MultiLock, elock:add_lock(N1Lock, {#{}, #{}})),
+  ?assertEqual({
+    #{
+      {s, t2, n1} => Ma,
+      {s, t2, n2} => Mb
+    },
+    #{ {s, t2, n1} => 2 }
+  }, Multi1),
 
-  % the removal counts down
-  ?assertEqual(Locked1, elock:remove_lock(Lock, Locked2)),
-  ?assertEqual(#{}, elock:remove_lock(Lock, Locked1)),
+  % the removal from 3, from 2 (the count is dropped) and of a key
+  % held once (the key is dropped)
+  ?assertEqual(Held2, elock:remove_lock(Lock, Held3)),
+  ?assertEqual(Held1, elock:remove_lock(Lock, Held2)),
+  ?assertEqual({#{}, #{}}, elock:remove_lock(Lock, Held1)),
 
-  % a stale manager keeps the entry, an unknown key is a no-op
-  ?assertEqual(Locked2, elock:remove_lock(StaleLock, Locked2)),
-  ?assertEqual(Locked1, elock:remove_lock(OtherLock, Locked1)),
-  ?assertEqual(#{}, elock:remove_lock(Lock, #{})),
+  % a stale manager keeps the entry and its count, an unknown key is a no-op
+  ?assertEqual(Held3, elock:remove_lock(StaleLock, Held3)),
+  ?assertEqual(Held2, elock:remove_lock(StaleLock, Held2)),
+  ?assertEqual(Held1, elock:remove_lock(StaleLock, Held1)),
+  ?assertEqual(Held2, elock:remove_lock(OtherLock, Held2)),
+  ?assertEqual(Held1, elock:remove_lock(OtherLock, Held1)),
+  ?assertEqual({#{}, #{}}, elock:remove_lock(Lock, {#{}, #{}})),
 
-  % every node of a multi node lock is removed
-  ?assertEqual(Locked1, elock:remove_lock(MultiLock, elock:add_lock(MultiLock, Locked1))),
+  % every node of a multi node lock is removed, each by its own count
+  ?assertEqual(Held2, elock:remove_lock(MultiLock, elock:add_lock(MultiLock, Held2))),
+  ?assertEqual({#{ {s, t2, n1} => Ma }, #{}}, elock:remove_lock(MultiLock, Multi1)),
+  ?assertEqual({#{ {s, t2, n2} => Mb }, #{}}, elock:remove_lock(N1Lock, elock:remove_lock(N1Lock, Multi1))),
 
   ?NO_MESSAGE.
 
@@ -737,9 +810,12 @@ unlock_by_another_process_test(Config)->
 %%  The request (fake manager)
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The #request{} a client sends to the manager: every field, the
-%%  held map of a fresh client and of a client holding another term
-%%  managed by a real manager, the defaults of lock/3, duplicated
+%%  The #request{} a client sends to the manager: every field. The
+%%  tag is a reference of its own, not the ref of the request. The
+%%  request carries no held map, only the number of the locks the
+%%  client holds: 0 for a fresh client, then one per held key - a
+%%  term managed by a real manager, the ones of the fake manager, a
+%%  key held twice counts once. The defaults of lock/3, duplicated
 %%  nodes collapse
 %%-----------------------------------------------------------------
 request_fields_test(Config)->
@@ -751,8 +827,10 @@ request_fields_test(Config)->
   % a fresh client holds nothing
   true = ets:insert(Scope, {t1, Self, 1}),
   R1 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{is_shared => true, timeout => 1234}),
-  #request{ref = Ref1} = Request1 = ?RECEIVE(#request{}),
+  #request{ref = Ref1, tag = Tag1} = Request1 = ?RECEIVE(#request{}),
   ?assert(is_reference(Ref1)),
+  ?assert(is_reference(Tag1)),
+  ?assertNotEqual(Ref1, Tag1),
   ?assertEqual(#request{
     queue = 2,
     ref = Ref1,
@@ -760,23 +838,28 @@ request_fields_test(Config)->
     term = t1,
     client = C1,
     proxy = C1,
+    tag = Tag1,
     shared = true,
-    held = #{},
+    held_count = 0,
     nodes = [Node],
     timeout = 1234
   }, Request1),
   ?assert(elock_test_utils:pending(R1)),
-  C1 ! #locked{ref = Ref1},
+  C1 ! ?reply(Tag1, #locked{ref = Ref1}),
   ?assertEqual({ok, {ok, Ref1}}, elock_test_utils:result(R1, ?DEADLINE)),
 
-  % a real lock on another term shows up in held together with the fake one
+  % a real lock on another term is counted together with the fake one
   {ok, Ref0} = elock_test_utils:lock(C1, Scope, t0, [Node]),
   M0 = elock_test_utils:wait_manager(Scope, t0),
+  ?assertEqual(#{
+    {Scope, t0, Node} => M0,
+    {Scope, t1, Node} => Self
+  }, elock:held_locks(elock_test_utils:context(C1))),
 
   % the defaults of lock/3, duplicated nodes collapse to the single node path
   true = ets:insert(Scope, {t2, Self, 1}),
   R2 = elock_test_utils:cast(C1, fun()-> elock:lock(Scope, t2, [Node, Node]) end),
-  #request{ref = Ref2} = Request2 = ?RECEIVE(#request{}),
+  #request{ref = Ref2, tag = Tag2} = Request2 = ?RECEIVE(#request{}),
   ?assertEqual(#request{
     queue = 2,
     ref = Ref2,
@@ -784,27 +867,33 @@ request_fields_test(Config)->
     term = t2,
     client = C1,
     proxy = C1,
+    tag = Tag2,
     shared = false,
-    held = #{
-      {Scope, t0, Node} => M0,
-      {Scope, t1, Node} => Self
-    },
+    held_count = 2,
     nodes = [Node],
     timeout = undefined
   }, Request2),
-  C1 ! #locked{ref = Ref2},
+  C1 ! ?reply(Tag2, #locked{ref = Ref2}),
   ?assertEqual({ok, {ok, Ref2}}, elock_test_utils:result(R2, ?DEADLINE)),
 
   % the second request of the same term takes the next ticket
   R3 = elock_test_utils:lock_async(C1, Scope, t2, [Node], #{}),
-  #request{ref = Ref3, queue = 3, held = Held3} = ?RECEIVE(#request{}),
-  ?assertEqual(#{
-    {Scope, t0, Node} => M0,
-    {Scope, t1, Node} => Self,
-    {Scope, t2, Node} => Self
-  }, Held3),
-  C1 ! #locked{ref = Ref3},
+  #request{ref = Ref3, tag = Tag3} = Request3 = ?RECEIVE(#request{}),
+  ?assertEqual(Request2#request{queue = 3, ref = Ref3, tag = Tag3, held_count = 3}, Request3),
+  C1 ! ?reply(Tag3, #locked{ref = Ref3}),
   ?assertEqual({ok, {ok, Ref3}}, elock_test_utils:result(R3, ?DEADLINE)),
+
+  % four locks over three keys: a key held twice counts once
+  R4 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{}),
+  #request{ref = Ref4, tag = Tag4} = Request4 = ?RECEIVE(#request{}),
+  ?assertEqual(Request1#request{queue = 3, ref = Ref4, tag = Tag4, shared = false, held_count = 3, timeout = undefined}, Request4),
+  C1 ! ?reply(Tag4, #timeout{ref = Ref4}),
+  ?assertEqual({ok, {error, timeout}}, elock_test_utils:result(R4, ?DEADLINE)),
+
+  % a tag of its own for every request
+  Tags = [Tag1, Tag2, Tag3, Tag4],
+  ?assert(lists:all(fun erlang:is_reference/1, Tags)),
+  ?assertEqual(8, length(lists:usort(Tags ++ [Ref1, Ref2, Ref3, Ref4]))),
 
   % the unlocks reach the fake manager
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
@@ -823,11 +912,12 @@ request_fields_test(Config)->
   elock_test_utils:stop(C1).
 
 %%-----------------------------------------------------------------
-%%  The verdicts of the manager: #locked{} -> {ok, Ref} and the
-%%  context counts the fake manager; #deadlock{} includes the winner lock
-%%  and no context, #timeout{} -> {error, timeout}, #retry{} -> the
-%%  client comes back with a new ticket, a verdict for a foreign ref
-%%  is left in the client's mailbox
+%%  The verdicts of the manager, each under the tag of the request:
+%%  #locked{} -> {ok, Ref} and the context names the fake manager;
+%%  #deadlock{} includes the winner lock and no context, #timeout{}
+%%  -> {error, timeout}, #retry{} -> the client comes back with a
+%%  new ticket and a new tag; the replies with another tag and the
+%%  bare verdicts are left in the client's mailbox
 %%-----------------------------------------------------------------
 verdicts_test(Config)->
   Scope = ?config(scope, Config),
@@ -838,12 +928,13 @@ verdicts_test(Config)->
 
   % #locked{}
   R1 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{}),
-  #request{ref = Ref1, queue = 2} = ?RECEIVE(#request{}),
-  C1 ! #locked{ref = Ref1},
+  #request{ref = Ref1, queue = 2, tag = Tag1} = ?RECEIVE(#request{}),
+  C1 ! ?reply(Tag1, #locked{ref = Ref1}),
   ?assertEqual({ok, {ok, Ref1}}, elock_test_utils:result(R1, ?DEADLINE)),
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => #lock{ scope = Scope, term = t1, nodes = #{ Node => Self } } },
-    locked = #{ {Scope, t1, Node} => {Self, 1} }
+    locked = #{ {Scope, t1, Node} => Self },
+    counts = #{}
   }, elock_test_utils:context(C1)),
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
   ?assertEqual(#unlock{ref = Ref1}, ?RECEIVE(#unlock{})),
@@ -851,47 +942,142 @@ verdicts_test(Config)->
 
   % #deadlock{}
   R2 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{}),
-  #request{ref = Ref2, queue = 3} = ?RECEIVE(#request{}),
-  C1 ! #deadlock{ref = Ref2, winner = ?WINNER},
+  #request{ref = Ref2, queue = 3, tag = Tag2} = ?RECEIVE(#request{}),
+  C1 ! ?reply(Tag2, #deadlock{ref = Ref2, winner = ?WINNER}),
   ?assertEqual({ok, {error, {deadlock, ?WINNER}}}, elock_test_utils:result(R2, ?DEADLINE)),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
 
   % #timeout{}
   R3 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{timeout => 60000}),
-  #request{ref = Ref3, queue = 4, timeout = 60000} = ?RECEIVE(#request{}),
-  C1 ! #timeout{ref = Ref3},
+  #request{ref = Ref3, queue = 4, timeout = 60000, tag = Tag3} = ?RECEIVE(#request{}),
+  C1 ! ?reply(Tag3, #timeout{ref = Ref3}),
   ?assertEqual({ok, {error, timeout}}, elock_test_utils:result(R3, ?DEADLINE)),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
 
-  % #retry{}: a new ticket, the same ref
+  % #retry{}: a new ticket and a new tag, the same ref
   R4 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{}),
-  #request{ref = Ref4, queue = 5} = ?RECEIVE(#request{}),
-  C1 ! #retry{ref = Ref4},
-  #request{ref = Ref4, queue = 6, client = C1, proxy = C1} = ?RECEIVE(#request{}),
+  #request{ref = Ref4, queue = 5, tag = Tag4} = ?RECEIVE(#request{}),
+  C1 ! ?reply(Tag4, #retry{ref = Ref4}),
+  #request{ref = Ref4, queue = 6, client = C1, proxy = C1, tag = Tag5} = ?RECEIVE(#request{}),
+  ?assertNotEqual(Tag4, Tag5),
   ?assertEqual([{t1, Self, 6}], elock_test_utils:locks(Scope)),
   ?assert(elock_test_utils:pending(R4)),
-  C1 ! #locked{ref = Ref4},
+  C1 ! ?reply(Tag5, #locked{ref = Ref4}),
   ?assertEqual({ok, {ok, Ref4}}, elock_test_utils:result(R4, ?DEADLINE)),
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref4)),
   ?assertEqual(#unlock{ref = Ref4}, ?RECEIVE(#unlock{})),
 
-  % a verdict for a foreign ref is left in the mailbox
+  % only the replies with the tag of the request are taken: the bare
+  % verdicts, even with its ref, and the replies with another tag are
+  % left in the mailbox
   R5 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{}),
-  #request{ref = Ref5, queue = 7} = ?RECEIVE(#request{}),
+  #request{ref = Ref5, queue = 7, tag = Tag6} = ?RECEIVE(#request{}),
   Foreign = [
-    #locked{ref = make_ref()},
-    #deadlock{ref = make_ref(), winner = ?WINNER},
-    #timeout{ref = make_ref()},
-    #retry{ref = make_ref()}
+    #locked{ref = Ref5},
+    #deadlock{ref = Ref5, winner = ?WINNER},
+    #timeout{ref = Ref5},
+    #retry{ref = Ref5},
+    ?reply(Tag4, #locked{ref = Ref5}),
+    ?reply(Tag5, #deadlock{ref = Ref5, winner = ?WINNER}),
+    ?reply(make_ref(), #timeout{ref = Ref5}),
+    ?reply(Ref5, #retry{ref = Ref5})
   ],
-  [ C1 ! Verdict || Verdict <- Foreign ],
+  [ C1 ! Message || Message <- Foreign ],
   ?assertEqual(timeout, elock_test_utils:result(R5, ?QUIET)),
-  C1 ! #timeout{ref = Ref5},
+  ?assertEqual([{t1, Self, 7}], elock_test_utils:locks(Scope)),
+  C1 ! ?reply(Tag6, #timeout{ref = Ref5}),
   ?assertEqual({ok, {error, timeout}}, elock_test_utils:result(R5, ?DEADLINE)),
   ?assertEqual({messages, Foreign}, process_info(C1, messages)),
 
   ?NO_MESSAGE,
   true = ets:delete(Scope, t1),
+  elock_test_utils:stop(C1).
+
+%%-----------------------------------------------------------------
+%%  The client answers #queued{}. A client that holds locks - one
+%%  of a real manager and one of the fake manager - asks for a term
+%%  of the fake manager. The request names only their number and
+%%  nothing is sent until the manager asks. On #queued{} under the
+%%  tag of the request the manager gets #add_held_locks{} with the
+%%  ref of the request and the whole held map of the client, the
+%%  locked map of its context as it is; the client keeps waiting
+%%  and takes the verdict, a grant and a failure alike, its mailbox
+%%  is empty afterwards
+%%-----------------------------------------------------------------
+queued_answered_with_held_locks_test(Config)->
+  Scope = ?config(scope, Config),
+  Node = node(),
+  Self = self(),
+  C1 = elock_test_utils:client(),
+
+  % the locks of the client
+  {ok, Ref0} = elock_test_utils:lock(C1, Scope, t0, [Node]),
+  M0 = elock_test_utils:wait_manager(Scope, t0),
+  true = ets:insert(Scope, {t1, Self, 1}),
+  R1 = elock_test_utils:lock_async(C1, Scope, t1, [Node], #{is_shared => true}),
+  #request{ref = Ref1, tag = Tag1, held_count = 1} = ?RECEIVE(#request{}),
+  C1 ! ?reply(Tag1, #locked{ref = Ref1}),
+  ?assertEqual({ok, {ok, Ref1}}, elock_test_utils:result(R1, ?DEADLINE)),
+  Held = #{
+    {Scope, t0, Node} => M0,
+    {Scope, t1, Node} => Self
+  },
+  #context{locked = Locked} = Context = elock_test_utils:context(C1),
+  ?assertEqual(Held, Locked),
+
+  % the request waits at the fake manager and is asked
+  true = ets:insert(Scope, {t2, Self, 1}),
+  R2 = elock_test_utils:lock_async(C1, Scope, t2, [Node], #{}),
+  #request{ref = Ref2, tag = Tag2} = Request2 = ?RECEIVE(#request{}),
+  ?assertEqual(#request{
+    queue = 2,
+    ref = Ref2,
+    scope = Scope,
+    term = t2,
+    client = C1,
+    proxy = C1,
+    tag = Tag2,
+    shared = false,
+    held_count = 2,
+    nodes = [Node],
+    timeout = undefined
+  }, Request2),
+  ?NO_MESSAGE,
+  C1 ! ?reply(Tag2, #queued{ref = Ref2, manager = Self, node = Node}),
+  ?assertEqual(#add_held_locks{ref = Ref2, held = Held}, ?RECEIVE(#add_held_locks{})),
+  ?assertEqual(timeout, elock_test_utils:result(R2, ?QUIET)),
+  ?assertEqual(Context, elock_test_utils:context(C1)),
+
+  % the failure: nothing more to the manager, the locks of the client stay
+  C1 ! ?reply(Tag2, #deadlock{ref = Ref2, winner = ?WINNER}),
+  ?assertEqual({ok, {error, {deadlock, ?WINNER}}}, elock_test_utils:result(R2, ?DEADLINE)),
+  ?assertEqual(Context, elock_test_utils:context(C1)),
+  ?assertEqual({messages, []}, process_info(C1, messages)),
+  ?NO_MESSAGE,
+
+  % asked once more, the grant: the manager that was told the locks
+  % of the client joins them
+  R3 = elock_test_utils:lock_async(C1, Scope, t2, [Node], #{}),
+  #request{ref = Ref3, queue = 3, tag = Tag3, held_count = 2} = ?RECEIVE(#request{}),
+  C1 ! ?reply(Tag3, #queued{ref = Ref3, manager = Self, node = Node}),
+  ?assertEqual(#add_held_locks{ref = Ref3, held = Held}, ?RECEIVE(#add_held_locks{})),
+  ?assert(elock_test_utils:pending(R3)),
+  C1 ! ?reply(Tag3, #locked{ref = Ref3}),
+  ?assertEqual({ok, {ok, Ref3}}, elock_test_utils:result(R3, ?DEADLINE)),
+  ?assertEqual(Held#{ {Scope, t2, Node} => Self }, elock:held_locks(elock_test_utils:context(C1))),
+  ?assertEqual({messages, []}, process_info(C1, messages)),
+
+  ?assertEqual(ok, elock_test_utils:unlock(C1, Ref3)),
+  ?assertEqual(#unlock{ref = Ref3}, ?RECEIVE(#unlock{})),
+  ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
+  ?assertEqual(#unlock{ref = Ref1}, ?RECEIVE(#unlock{})),
+  ?assertEqual(ok, elock_test_utils:unlock(C1, Ref0)),
+  ?assertEqual(undefined, elock_test_utils:context(C1)),
+  ?NO_MESSAGE,
+
+  true = ets:delete(Scope, t1),
+  true = ets:delete(Scope, t2),
+  elock_test_utils:wait_idle(Scope),
   elock_test_utils:stop(C1).
 
 %%-----------------------------------------------------------------
@@ -923,7 +1109,8 @@ fake_manager_dies_test(Config)->
   ?assertEqual([{t1, Manager, 1}], elock_test_utils:locks(Scope)),
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => #lock{ scope = Scope, term = t1, nodes = #{ Node => Manager } } },
-    locked = #{ {Scope, t1, Node} => {Manager, 1} }
+    locked = #{ {Scope, t1, Node} => Manager },
+    counts = #{}
   }, elock_test_utils:context(C1)),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
@@ -942,31 +1129,32 @@ wait_verdict_all_granted_test(Config)->
   Ref = make_ref(),
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
-  W1 = worker({ok, {ok, M1}}),
-  W2 = worker({ok, {ok, M2}}),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
 
   finish_worker(W1),
   finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  #queued{} from n2 before any grant: nothing to tell yet. Then n1
-%%  grants: the queued manager gets #add_held_locks{} with the n1
-%%  hold. Then n2 grants: ok, nothing else is sent
+%%  The client holds nothing. #queued{} from n2 before any grant:
+%%  nothing to tell yet. Then n1 grants: the queued manager gets
+%%  #add_held_locks{} with the n1 hold. Then n2 grants: ok, nothing
+%%  else is sent
 %%-----------------------------------------------------------------
 wait_verdict_queued_then_granted_test(Config)->
   Scope = ?config(scope, Config),
   Ref = make_ref(),
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
-  W1 = worker({ok, {ok, M1}}),
-  W2 = worker({ok, {ok, M2}}),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
 
   self() ! #queued{ref = Ref, manager = M2, node = n2},
   finish_worker(W1),
   finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
 
   ?assertEqual([#add_held_locks{
     ref = Ref,
@@ -975,9 +1163,9 @@ wait_verdict_queued_then_granted_test(Config)->
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  n1 granted first, then #queued{} from n2: #add_held_locks{} with
-%%  the n1 hold goes at once; a third node granting later is pushed
-%%  to the queued manager as well
+%%  The client holds nothing. n1 granted first, then #queued{} from
+%%  n2: #add_held_locks{} with the n1 hold goes at once; a third
+%%  node granting later is pushed to the queued manager as well
 %%-----------------------------------------------------------------
 wait_verdict_granted_then_queued_test(Config)->
   Scope = ?config(scope, Config),
@@ -985,16 +1173,16 @@ wait_verdict_granted_then_queued_test(Config)->
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
   M3 = elock_test_utils:collector(),
-  W1 = worker({ok, {ok, M1}}),
-  W2 = worker({ok, {ok, M2}}),
-  W3 = worker({ok, {ok, M3}}),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
+  W3 = worker(Ref, {ok, {ok, M3}}),
 
   finish_worker(W1),
   self() ! #queued{ref = Ref, manager = M2, node = n2},
   finish_worker(W3),
   finish_worker(W2),
   ?assertEqual({ok, #{ n1 => M1, n2 => M2, n3 => M3 }},
-    elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3 }))),
+    elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3 }))),
 
   ?assertEqual([
     #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } },
@@ -1003,26 +1191,30 @@ wait_verdict_granted_then_queued_test(Config)->
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  #queued{} of a foreign ref is left in the mailbox and does not
-%%  disturb the request
+%%  #queued{} of a foreign ref and the down message of a worker of
+%%  another request (its tag is the ref of that request) are left
+%%  in the mailbox and do not disturb the request
 %%-----------------------------------------------------------------
 wait_verdict_foreign_queued_left_in_mailbox_test(Config)->
   Scope = ?config(scope, Config),
   Ref = make_ref(),
   M1 = elock_test_utils:collector(),
   M2 = elock_test_utils:collector(),
-  W1 = worker({ok, {ok, M1}}),
-  W2 = worker({ok, {ok, M2}}),
-  Foreign = #queued{ref = make_ref(), manager = M2, node = n2},
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
+  Foreign = [
+    #queued{ref = make_ref(), manager = M2, node = n2},
+    {make_ref(), make_ref(), process, self(), {ok, {ok, M2}}}
+  ],
 
-  self() ! Foreign,
+  [ self() ! Message || Message <- Foreign ],
   finish_worker(W1),
   self() ! #queued{ref = Ref, manager = M2, node = n2},
   finish_worker(W2),
-  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }}, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
 
-  ?assertEqual(Foreign, ?RECEIVE(#queued{})),
   ?assertEqual([#add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } }], elock_test_utils:collected(M2, 1)),
+  ?assertEqual(Foreign, elock_test_utils:flush()),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -1039,9 +1231,9 @@ wait_verdict_failure_test(Config)->
   M3 = elock_test_utils:collector(),
   M4 = elock_test_utils:collector(),
   M5 = elock_test_utils:collector(),
-  W1 = worker({ok, {ok, M1}}),
-  W2 = worker({error, {deadlock, ?WINNER}}),
-  W4 = worker({ok, {ok, M4}}),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {error, {deadlock, ?WINNER}}),
+  W4 = worker(Ref, {ok, {ok, M4}}),
 
   finish_worker(W1),
   self() ! #queued{ref = Ref, manager = M3, node = n3},
@@ -1049,7 +1241,7 @@ wait_verdict_failure_test(Config)->
   self() ! #queued{ref = Ref, manager = M5, node = n5},
   finish_worker(W4),
   ?assertEqual({error, {deadlock, ?WINNER}},
-    elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W4 => n4 }))),
+    elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W4 => n4 }))),
 
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
   ?assertEqual([
@@ -1069,17 +1261,17 @@ wait_verdict_failure_late_results_test(Config)->
   Scope = ?config(scope, Config),
   Ref = make_ref(),
   M3 = elock_test_utils:collector(),
-  W1 = worker({error, timeout}),
-  W2 = worker({error, {badrpc, noconnection}}),
-  W3 = worker({ok, {ok, M3}}),
-  W4 = worker({error, {deadlock, ?WINNER}}),
+  W1 = worker(Ref, {error, timeout}),
+  W2 = worker(Ref, {error, {badrpc, noconnection}}),
+  W3 = worker(Ref, {ok, {ok, M3}}),
+  W4 = worker(Ref, {error, {deadlock, ?WINNER}}),
 
   finish_worker(W1),
   finish_worker(W2),
   finish_worker(W3),
   finish_worker(W4),
   ?assertEqual({error, timeout},
-    elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3, W4 => n4 }))),
+    elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2, W3 => n3, W4 => n4 }))),
 
   ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M3, 1)),
   ?NO_MESSAGE.
@@ -1094,11 +1286,11 @@ wait_verdict_failure_reasons_test(Config)->
     fun(Reason)->
       Ref = make_ref(),
       M1 = elock_test_utils:collector(),
-      W1 = worker({ok, {ok, M1}}),
-      W2 = worker(Reason),
+      W1 = worker(Ref, {ok, {ok, M1}}),
+      W2 = worker(Ref, Reason),
       finish_worker(W1),
       finish_worker(W2),
-      ?assertEqual(Reason, elock:wait_verdict(waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
+      ?assertEqual(Reason, elock:wait_verdict(Ref, waiting(Ref, Scope, #{ W1 => n1, W2 => n2 }))),
       ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
       ?NO_MESSAGE
     end,
@@ -1112,6 +1304,268 @@ wait_verdict_failure_reasons_test(Config)->
       killed
     ]
   ).
+
+%%-----------------------------------------------------------------
+%%  The client holds locks. #queued{} from n2 before any grant: the
+%%  held map of the client goes to that manager at once, as it is,
+%%  in a message of its own; the grant of n1 that follows is told
+%%  alone. The managers of the held locks are told nothing
+%%-----------------------------------------------------------------
+wait_verdict_held_queued_first_test(Config)->
+  Scope = ?config(scope, Config),
+  Ref = make_ref(),
+  H1 = elock_test_utils:collector(),
+  H2 = elock_test_utils:collector(),
+  Held = #{
+    {other_scope, a, node()} => H1,
+    {Scope, b, n9} => H2
+  },
+  M1 = elock_test_utils:collector(),
+  M2 = elock_test_utils:collector(),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
+
+  self() ! #queued{ref = Ref, manager = M2, node = n2},
+  finish_worker(W1),
+  finish_worker(W2),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
+    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2 }))),
+
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held },
+    #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } }
+  ], elock_test_utils:collected(M2, 2)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  The client holds locks. n1 granted first, then #queued{} from
+%%  n2: the held map of the client and the grant so far go to that
+%%  manager in one message; its own grant is not told to it
+%%-----------------------------------------------------------------
+wait_verdict_held_queued_after_grant_test(Config)->
+  Scope = ?config(scope, Config),
+  Ref = make_ref(),
+  H1 = elock_test_utils:collector(),
+  H2 = elock_test_utils:collector(),
+  Held = #{
+    {other_scope, a, node()} => H1,
+    {Scope, b, n9} => H2
+  },
+  M1 = elock_test_utils:collector(),
+  M2 = elock_test_utils:collector(),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
+
+  finish_worker(W1),
+  self() ! #queued{ref = Ref, manager = M2, node = n2},
+  finish_worker(W2),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
+    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2 }))),
+
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held#{ {Scope, t, n1} => M1 } }
+  ], elock_test_utils:collected(M2, 1)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  The client holds locks. n2 and n3 report the request queued,
+%%  each manager gets the held map; a grant after that is told
+%%  alone, to every manager the request is still queued at: the
+%%  grant of n1 to both, the grant of n2 to the manager of n3
+%%-----------------------------------------------------------------
+wait_verdict_held_grant_after_queued_test(Config)->
+  Scope = ?config(scope, Config),
+  Ref = make_ref(),
+  H1 = elock_test_utils:collector(),
+  Held = #{ {other_scope, a, node()} => H1 },
+  M1 = elock_test_utils:collector(),
+  M2 = elock_test_utils:collector(),
+  M3 = elock_test_utils:collector(),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2}}),
+  W3 = worker(Ref, {ok, {ok, M3}}),
+
+  self() ! #queued{ref = Ref, manager = M2, node = n2},
+  self() ! #queued{ref = Ref, manager = M3, node = n3},
+  finish_worker(W1),
+  finish_worker(W2),
+  finish_worker(W3),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2, n3 => M3 }},
+    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W3 => n3 }))),
+
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held },
+    #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } }
+  ], elock_test_utils:collected(M2, 2)),
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held },
+    #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } },
+    #add_held_locks{ ref = Ref, held = #{ {Scope, t, n2} => M2 } }
+  ], elock_test_utils:collected(M3, 3)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  The failure of a request of a client that holds locks is the
+%%  one of wait_verdict_failure_test: n1 granted, n3 queued - it has
+%%  got the held map and the grant by then - n2 fails -> #unlock{}
+%%  to the granted and to the queued manager; a #queued{} that
+%%  comes after the failure is only unlocked, the held locks are of
+%%  no use to it. The locks the client holds are not touched
+%%-----------------------------------------------------------------
+wait_verdict_held_failure_test(Config)->
+  Scope = ?config(scope, Config),
+  Ref = make_ref(),
+  H1 = elock_test_utils:collector(),
+  Held = #{ {other_scope, a, node()} => H1 },
+  M1 = elock_test_utils:collector(),
+  M3 = elock_test_utils:collector(),
+  M4 = elock_test_utils:collector(),
+  M5 = elock_test_utils:collector(),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {error, {deadlock, ?WINNER}}),
+  W4 = worker(Ref, {ok, {ok, M4}}),
+
+  finish_worker(W1),
+  self() ! #queued{ref = Ref, manager = M3, node = n3},
+  finish_worker(W2),
+  self() ! #queued{ref = Ref, manager = M5, node = n5},
+  finish_worker(W4),
+  ?assertEqual({error, {deadlock, ?WINNER}},
+    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W4 => n4 }))),
+
+  ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M1, 1)),
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held#{ {Scope, t, n1} => M1 } },
+    #unlock{ref = Ref}
+  ], elock_test_utils:collected(M3, 2)),
+  ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M5, 1)),
+  ?assertEqual([#unlock{ref = Ref}], elock_test_utils:collected(M4, 1)),
+  % nothing to the manager of the held lock
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  A lock the client holds already among the grants: it holds the
+%%  term on n1 and asks for it on n1 and n2. #queued{} from n2
+%%  before the grant of n1: the queued manager gets the entry with
+%%  the held map and once more as the grant (the graph drops the
+%%  second one, see elock_graph_SUITE), the request completes. The
+%%  grant of n1 before #queued{}: the entry is in the held map, the
+%%  answer is that map
+%%-----------------------------------------------------------------
+wait_verdict_held_lock_granted_again_test(Config)->
+  Scope = ?config(scope, Config),
+  M1 = elock_test_utils:collector(),
+  M2 = elock_test_utils:collector(),
+  Held = #{ {Scope, t, n1} => M1 },
+
+  % queued first
+  Ref1 = make_ref(),
+  W1 = worker(Ref1, {ok, {ok, M1}}),
+  W2 = worker(Ref1, {ok, {ok, M2}}),
+  self() ! #queued{ref = Ref1, manager = M2, node = n2},
+  finish_worker(W1),
+  finish_worker(W2),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
+    elock:wait_verdict(Ref1, waiting(Ref1, Scope, Held, #{ W1 => n1, W2 => n2 }))),
+
+  ?assertEqual([
+    #add_held_locks{ ref = Ref1, held = Held },
+    #add_held_locks{ ref = Ref1, held = Held }
+  ], elock_test_utils:collected(M2, 2)),
+  ?NO_MESSAGE,
+
+  % granted first
+  Ref2 = make_ref(),
+  W3 = worker(Ref2, {ok, {ok, M1}}),
+  W4 = worker(Ref2, {ok, {ok, M2}}),
+  finish_worker(W3),
+  self() ! #queued{ref = Ref2, manager = M2, node = n2},
+  finish_worker(W4),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2 }},
+    elock:wait_verdict(Ref2, waiting(Ref2, Scope, Held, #{ W3 => n1, W4 => n2 }))),
+
+  ?assertEqual([#add_held_locks{ ref = Ref2, held = Held }], elock_test_utils:collected(M2, 1)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  The manager the request waits at on n2 dies and the proxy
+%%  queues it at the next one: a second #queued{} from the node
+%%  with another manager. The new manager is answered like the
+%%  first one, with the held map and the grants so far, and takes
+%%  its place: the grants that follow go to it alone
+%%-----------------------------------------------------------------
+wait_verdict_requeued_test(Config)->
+  Scope = ?config(scope, Config),
+  Ref = make_ref(),
+  H1 = elock_test_utils:collector(),
+  Held = #{ {other_scope, a, node()} => H1 },
+  M1 = elock_test_utils:collector(),
+  M2a = elock_test_utils:collector(),
+  M2b = elock_test_utils:collector(),
+  M3 = elock_test_utils:collector(),
+  W1 = worker(Ref, {ok, {ok, M1}}),
+  W2 = worker(Ref, {ok, {ok, M2b}}),
+  W3 = worker(Ref, {ok, {ok, M3}}),
+
+  self() ! #queued{ref = Ref, manager = M2a, node = n2},
+  finish_worker(W1),
+  self() ! #queued{ref = Ref, manager = M2b, node = n2},
+  finish_worker(W3),
+  finish_worker(W2),
+  ?assertEqual({ok, #{ n1 => M1, n2 => M2b, n3 => M3 }},
+    elock:wait_verdict(Ref, waiting(Ref, Scope, Held, #{ W1 => n1, W2 => n2, W3 => n3 }))),
+
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held },
+    #add_held_locks{ ref = Ref, held = #{ {Scope, t, n1} => M1 } }
+  ], elock_test_utils:collected(M2a, 2)),
+  ?assertEqual([
+    #add_held_locks{ ref = Ref, held = Held#{ {Scope, t, n1} => M1 } },
+    #add_held_locks{ ref = Ref, held = #{ {Scope, t, n3} => M3 } }
+  ], elock_test_utils:collected(M2b, 2)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  notify_queued/3: every queued manager gets #add_held_locks{}
+%%  with the ref and the held map as it is, a dead one is harmless;
+%%  nothing is sent when nobody is queued or the map is empty
+%%-----------------------------------------------------------------
+notify_queued_test(_Config)->
+  Ref = make_ref(),
+  H1 = elock_test_utils:collector(),
+  M1 = elock_test_utils:collector(),
+  M2 = elock_test_utils:collector(),
+  Dead = elock_test_utils:collector(),
+  ok = elock_test_utils:stop(Dead),
+  Held = #{ {s, a, node()} => H1, {s, t, n1} => M1 },
+
+  ?assertEqual(ok, elock:notify_queued(#{}, Held, Ref)),
+  ?assertEqual(ok, elock:notify_queued(#{ n2 => M2 }, #{}, Ref)),
+  ?assertEqual(ok, elock:notify_queued(#{}, #{}, Ref)),
+  ?NO_MESSAGE,
+
+  ?assertEqual(ok, elock:notify_queued(#{ n1 => M1, n2 => M2, n3 => Dead }, Held, Ref)),
+  ?assertEqual([#add_held_locks{ ref = Ref, held = Held }], elock_test_utils:collected(M1, 1)),
+  ?assertEqual([#add_held_locks{ ref = Ref, held = Held }], elock_test_utils:collected(M2, 1)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  The waits of a client for its workers do not scan the messages
+%%  it had before the request: the request ref made in lock/4 marks
+%%  the mailbox position, it is passed on as an argument of its own
+%%  and every clause of the receives of wait_verdict/2 and of
+%%  wait_unlock/2 matches it, their first parameter. A refactoring
+%%  that hides the ref from the compiler (the receive takes it out
+%%  of #waiting{}) passes every other test and only costs the scan.
+%%  No other receive of the module is reported
+%%-----------------------------------------------------------------
+receive_marker_test(_Config)->
+  ?assertEqual([
+    {{lock, 4}, reserved_receive_marker},
+    {{lock, 4}, passed_marker},
+    {{wait_verdict, 2}, {used_receive_marker, {parameter, 1}}},
+    {{wait_unlock, 2}, {used_receive_marker, {parameter, 1}}}
+  ], elock_test_utils:recv_opt_info(elock)).
 
 %%-----------------------------------------------------------------
 %%  A single remote node that can not be reached: {error, {badrpc, _}}
@@ -1267,16 +1721,17 @@ many_scopes_test(_Config)->
   Managers = [ elock_test_utils:wait_manager(Scope, t) || Scope <- Scopes ],
   ?assertEqual(10, length(lists:usort(Managers))),
 
-  #context{ref2lock = Ref2Lock, locked = Locked} = elock_test_utils:context(C1),
+  #context{ref2lock = Ref2Lock, locked = Locked, counts = Counts} = elock_test_utils:context(C1),
   ?assertEqual(
     maps:from_list([ {Ref, #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } }}
       || {{Scope, Ref}, Manager} <- lists:zip(Locks, Managers) ]),
     Ref2Lock
   ),
   ?assertEqual(
-    maps:from_list([ {{Scope, t, Node}, {Manager, 1}} || {Scope, Manager} <- lists:zip(Scopes, Managers) ]),
+    maps:from_list([ {{Scope, t, Node}, Manager} || {Scope, Manager} <- lists:zip(Scopes, Managers) ]),
     Locked
   ),
+  ?assertEqual(#{}, Counts),
   [ ?assertEqual([{t, Manager, 1}], elock_test_utils:locks(Scope)) || {Scope, Manager} <- lists:zip(Scopes, Managers) ],
 
   [ ?assertEqual(ok, elock_test_utils:unlock(C1, Ref)) || {_Scope, Ref} <- Locks ],
@@ -1300,17 +1755,21 @@ multi_node_request(Ref, Scope, Nodes)->
     nodes = Nodes,
     client = self(),
     shared = false,
-    held = #{},
+    held_count = 0,
     timeout = undefined
   }.
 
 % A #waiting{} of the request Ref for the term t with the given
-% pending workers: #{ Worker => Node }
+% pending workers: #{ Worker => Node }. Held is the held map of the
+% client, empty when it is not given
 waiting(Ref, Scope, Workers)->
+  waiting(Ref, Scope, #{}, Workers).
+waiting(Ref, Scope, Held, Workers)->
   #waiting{
     ref = Ref,
     scope = Scope,
     term = t,
+    held = Held,
     pending = maps:fold(
       fun({_Pid, MonRef}, Node, Acc)-> Acc#{ MonRef => Node } end,
       #{},
@@ -1320,23 +1779,28 @@ waiting(Ref, Scope, Workers)->
     queued = #{}
   }.
 
-% A worker that exits with Result when told to
-worker(Result)->
-  spawn_monitor(fun()->
-    receive
-      go-> exit(Result)
-    end
-  end).
+% A worker of the request Ref that exits with Result when told to.
+% It is monitored the way run_request/3 does it, with Ref as the
+% tag: its down message is {Ref, MonRef, process, Pid, Result}
+worker(Ref, Result)->
+  spawn_opt(
+    fun()->
+      receive
+        go-> exit(Result)
+      end
+    end,
+    [{monitor, [{tag, Ref}]}]
+  ).
 
-% Let the worker go and wait until its 'DOWN' is in the mailbox, so
-% that the mailbox order is exactly the order of the calls
+% Let the worker go and wait until its down message is in the
+% mailbox, so that the mailbox order is exactly the order of the calls
 finish_worker({Pid, MonRef})->
   Pid ! go,
   ?WAIT(begin
     {messages, Messages} = process_info(self(), messages),
     lists:any(
       fun
-        ({'DOWN', M, process, P, _}) when M =:= MonRef, P =:= Pid-> true;
+        ({_Tag, M, process, P, _}) when M =:= MonRef, P =:= Pid-> true;
         (_)-> false
       end,
       Messages

@@ -1,7 +1,8 @@
 %%=================================================================
 %%  Shared helpers of the elock functional suites:
 %%  scopes, clients, observation of the locks and the managers,
-%%  waiting with deadlines and message collectors.
+%%  waiting with deadlines, message collectors and what the
+%%  compiler says about the receives of a module.
 %%
 %%  Everything that waits has a deadline and fails naming what it
 %%  waited for - a test must never hang.
@@ -32,6 +33,8 @@
   lock/4, lock/5,
   lock_async/5,
   lock_queued/5, lock_queued/6,
+  settled/2,
+  quiet/1,
   unlock/2,
   context/1
 ]).
@@ -61,11 +64,18 @@
   stop_collectors/0
 ]).
 
+%% Compiler
+-export([
+  recv_opt_info/1
+]).
+
 %% Internal: the entry points of the processes spawned on other nodes
+%% and the calls made there
 -export([
   scope_holder/2,
   client_init/1,
-  collector_init/1
+  collector_init/1,
+  managers_work/0
 ]).
 
 -define(POLL, 10).
@@ -307,18 +317,41 @@ lock_async(Client, Scope, Term, Nodes, Options)->
   cast(Client, fun()-> elock:lock(Scope, Term, Nodes, Options) end).
 
 %%-----------------------------------------------------------------
-%%  An asynchronous lock request that the manager has taken for sure
-%%  before it returns, so that the next request queues up behind it:
-%%  the entry shows the ticket the request took and the manager
-%%  monitors the client, which it does once the request is in its
-%%  queue (or granted) - or the verdict is in already (a request
-%%  that closes a deadlock cycle may lose at once, and a dequeued
-%%  request is demonitored). The manager registers the request
-%%  after it has sent the deadlock probes of the locks the client
-%%  holds, so the probe of the next request finds this one in the
-%%  graph. The client must be new to the manager: one that holds
-%%  the term already is monitored since its first request. The
-%%  verdict is collected with result/2
+%%  An asynchronous lock request that has settled before the helper
+%%  returns, so that the next request finds it in place: it stands
+%%  in the queue of its manager and, if its client holds locks, it
+%%  is in the wait-for graph and its probes have been handled. A
+%%  request does not bring the held locks with it: the manager asks
+%%  the client for them (#queued{}) and it is the answer of the
+%%  client that joins the request to the graph and sends its
+%%  probes. Hence three things are awaited, in this order - each
+%%  one is what makes the next one conclusive:
+%%  * taken - the entry shows the ticket the request took and the
+%%    manager monitors the client, which it does once the request
+%%    is in its queue (or granted). The manager registers the
+%%    client after it has sent #queued{}, if it asks at all, hence
+%%    the question is in the mailbox of the client by now
+%%  * answered - the client is suspended in its receive again. A
+%%    local send puts the message into the mailbox at once and a
+%%    process with a message it waits for is not suspended, hence
+%%    the client has taken the question and has sent its answer:
+%%    the answer is in the mailbox of the manager. A client that is
+%%    not asked (it holds nothing and names one node) is suspended
+%%    from the start
+%%  * quiet - the managers have nothing to do and have done nothing
+%%    for a while (see quiet/1), hence the answer is handled, the
+%%    request is in the graph, and its probes, the ones passed on
+%%    from manager to manager included, and the verdicts they have
+%%    brought are handled by every manager they got to
+%%  or the verdict is in already, then there is nothing to look at:
+%%  a request that closes a deadlock cycle loses at once and a
+%%  dequeued request is demonitored.
+%%
+%%  On one node this is exact: everything is a local send, there is
+%%  no moment when a message is in nobody's mailbox. The client
+%%  must be new to the manager: one that holds the term already is
+%%  monitored since its first request. The verdict is collected
+%%  with result/2
 %%-----------------------------------------------------------------
 lock_queued(Client, Scope, Term, Nodes, Options)->
   lock_queued(node(), Client, Scope, Term, Nodes, Options).
@@ -327,7 +360,12 @@ lock_queued(Client, Scope, Term, Nodes, Options)->
 %%  The same for a request of a remote scope: Watch is the node, or
 %%  the nodes, whose managers must have taken the request (the
 %%  tables and the monitors are read there through rpc) - for a
-%%  multi node request every node of it
+%%  multi node request every node of it. The client and the managers
+%%  of every node are looked at through rpc the same way, but
+%%  across nodes this is not a guarantee: #queued{}, the answer and
+%%  the probes travel through ecall, and a message on its way
+%%  between two nodes is in nobody's mailbox. The checks only
+%%  narrow the window there
 %%-----------------------------------------------------------------
 lock_queued(Watch, Client, Scope, Term, Nodes, Options) when is_atom(Watch)->
   lock_queued([Watch], Client, Scope, Term, Nodes, Options);
@@ -340,14 +378,19 @@ lock_queued(Watch, Client, Scope, Term, Nodes, Options)->
         false->
           true;
         true->
-          lists:foldl(
-            fun
-              ({Node, Ticket}, true)-> taken(Node, Client, Scope, Term, Ticket);
-              (_, Problem)-> Problem
-            end,
-            true,
-            Tickets
-          )
+          Taken =
+            lists:foldl(
+              fun
+                ({Node, Ticket}, true)-> taken(Node, Client, Scope, Term, Ticket);
+                (_, Problem)-> Problem
+              end,
+              true,
+              Tickets
+            ),
+          case Taken of
+            true-> settled(Client, Watch);
+            Problem-> Problem
+          end
       end
     end,
     ?DEADLINE
@@ -373,6 +416,108 @@ taken(Node, Client, Scope, Term, Ticket)->
       end;
     Entry->
       {not_taken, Node, Entry}
+  end.
+
+%%-----------------------------------------------------------------
+%%  The request the client waits with has settled: the client is
+%%  suspended in its receive - it has answered whatever it was
+%%  asked - and after that the managers are quiet, i.e. they have
+%%  handled the answer and what it set off. The order matters: the
+%%  answer is in the mailbox of the manager only once the client is
+%%  seen suspended. The caller sees to it that the manager has
+%%  taken the request (see lock_queued/6). The managers looked at
+%%  are those of the node of the client, of Nodes and of every
+%%  node connected to this one. The result is true or what is in
+%%  the way
+%%-----------------------------------------------------------------
+settled(Client, Nodes)->
+  case rpc(node(Client), erlang, process_info, [Client, status]) of
+    {status, waiting}->
+      quiet(lists:usort([node(Client) | Nodes] ++ nodes()));
+    Status->
+      {client_not_suspended, Client, Status}
+  end.
+
+%%-----------------------------------------------------------------
+%%  No manager of the nodes has anything to do, nor has it done
+%%  anything lately: every one of them is suspended with an empty
+%%  mailbox in two looks in a row and its reductions have not moved
+%%  in between. One look is not enough. The managers are looked at
+%%  one after another: a manager seen idle may get a probe passed
+%%  on right after by a manager that is seen idle as well when its
+%%  turn comes. The second look tells: a manager that has got a
+%%  message since the first one has it in its mailbox, runs, or has
+%%  run - its reductions have moved. If nothing moved, then between
+%%  the two looks no manager ran and no mailbox of theirs had a
+%%  message, so there was nobody to send one: the managers are at
+%%  rest, all at the same moment. A manager that came or went in
+%%  between is a change as well. The result is true or what is in
+%%  the way
+%%-----------------------------------------------------------------
+quiet(Nodes)->
+  Look = fun()-> [ {Node, managers_work(Node)} || Node <- Nodes ] end,
+  First = Look(),
+  case [ Busy || {_Node, Managers} <- First, Busy <- busy(Managers) ] of
+    []->
+      case Look() of
+        First-> true;
+        Second-> {managers_not_quiet, First, Second}
+      end;
+    Busy->
+      {managers_busy, Busy}
+  end.
+
+% What the managers of the node are doing: [{Manager, Work}] or what
+% is wrong with the node
+managers_work(Node) when Node =:= node()->
+  managers_work();
+managers_work(Node)->
+  rpc:call(Node, ?MODULE, managers_work, []).
+
+% The managers are the ones the lock entries of the scopes of the
+% node name, sorted: two looks at the same managers are equal terms.
+% An entry without a pid is a manager that is starting, a dead
+% manager has nothing to do
+managers_work()->
+  lists:sort([ {Manager, work(Manager)} || Scope <- scopes(), {_Term, Manager, _Ticket} <- entries(Scope) ]).
+
+work(Manager) when is_pid(Manager)->
+  process_info(Manager, [message_queue_len, status, reductions]);
+work(_NotRegistered)->
+  starting.
+
+% The managers that are not at rest
+busy(Managers) when is_list(Managers)->
+  [ M || {_Manager, Work} = M <- Managers, not at_rest(Work) ];
+busy(NodeProblem)->
+  [NodeProblem].
+
+at_rest(undefined)->
+  true;
+at_rest([{message_queue_len, 0}, {status, waiting}, {reductions, _}])->
+  true;
+at_rest(_Work)->
+  false.
+
+% The scopes of the node: the pg scope of a scope is registered as
+% <Scope>_$pg$ (see elock:start_link/1)
+scopes()->
+  lists:filtermap(
+    fun(Name)->
+      case string:split(atom_to_list(Name), "_$pg$", trailing) of
+        [Scope, ""]->
+          {true, list_to_atom(Scope)};
+        _->
+          false
+      end
+    end,
+    registered()
+  ).
+
+% The entries of the scope, none if its table is gone
+entries(Scope)->
+  try ets:tab2list(Scope)
+  catch error:badarg-> []
   end.
 
 unlock(Client, LockRef)->
@@ -563,6 +708,57 @@ collected(Collector, Count)->
 %%-----------------------------------------------------------------
 stop_collectors()->
   stop_spawned(?COLLECTORS).
+
+%%=================================================================
+%%  Compiler
+%%
+%%  A receive that waits for a message carrying a fresh reference
+%%  does not scan the messages that were in the mailbox before the
+%%  reference was made - if the compiler can follow the reference
+%%  from its creation to the receive. It follows a plain variable
+%%  through the local calls only: a reference taken out of a record
+%%  compiles and works, the receive just scans the whole mailbox.
+%%  Nothing but the compiler tells the difference
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  What the compiler reports about the receives of the module (the
+%%  recv_opt_info option), in the order of the source:
+%%  [{{Function, Arity}, Info}], where Info is
+%%  * reserved_receive_marker - a reference made here marks the
+%%    mailbox position
+%%  * passed_marker - and is passed on to a call
+%%  * {used_receive_marker, {parameter, N}} - every clause of the
+%%    receive matches the reference in the parameter N
+%%  * unoptimized_selective_receive and the other complaints of
+%%    beam_ssa_recv as they are
+%%  The source is compiled once more the way the loaded module was
+%%  (its include paths and macros), in memory: the loaded module is
+%%  not touched
+%%-----------------------------------------------------------------
+recv_opt_info(Module)->
+  Compile = Module:module_info(compile),
+  Source = proplists:get_value(source, Compile),
+  Options = [ Option || Option <- proplists:get_value(options, Compile, []),
+    is_tuple(Option), lists:member(element(1, Option), [i, d]) ],
+  {ok, Module, Binary, Warnings} = compile:file(Source, [recv_opt_info, return, binary, debug_info | Options]),
+  {ok, {Module, [{abstract_code, {raw_abstract_v1, Forms}}]}} = beam_lib:chunks(Binary, [abstract_code]),
+  Functions = [ {erl_anno:line(Anno), {Name, Arity}} || {function, Anno, Name, Arity, _Clauses} <- Forms ],
+  [ {function_at(Location, Functions), recv_info(Info)}
+    || {_File, FileWarnings} <- Warnings, {Location, beam_ssa_recv, Info} <- lists:sort(FileWarnings) ].
+
+% The function the location belongs to: the last one that starts at
+% or before its line
+function_at({Line, _Column}, Functions)->
+  function_at(Line, Functions);
+function_at(Line, Functions)->
+  {_Start, Function} = lists:last([ F || {Start, _} = F <- lists:sort(Functions), Start =< Line ]),
+  Function.
+
+% The creation site of a passed marker is an internal term of the compiler
+recv_info({passed_marker, _CreatedBy})->
+  passed_marker;
+recv_info(Info)->
+  Info.
 
 %%=================================================================
 %%  Utilities

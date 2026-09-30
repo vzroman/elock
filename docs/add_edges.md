@@ -37,6 +37,10 @@ request.
 3. A manager that queues a request sends `#queued{}` when it needs the
    map, the client answers with `#add_held_locks{}`. A request that
    holds nothing and asks a single node is never asked.
+4. The client waits are receive-optimized: the workers are monitored
+   with the request `Ref` as the tag and `Ref` is passed as its own
+   argument down the wait chain, so the loops skip every message that
+   was in the mailbox before the request started.
 
 The manager feeds the graph at one point only: `elock_graph:add_edges/5`
 (the renamed `add_held_locks/4`). The old `add_edges/2` is gone.
@@ -91,7 +95,7 @@ graph function that consumes it is renamed.
 | Request                          | Path                                        | Proxy                                       | Answer                                                                        |
 |----------------------------------|---------------------------------------------|---------------------------------------------|-------------------------------------------------------------------------------|
 | single node, local               | `elock_manager:lock/2` in the client itself | the client                                  | `Manager ! #add_held_locks{}` from `elock_manager:wait_verdict/3`             |
-| single node remote, multi node   | workers + `elock:wait_verdict/1`            | the process spawned by ecall/erpc on the node | proxy forwards with `ecall:send/2`, the client answers with `ecall:send/2` |
+| single node remote, multi node   | workers + `elock:wait_verdict/2`            | the process spawned by ecall/erpc on the node | proxy forwards with `ecall:send/2`, the client answers with `ecall:send/2` |
 
 A single remote node request today calls `ecall:call/4`, which blocks
 the client in a selective receive on ecall's own reference: a forwarded
@@ -153,11 +157,14 @@ Request = #request{
 },
 ```
 
-The map is not built and not put into the request.
+The map is not built and not put into the request. The call is
+`run_request(Ref, Request, HeldLocks)` with `Ref` the variable returned
+by `make_ref()`, not the copy in the record (see *Mark the mailbox
+position*).
 
-### `run_request/2`
+### `run_request/3`
 
-`run_request(Request, HeldLocks)`, `HeldLocks = held_locks(Context)`
+`run_request(Ref, Request, HeldLocks)`, `HeldLocks = held_locks(Context)`
 from `lock/4` - a pointer to the map in the context, no copy. Two
 clauses instead of three:
 
@@ -165,13 +172,19 @@ clauses instead of three:
   `elock_manager:lock(Request, HeldLocks)`, result mapped to
   `{ok, #{ Node => Manager }}` as today;
 * everything else - a single remote node or several nodes: the worker
-  path as today (`spawn_monitor` of `ecall_connection:call/4` per
-  node, `wait_verdict/1`) with `HeldLocks` in `#waiting.held`. The
-  single remote node clause is deleted.
+  path, one worker per node running `ecall_connection:call/4`, started
+  with `spawn_opt(Fun, [{monitor, [{tag, Ref}]}])` instead of
+  `spawn_monitor/1`, then `wait_verdict(Ref, Waiting)` with `HeldLocks`
+  in `#waiting.held`. `pending` still maps the monitor references to
+  the nodes. The single remote node clause is deleted.
 
-### `wait_verdict/1`
+### `wait_verdict/2`
 
-`#waiting{}` gets a `held` field: the client's held map.
+`wait_verdict(Ref, #waiting{})`: `Ref` is the first argument, the
+record keeps its copy. `#waiting{}` gets a `held` field: the client's
+held map. The down clause becomes
+`{Ref, MonRef, process, _Pid, NodeResult} when is_map_key(MonRef, Pending0)`,
+so every clause of the receive matches `Ref`.
 
 On `#queued{ref = Ref, manager = Manager, node = Node}`:
 
@@ -183,33 +196,55 @@ On `#queued{ref = Ref, manager = Manager, node = Node}`:
    the map is not rebuilt;
 2. record `Queued#{ Node => Manager }` as today.
 
-On a grant (`'DOWN'` with `{ok, {ok, Manager}}`): as today, the grant
-alone - `#{ {Scope, Term, Node} => Manager }` - goes to every queued
-manager.
+On a grant (`{Ref, MonRef, process, _, {ok, {ok, Manager}}}`): as
+today, the grant alone - `#{ {Scope, Term, Node} => Manager }` - goes
+to every queued manager.
 
 `notify_queued/5` becomes a plain "send this held map to these
 managers" helper used by both; the two call sites build the map.
 
-`wait_unlock/2` does not change: a withdrawn request answers `#queued{}`
-with `#unlock{}`, the held locks are not needed.
+`wait_unlock/2` becomes `wait_unlock(Ref, Pending)` with the same down
+clause shape; a withdrawn request still answers `#queued{}` with
+`#unlock{}`, the held locks are not needed.
 
-### Optional: mark the mailbox position with the request ref
+### Mark the mailbox position with the request ref
 
-Both client waits are not receive-optimized today (`erlc +recv_opt_info`:
-"all clauses do not match a suitable reference") because the `'DOWN'`
-clauses carry the monitor references, not `Ref`. If the workers are
-started with
+The compiler lets a receive skip the messages that were in the mailbox
+before a reference was created when every clause matches that one
+reference and the reference reaches the receive as a plain variable
+from its creation (`make_ref/0`, `erlang:monitor/2`, ...). A record,
+map or closure on the way ends the trace. Today `wait_verdict/1`
+matches a monitor reference per node through `is_map_key/2`, the
+`#queued{}` clause matches `Ref`, and `Ref` travels inside `#request{}`
+and `#waiting{}`: `erlc +recv_opt_info` reports "all clauses do not
+match a suitable reference" for both waits.
 
-```erlang
-spawn_opt(Fun, [{monitor, [{tag, Ref}]}])
-```
+Two changes, both required:
 
-the down message is `{Ref, MonRef, process, Pid, Reason}`, every clause
-of `wait_verdict/1` and `wait_unlock/2` matches `Ref`, and the compiler
-optimizes the receive (verified on OTP 27 with `Ref` made two calls up
-the stack: "all clauses match reference in function parameter"). The
-loop then skips every message that was in the mailbox before the
-request started. Independent of the rest, can be left out.
+1. the workers are started with
+   `spawn_opt(Fun, [{monitor, [{tag, Ref}]}])`, so the down message is
+   `{Ref, MonRef, process, Pid, Reason}` and every clause of
+   `wait_verdict/2` and `wait_unlock/2` matches `Ref`;
+2. `Ref` is passed as its own argument from `make_ref()` in `lock/4`
+   down the whole chain: `run_request/3`, `wait_verdict/2`,
+   `wait_unlock/2`. The records keep their copies, the receives match
+   the parameter. A `Ref` taken out of a record anywhere in the chain
+   leaves the receive unoptimized.
+
+Verify with `erlc +recv_opt_info`; two messages are required:
+"reference used to mark a message queue position" at the `make_ref()`
+line of `lock/4` and "all clauses match reference in function
+parameter N" at each receive. The second alone proves nothing: without
+the first the marker is never bound and the receive scans from the head.
+
+Measured on OTP 27.2.3, one wait for three workers, us per request with
+N messages already in the mailbox:
+
+| N      | today | tag, `Ref` out of the records | tag, `Ref` as argument |
+|--------|-------|-------------------------------|------------------------|
+| 1000   | 21    | 19                            | 5                      |
+| 10000  | 77    | 78                            | 6                      |
+| 100000 | 724   | 746                           | 3                      |
 
 ## Manager: `elock_manager`
 

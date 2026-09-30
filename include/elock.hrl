@@ -12,8 +12,9 @@
   term,
   client,
   proxy,
+  tag,
   shared,
-  held,
+  held_count,
   nodes,
   timeout
 }).

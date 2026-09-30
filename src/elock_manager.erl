@@ -38,12 +38,25 @@
 %%	API
 %%=================================================================
 -export([
-  lock/1
+  lock/1, lock/2
 ]).
 
 %%=================================================================
 %%  Client <-> manager protocol
 %%=================================================================
+%%-----------------------------------------------------------------
+%%  Every message from the manager to the proxy of a request goes
+%%  in this shape, the verdicts and #queued{} alike. Tag is the
+%%  reference of the monitor the proxy has set on the manager for
+%%  the attempt, it comes with the request (#request.tag). The
+%%  proxy makes it right before it sends the request, hence its
+%%  receive matches the tag alone and skips whatever was in the
+%%  mailbox before (see wait_verdict/4). Both sides go through the
+%%  macro: the manager builds the message with it, the proxy matches
+%%  it
+%%-----------------------------------------------------------------
+-define(reply(Tag, Message), {Tag, Message}).
+
 %%-----------------------------------------------------------------
 %%  The verdict on a queued request. #retry{} means the manager has
 %%  already passed the ticket by, the client has to take a new one.
@@ -62,13 +75,36 @@
 
 %%=================================================================
 %%  Client side
+%%
+%%  The process that takes the ticket and waits for the verdict is
+%%  the proxy of the request. It is either the client itself or a
+%%  process that runs the request on its behalf, and the manager
+%%  may ask it for the locks the client holds (see wait_verdict/4)
 %%=================================================================
+%%-----------------------------------------------------------------
+%%  Proxy mode, the remote apply: the process runs the request on
+%%  behalf of the client (see elock:run_request/3), it does not have
+%%  the locks the client holds
+%%-----------------------------------------------------------------
 -spec lock(#request{}) ->
   {ok, pid()} | {error, timeout | {deadlock, {atom(), term(), node()}}}.
-lock(#request{
-  scope = Scope,
-  term = Term
-} = Request
+lock(Request)->
+  lock(Request, undefined).
+
+%%-----------------------------------------------------------------
+%%  The body of both modes, HeldLocks tells them apart:
+%%  * a map - client mode: the process is the client itself, the
+%%    map is the locks it holds
+%%  * undefined - proxy mode (see lock/1)
+%%-----------------------------------------------------------------
+-spec lock(#request{}, #{{atom(), term(), node()} => pid()} | undefined) ->
+  {ok, pid()} | {error, timeout | {deadlock, {atom(), term(), node()}}}.
+lock(
+    #request{
+      scope = Scope,
+      term = Term
+    } = Request,
+    HeldLocks
 )->
   case ets:update_counter(Scope, Term, {3,1}, {Term,0,0}) of % try to set lock
     1->
@@ -86,45 +122,75 @@ lock(#request{
         Manager when is_pid(Manager) ->
           % The verdict lives in the manager's mailbox. If the manager
           % exits before it has replied then the request goes with the
-          % mailbox and nobody will ever answer - monitor it
+          % mailbox and nobody will ever answer - monitor it. The
+          % monitor reference is also the tag of the replies (see
+          % ?reply) and the mark of the mailbox position for the wait:
+          % it goes to wait_verdict/4 as an argument of its own
           MonitorRef = erlang:monitor(process, Manager),
-          Manager ! Request#request{ queue = RequestQueue, proxy = self() },
-          Verdict = wait_verdict(Manager, Request),
+          Manager ! Request#request{ queue = RequestQueue, proxy = self(), tag = MonitorRef },
+          Verdict = wait_verdict(MonitorRef, Manager, Request, HeldLocks),
           erlang:demonitor(MonitorRef, [flush]),
           case Verdict of
             retry ->
-              lock(Request);
+              lock(Request, HeldLocks);
             _->
               Verdict
           end;
         _->
-          lock(Request)
+          lock(Request, HeldLocks)
       end
   end.
 
+%%-----------------------------------------------------------------
+%%  MonitorRef is an argument of its own and every clause of the
+%%  receive matches it: the receive skips the messages that were in
+%%  the mailbox before the monitor was set (see erlang:monitor/2 in
+%%  lock/2). The request Ref would not do: it is made in elock, on
+%%  another node when the process is a proxy, and the compiler
+%%  follows a reference only from its creation down the local
+%%  calls. The tag alone tells the attempt, every attempt has a
+%%  monitor of its own, hence the ref inside the message is not
+%%  matched.
+%%
+%%  #queued{} is not a verdict: the request waits and the manager
+%%  asks for the locks the client holds (see notify_queued/1). Who
+%%  answers depends on the mode:
+%%  * HeldLocks is undefined, a proxy - the question is passed on to
+%%    the client as it is, without the tag (see elock:wait_verdict/2)
+%%  * HeldLocks is a map, the client itself - it answers with the
+%%    map. Passing the question on would send it back to this very
+%%    process
+%%-----------------------------------------------------------------
 wait_verdict(
+    MonitorRef,
     Manager,
     #request{
       ref = Ref,
       scope = Scope,
       term = Term,
       client = ClientPID
-    } = Request
+    } = Request,
+    HeldLocks
 )->
   receive
-    #locked{ref = Ref}->
+    ?reply(MonitorRef, #locked{})->
       {ok, Manager};
-    #queued{ref = Ref} = Queued->
-      catch ecall:send(ClientPID, Queued),
-      wait_verdict(Manager, Request);
-    #deadlock{ref = Ref, winner = Winner}->
+    ?reply(MonitorRef, #queued{} = Queued)->
+      case HeldLocks of
+        undefined ->
+          catch ecall:send(ClientPID, Queued);
+        _->
+          Manager ! #add_held_locks{ref = Ref, held = HeldLocks}
+      end,
+      wait_verdict(MonitorRef, Manager, Request, HeldLocks);
+    ?reply(MonitorRef, #deadlock{winner = Winner})->
       {error, {deadlock, Winner}};
-    #timeout{ref = Ref}->
+    ?reply(MonitorRef, #timeout{})->
       {error, timeout};
-    #retry{ref = Ref}->
+    ?reply(MonitorRef, #retry{})->
       % The ticket is not valid any longer, start over
       retry;
-    {'DOWN', _Ref, process, Manager, _Reason}->
+    {'DOWN', MonitorRef, process, Manager, _Reason}->
       % The manager is gone and the request went with it.
       % The lock entry is removed before the manager exits,
       % so the new ticket starts the next round
@@ -180,7 +246,7 @@ start_manager(Request)->
   last,             % the last ticket taken into the queue
   postponed,        % the requests that came before their turn
   postpone_timer,   % set while waiting for a missing ticket
-  graph             % the locks held by the waiters (see elock_graph)
+  graph             % the locks the waiters have reported (see elock_graph)
 }).
 
 -record(req,{
@@ -188,7 +254,9 @@ start_manager(Request)->
   ref,              % unique reference of the request
   queue,            % the ticket, the key of the request in #state.queue
   proxy,            % the process waiting for the verdict
+  tag,              % #request.tag, on every message to the proxy (see ?reply)
   shared,           % the requested lock type
+  held_count,       % #request.held_count, the weight in the graph
   has_lock,         % true - holds the lock, false - waits in the queue
   timer             % the timeout timer, only while waiting
 }).
@@ -334,11 +402,12 @@ handle_request(
 handle_request(
     #request{
       ref = Ref,
-      proxy = Proxy
+      proxy = Proxy,
+      tag = Tag
     },
     State
 )->
-  catch Proxy ! #retry{ref = Ref},
+  catch Proxy ! ?reply(Tag, #retry{ref = Ref}),
   State.
 
 %%-----------------------------------------------------------------
@@ -381,10 +450,11 @@ handle_postponed(#state{
 handle_postponed(#state{
   postponed = [#request{
     ref = Ref,
-    proxy = Proxy
+    proxy = Proxy,
+    tag = Tag
   }|Rest]
 } = State)->
-  catch Proxy ! #retry{ref = Ref},
+  catch Proxy ! ?reply(Tag, #retry{ref = Ref}),
   handle_postponed(State#state{
     postponed = Rest
   });
@@ -548,8 +618,8 @@ handle_timeout(
     } = State0
 )->
   case Requests of
-    #{Ref := #req{ has_lock = false, proxy = Proxy } = Req}->
-      catch Proxy ! #timeout{ref = Ref},
+    #{Ref := #req{ has_lock = false, proxy = Proxy, tag = Tag } = Req}->
+      catch Proxy ! ?reply(Tag, #timeout{ref = Ref}),
       % The timer has just fired, there is nothing to cancel. Cancelling
       % it here would cost a round trip to the scheduler that owns it -
       % a fired timer is no longer in the manager's own timer tree
@@ -575,9 +645,10 @@ handle_deadlock(
   case Requests of
     #{Ref := Req = #req{
       has_lock = false,
-      proxy = Proxy
+      proxy = Proxy,
+      tag = Tag
     }}->
-      catch Proxy ! Deadlock,
+      catch Proxy ! ?reply(Tag, Deadlock),
       State = dequeue(Req, State0),
       next(State);
     _->
@@ -711,9 +782,9 @@ kill_proxy(#req{
   proxy = Proxy
 })->
   if
-  % For a multi node lock the verdict is awaited not by the
-  % client itself but by a worker on its behalf. There is
-  % nobody to serve any more
+  % For a remote or a multi node lock the verdict is awaited not
+  % by the client itself but by a process on its behalf (see
+  % lock/1). There is nobody to serve any more
     is_pid(Proxy), Proxy =/= ClientPID ->
       exit(Proxy, kill);
     true ->
@@ -724,28 +795,33 @@ kill_proxy(#req{
 %%-----------------------------------------------------------------
 %%  The #req{} of a new request. The ticket is what keys it in
 %%  #state.queue, has_lock is turned on by locked/2 when the request
-%%  gets the lock
+%%  gets the lock. held_count is the weight of the request in the
+%%  graph for as long as it waits (see handle_add_held_locks/2)
 %%-----------------------------------------------------------------
 new_req(#request{
   client = ClientPID,
   ref = Ref,
   queue = Ticket,
   proxy = Proxy,
-  shared = Shared
+  tag = Tag,
+  shared = Shared,
+  held_count = HeldCount
 })->
   #req{
     client = ClientPID,
     ref = Ref,
     queue = Ticket,
     proxy = Proxy,
+    tag = Tag,
     shared = Shared,
+    held_count = HeldCount,
     has_lock = false
   }.
 
 %%-----------------------------------------------------------------
-%%  The client starts waiting here: the deadlock probe is sent off
-%%  and the timeout timer lives as long as the request is in the
-%%  queue
+%%  The client starts waiting here: it is asked for the locks the
+%%  request holds (see start_waiting/1) and the timeout timer lives
+%%  as long as the request is in the queue
 %%-----------------------------------------------------------------
 enqueue(
     #request{
@@ -757,12 +833,11 @@ enqueue(
     #state{
       queue = Queue0,
       requests = Requests0,
-      clients = Clients0,
-      graph = Graph0
+      clients = Clients0
     } = State
 )->
 
-  {Req, Graph} = start_waiting(Request, Graph0),
+  Req = start_waiting(Request),
   Requests = Requests0#{
     Ref => Req
   },
@@ -775,8 +850,7 @@ enqueue(
   State#state{
     queue = Queue,
     requests = Requests,
-    clients = Clients,
-    graph = Graph
+    clients = Clients
   }.
 
 %%-----------------------------------------------------------------
@@ -791,11 +865,10 @@ enqueue_barging(
     } = Request,
     #state{
       requests = Requests0,
-      clients = Clients0,
-      graph = Graph0
+      clients = Clients0
     } =State
 )->
-  {Req, Graph} = start_waiting(Request, Graph0),
+  Req = start_waiting(Request),
   Requests = Requests0#{
     Ref => Req
   },
@@ -804,8 +877,7 @@ enqueue_barging(
   State#state{
     requests = Requests,
     clients = Clients,
-    barging = Request,
-    graph = Graph
+    barging = Request
   }.
 
 %%-----------------------------------------------------------------
@@ -901,6 +973,7 @@ locked(
       ref = Ref,
       queue = Ticket,
       proxy = Proxy,
+      tag = Tag,
       shared = Shared
     } = Req0,
     #state{
@@ -911,7 +984,7 @@ locked(
       graph = Graph0
     } = State)->
 
-  catch Proxy ! #locked{ref = Ref},
+  catch Proxy ! ?reply(Tag, #locked{ref = Ref}),
   {Req, Graph} = stop_waiting(
     Req0#req{
       has_lock = true,
@@ -988,7 +1061,8 @@ try_barging(
       ref = Ref,
       client = ClientPID,
       shared = Shared,
-      proxy = Proxy
+      proxy = Proxy,
+      tag = Tag
     } = Request,
     #state{
       holders = Holders,
@@ -1028,7 +1102,7 @@ try_barging(
     true->
       % Client requested lock upgrade, but there is already another client
       % waiting for upgrade - deadlock. The first enqueued wins.
-      catch Proxy ! #deadlock{ref = Ref, winner = {Scope, Term, node()}},
+      catch Proxy ! ?reply(Tag, #deadlock{ref = Ref, winner = {Scope, Term, node()}}),
       State
   end.
 
@@ -1168,17 +1242,22 @@ try_unlock(#state{
 %%  Deadlock probes
 %%
 %%  The wait-for graph and the probe protocol live in elock_graph,
-%%  the manager feeds it: a request joins the graph when it starts
-%%  waiting and leaves it when it stops (see start_waiting/2 and
-%%  stop_waiting/2). The grants a multi node request gets on the
-%%  other nodes meanwhile and the probes of the other managers come
-%%  in here
+%%  the manager feeds it at one point: a waiting request joins the
+%%  graph when its client reports the locks it holds (see
+%%  handle_add_held_locks/2) and leaves it when it stops waiting
+%%  (see stop_waiting/2). The probes of the other managers come in
+%%  here as well
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  A waiting request has been granted on another node. The hold
-%%  joins its held map in the graph and is probed: it adds wait-for
-%%  edges and may be the very edge that closes a cycle, and only the
-%%  request that gained it can see that
+%%  The locks a waiting request holds: the answer of the client to
+%%  #queued{} (see start_waiting/1) - the locks it held when it
+%%  asked and the grants of a multi node request so far - or a
+%%  grant the request has got on another node since then. They join
+%%  its held map in the graph and are probed: a hold adds wait-for
+%%  edges and may be the very edge that closes a cycle, and only
+%%  the request that has it can see that. The weight is the held
+%%  count of the request whatever comes in, the grants do not
+%%  change it (see elock_graph)
 %%-----------------------------------------------------------------
 handle_add_held_locks(
     #add_held_locks{
@@ -1194,9 +1273,10 @@ handle_add_held_locks(
 )->
   case Requests of
     #{Ref := #req{
-      has_lock = false
+      has_lock = false,
+      held_count = Weight
     }}->
-      Graph = elock_graph:add_held_locks(Ref, {Scope, Term, node()}, Update, Graph0),
+      Graph = elock_graph:add_edges(Ref, {Scope, Term, node()}, Update, Weight, Graph0),
       State#state{
         graph = Graph
       };
@@ -1314,22 +1394,17 @@ only_holder(ClientRequests, Holders, Waiting)->
   map_size(ClientRequests) - Waiting =:= map_size(Holders).
 
 %%-----------------------------------------------------------------
-%%  A request starts waiting: the client of a multi node request is
-%%  told where it queued up (it answers with #add_held_locks{} as
-%%  the other nodes grant), the timeout timer is set for as long as
-%%  the request waits, and the request joins the wait-for graph,
-%%  which probes the locks it holds (see elock_graph)
+%%  A request starts waiting: the client is asked for the locks the
+%%  request holds (see notify_queued/1) and the timeout timer is set
+%%  for as long as the request waits. The graph is not touched here,
+%%  the request joins it when the client answers (see
+%%  handle_add_held_locks/2)
 %%-----------------------------------------------------------------
-start_waiting(
-    #request{
-      timeout = Timeout
-    } = Request,
-    Graph0
-)->
+start_waiting(#request{
+  timeout = Timeout
+} = Request)->
   notify_queued(Request),
-  Req = start_timer(new_req(Request), Timeout),
-  Graph = elock_graph:add_edges(Request, Graph0),
-  {Req, Graph}.
+  start_timer(new_req(Request), Timeout).
 
 stop_waiting(
     #req{
@@ -1341,18 +1416,33 @@ stop_waiting(
   Graph = elock_graph:remove_edges(Ref, Graph0),
   {Req, Graph}.
 
+%%-----------------------------------------------------------------
+%%  #queued{} tells the client that its request waits here and asks
+%%  for the locks the request holds. The client answers with
+%%  #add_held_locks{}: at once with the locks it held when it asked,
+%%  then with every grant a multi node request gets on the other
+%%  nodes. The request does not carry the map itself - most of the
+%%  requests never wait. It is sent when the request holds or may
+%%  hold something:
+%%  * the client held locks when it asked (held_count > 0), or
+%%  * the request names several nodes and gains their grants
+%%  A request that holds nothing and asks a single node can not be
+%%  on a cycle, its client is not asked
+%%-----------------------------------------------------------------
 notify_queued(#request{
   ref = Ref,
   proxy = Proxy,
+  tag = Tag,
+  held_count = HeldCount,
   nodes = Nodes
 })->
   if
-    length(Nodes) > 1->
-      Proxy ! #queued{
+    HeldCount > 0; length(Nodes) > 1->
+      Proxy ! ?reply(Tag, #queued{
         ref = Ref,
         manager = self(),
         node = node()
-      };
+      });
     true ->
       ignore
   end.

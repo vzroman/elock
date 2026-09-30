@@ -3,25 +3,38 @@
 %%
 %%  A waiter depends on every holder of its Term, and a holder that
 %%  is itself waiting for another Term carries the dependency on - a
-%%  deadlock is a cycle of such dependencies. #request.held is the
-%%  set of the locks the client held when it made the request, i.e.
-%%  the terms the request holds while it waits. A lock is
-%%  {Scope, Term, Node}: the scopes are separate heaps of locks, but
-%%  a cycle through several of them blocks like any other, hence the
-%%  held map spans the scopes and the key carries the scope - the
-%%  same Term in two scopes is two locks. A multi node request
-%%  is granted node by node: every grant the client gets while the
-%%  request still waits comes in as #add_held_locks{} and joins the
-%%  held map (see add_held_locks/4).
+%%  deadlock is a cycle of such dependencies. The held map of a
+%%  request is the set of the locks it holds while it waits. A lock
+%%  is {Scope, Term, Node}: the scopes are separate heaps of locks,
+%%  but a cycle through several of them blocks like any other, hence
+%%  the held map spans the scopes and the key carries the scope -
+%%  the same Term in two scopes is two locks.
+%%
+%%  The held map does not come with the request: most of the
+%%  requests never wait. The manager asks the client for it when the
+%%  request has to wait, and every hold of a waiting request comes
+%%  in as #add_held_locks{} through add_edges/5: the locks the
+%%  client held when it made the request, and the grants of a multi
+%%  node request, which is granted node by node, as the client gets
+%%  them while the request still waits. The request is in the graph
+%%  from its first hold on. Until then it is a request that has not
+%%  asked yet, and one that holds nothing can not be on a cycle - it
+%%  stays out of the graph, no probe.
+%%
+%%  The weight of a request is its #request.held_count, the number
+%%  of the locks the client held when it made the request. It is the
+%%  same for the whole life of the request, the grants it gains do
+%%  not change it: every probe and every entry of the request carry
+%%  the same number at every manager it waits at, hence the managers
+%%  of a cycle, which weigh at different moments, name the same
+%%  loser.
 %%
 %%  There are no checker processes, the managers probe each other.
-%%  When a request starts waiting (the origin) the probe goes to the
-%%  manager of every lock it holds, except the origin manager itself
-%%  (a barging request holds the term it waits for), and every hold
-%%  it gains meanwhile is probed the same way: it adds wait-for
-%%  edges and may be the one that closes a cycle. A request that
-%%  holds nothing can not be on a cycle - it stays out of the graph,
-%%  no probe.
+%%  Every hold of a waiting request (the origin) is probed as it
+%%  comes in: it adds wait-for edges and may be the one that closes
+%%  a cycle. The probe goes to the manager of the lock, except the
+%%  origin manager itself (a barging request holds the term it waits
+%%  for).
 %%
 %%  A manager that receives the probe looks at its own waiters:
 %%    * a waiter that holds the lock the origin waits for closes a
@@ -46,12 +59,12 @@
 %%  already in place.
 %%
 %%  The graph is changed by the manager alone: a request joins it
-%%  when it starts waiting and leaves it when it stops. probe/3 only
-%%  names the closers to abort and forward/2 is called after the
-%%  aborts, on the graph as it is then - an abort pushes the queue
-%%  and may grant the lock to a later waiter, from then on it is a
-%%  holder, it does not depend on the origin and is not forwarded
-%%  for
+%%  when its holds come in and leaves it when it stops waiting (see
+%%  add_edges/5 and remove_edges/2). probe/3 only names the closers
+%%  to abort and forward/2 is called after the aborts, on the graph
+%%  as it is then - an abort pushes the queue and may grant the lock
+%%  to a later waiter, from then on it is a holder, it does not
+%%  depend on the origin and is not forwarded for
 %%=================================================================
 -module(elock_graph).
 
@@ -79,8 +92,7 @@
 %%	API
 %%=================================================================
 -export([
-  add_edges/2,
-  add_held_locks/4,
+  add_edges/5,
   remove_edges/2,
   probe/3,
   forward/2
@@ -90,94 +102,50 @@
 %%  The edges
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  A request starts waiting
+%%  The holds of a waiting request come in: Update is a held map,
+%%  Edge is the lock of this manager, the one the request waits
+%%  for, Weight is the held count of the request
 %%  the guard:
-%%  * the request holds nothing - it can not be on a cycle, it stays
-%%    out of the graph and there is nothing to probe
+%%  * the update is empty - nothing to add, nothing to probe. The
+%%    graph stays as it is, whether it exists or not: a request that
+%%    holds nothing does not start it
 %%-----------------------------------------------------------------
-add_edges(
-    #request{
-      held = Held
-    },
-    Graph
-) when map_size(Held) =:= 0 ->
+add_edges(_Ref, _Edge, Update, _Weight, Graph) when map_size(Update) =:= 0->
+  % TODO. Is it redundant?
   Graph;
-
-%%-----------------------------------------------------------------
-%%  The request joins the graph with the locks it holds and they are
-%%  probed. The weight is the number of them as of now and it stays
-%%  so (see the header)
-%%  the guard:
-%%  * the request holds something (the clause above)
-%%  * the graph exists
-%%-----------------------------------------------------------------
-add_edges(
-    #request{
-      ref = Ref,
-      scope = Scope,
-      term = Term,
-      held = Held
-    },
-    #graph{
-      edges = Edges0,
-      index = Index0
-    } = Graph0
-) when map_size(Held) > 0->
-
-  Weight = map_size(Held),
-  run_probe(Ref, {Scope, Term, node()}, Held, Weight),
-
-  Edges = add_holder(Ref, Weight, maps:keys(Held), Edges0),
-  Index = Index0#{
-    Ref => {Weight, Held}
-  },
-  Graph0#graph{
-    edges = Edges,
-    index = Index
-  };
-
-%%-----------------------------------------------------------------
-%%  The first waiter that holds something - the graph starts with it
-%%  the guard:
-%%  * there is no graph yet (the clauses above)
-%%-----------------------------------------------------------------
-add_edges(Request, _Graph)->
-  add_edges(Request, #graph{
-    edges = #{},
-    index = #{}
-  }).
 
 %%-----------------------------------------------------------------
 %%  The entries of the update the held map does not have yet join it
 %%  and are probed alone: they add wait-for edges and may be the very
-%%  edge that closes a cycle, and only the request that gained them
-%%  can see that. The weight stays as it was when the request asked
-%%  (see the header), a request that held nothing then is not in the
-%%  graph yet and joins with the weight 0. Edge is the lock of this
-%%  manager, the one the request waits for
+%%  edge that closes a cycle, and only the request that has them can
+%%  see that. A request that is not in the graph yet joins with the
+%%  given weight, one that is there keeps the weight it has joined
+%%  with (see the header)
 %%  the guard:
 %%  * the update is not empty (the clause above)
 %%  * the graph exists
 %%-----------------------------------------------------------------
-add_held_locks(
+add_edges(
     Ref,
     Edge,
     Update,
+    Weight,
     #graph{
       edges = Edges0,
       index = Index0
     } = Graph0
 )->
-  {Weight, Held0} = maps:get(Ref, Index0, {0, #{}}),
+  % TODO. Is new_held_locks redundant
+  {Weight0, Held0} = maps:get(Ref, Index0, {Weight, #{}}),
   case new_held_locks(Update, Held0) of
     New when map_size(New) =:= 0->
       Graph0;
     New->
-      run_probe(Ref, Edge, New, Weight),
+      run_probe(Ref, Edge, New, Weight0),
 
-      Edges = add_holder(Ref, Weight, maps:keys(New), Edges0),
+      Edges = add_holder(Ref, Weight0, maps:keys(New), Edges0),
       Index = Index0#{
-        Ref => {Weight, maps:merge(Held0, New)}
+        Ref => {Weight0, maps:merge(Held0, New)}
       },
       Graph0#graph{
         edges = Edges,
@@ -188,10 +156,11 @@ add_held_locks(
 %%-----------------------------------------------------------------
 %%  The first waiter that holds something - the graph starts with it
 %%  the guard:
+%%  * the update is not empty
 %%  * there is no graph yet (the clauses above)
 %%-----------------------------------------------------------------
-add_held_locks(Ref, Edge, Update, _Graph)->
-  add_held_locks(Ref, Edge, Update, #graph{
+add_edges(Ref, Edge, Update, Weight, _Graph)->
+  add_edges(Ref, Edge, Update, Weight, #graph{
     edges = #{},
     index = #{}
   }).
@@ -272,7 +241,8 @@ remove_edges(
         index = Index
       };
     _->
-      % the request held nothing, it has never been in the graph
+      % the request has never been in the graph: it holds nothing,
+      % or its holds have not come in yet
       Graph0
   end;
 
@@ -417,13 +387,13 @@ drop_coin(Ref1, Ref2)->
   element(Winner, Tie).
 
 %%-----------------------------------------------------------------
-%%  The probe of a waiting request for the locks it holds - the whole
-%%  held map when it starts waiting, the new entries as it gains
-%%  them. It goes to the manager of each of them, except this very
-%%  manager: a barging request holds the term it waits for. Edge is
-%%  the lock of this manager, the one the origin waits for. sent_to
-%%  names every manager the probe has been sent to, this one
-%%  included, before it goes
+%%  The probe of a waiting request for the holds that have just come
+%%  in: the locks of its client, the grants as it gains them (see
+%%  add_edges/5). It goes to the manager of each of them, except
+%%  this very manager: a barging request holds the term it waits
+%%  for. Edge is the lock of this manager, the one the origin waits
+%%  for. sent_to names every manager the probe has been sent to,
+%%  this one included, before it goes
 %%-----------------------------------------------------------------
 run_probe(Ref, Edge, Held, Weight)->
   Self = self(),

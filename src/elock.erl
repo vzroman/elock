@@ -27,8 +27,11 @@
 -define(pg_scope(Scope),list_to_atom(atom_to_list(Scope)++"_$pg$")).
 
 -record(context,{
-  ref2lock,
-  locked
+  ref2lock,   % #{ Ref => #lock{} }
+  locked,     % #{ {Scope, Term, Node} => Manager } - the held map, sent as is
+  counts      % #{ {Scope, Term, Node} => N } for N >= 2 only: the keys held
+              % by more than one request of the client. A key absent here
+              % is held once
 }).
 
 -record(lock,{
@@ -86,12 +89,15 @@ lock(Scope, Term, Nodes, Options)->
     scope = Scope,
     term = Term,
     nodes = lists:usort(Nodes),
-    held = HeldLocks,
+    held_count = held_count(Context),
     client = self(),
     timeout = Timeout,
     shared = IsShared
   },
-  case run_request(Request) of
+  % Ref goes as an argument of its own, not as the copy in the request:
+  % it marks the mailbox position for the receives of the wait (see
+  % wait_verdict/2)
+  case run_request(Ref, Request, HeldLocks) of
     {ok, LockedNodes} ->
       locked(Request, LockedNodes, Context),
       {ok, Ref};
@@ -131,7 +137,8 @@ locked(
     Nodes,
     #context{
       ref2lock = Ref2Lock0,
-      locked = Locked0
+      locked = Locked0,
+      counts = Counts0
     } = Context0
 )->
   Lock = #lock{
@@ -143,17 +150,19 @@ locked(
     Ref => Lock
   },
 
-  Locked = add_lock(Lock, Locked0),
+  {Locked, Counts} = add_lock(Lock, {Locked0, Counts0}),
 
   Context = Context0#context{
     ref2lock = Ref2Lock,
-    locked = Locked
+    locked = Locked,
+    counts = Counts
   },
   put_context(Context);
 locked(Request, Nodes, _NoContext)->
   Context = #context{
     ref2lock = #{},
-    locked = #{}
+    locked = #{},
+    counts = #{}
   },
   locked(Request, Nodes, Context).
 
@@ -163,7 +172,8 @@ unlock(
     Ref,
     #context{
       ref2lock = Ref2Lock0,
-      locked = Locked0
+      locked = Locked0,
+      counts = Counts0
     } = Context
 ) when is_map_key(Ref, Ref2Lock0)->
   {Lock, Ref2Lock} = maps:take(Ref, Ref2Lock0),
@@ -175,10 +185,11 @@ unlock(
     map_size(Ref2Lock) =:= 0 ->
       no_locks_remain;
     true ->
-      Locked = remove_lock(Lock, Locked0),
+      {Locked, Counts} = remove_lock(Lock, {Locked0, Counts0}),
       put_context(Context#context{
         ref2lock = Ref2Lock,
-        locked = Locked
+        locked = Locked,
+        counts = Counts
       })
   end,
   ok;
@@ -188,37 +199,45 @@ unlock(_UnexpectedRef, #context{} = Context)->
 unlock(_Ref, _NoContext)->
   ok.
 
-% Locked structure, the locks the process holds in every scope:
-% #{
-%   {Scope, Term, Node} => {Manager, Count}
+% The locks the process holds in every scope, {Locked, Counts}:
+% Locked = #{
+%   {Scope, Term, Node} => Manager
+% },
+% Counts = #{
+%   {Scope, Term, Node} => Count
 % }
 % A lock is keyed by its scope as well: the same Term may be locked
 % in several scopes on a node and those are different locks with
-% different managers. The whole map goes into #request.held (see
+% different managers. Locked is the held map in the form the managers
+% take it: it is sent as it is when a request has to wait (see
 % held_locks/1), hence a deadlock through several scopes is seen
-% like one within a scope (see elock_graph)
+% like one within a scope (see elock_graph). The re-entries are
+% counted aside for that: Counts has only the keys locked by more
+% than one request of the process, a key locked once is in Locked
+% alone
 add_lock(
     #lock{
       scope = Scope,
       term = Term,
       nodes = Nodes
     },
-    Locked
+    LockedCounts
 )->
   maps:fold(
-    fun(Node, Manager, Acc)->
+    fun(Node, Manager, {Locked, Counts})->
       Key = {Scope, Term, Node},
-      case Acc of
-        #{Key := {Manager, Count}}->
-          Acc#{ Key => {Manager, Count + 1}};
-        #{Key := {_StaleManager, StaleCount}}->
-          ?LOGWARNING("~p has stale lock: ~p, count: ~p",[self(), Key, StaleCount]),
-          Acc#{ Key => {Manager, 1}};
+      case Locked of
+        #{Key := Manager}->
+          Count = maps:get(Key, Counts, 1),
+          {Locked, Counts#{ Key => Count + 1 }};
+        #{Key := _StaleManager}->
+          ?LOGWARNING("~p has stale lock: ~p, count: ~p",[self(), Key, maps:get(Key, Counts, 1)]),
+          {Locked#{ Key => Manager }, maps:remove(Key, Counts)};
         _->
-          Acc#{ Key => {Manager, 1}}
+          {Locked#{ Key => Manager }, Counts}
       end
     end,
-    Locked,
+    LockedCounts,
     Nodes
   ).
 
@@ -228,34 +247,40 @@ remove_lock(
       term = Term,
       nodes = Nodes
     },
-    Locked
+    LockedCounts
 )->
   maps:fold(
-    fun(Node, Manager, Acc)->
+    fun(Node, Manager, {Locked, Counts} = Acc)->
       Key = {Scope, Term, Node},
-      case Acc of
-        #{Key := {Manager, Count}} ->
-          if
-            Count =:= 1 ->
-              maps:remove(Key, Acc);
-            true ->
-              Acc#{ Key => {Manager, Count - 1}}
+      case Locked of
+        #{Key := Manager} ->
+          case Counts of
+            #{Key := 2}->
+              {Locked, maps:remove(Key, Counts)};
+            #{Key := Count}->
+              {Locked, Counts#{ Key => Count - 1 }};
+            _->
+              {maps:remove(Key, Locked), Counts}
           end;
-        #{Key := {_NewManager, _Count}}->
+        #{Key := _NewManager}->
           ?LOGWARNING("~p unlocked stale lock ~p",[self(), Key]),
           Acc;
         _->
           Acc
       end
     end,
-    Locked,
+    LockedCounts,
     Nodes
   ).
 
+% The held map is kept ready to send, no copy is made
 held_locks(#context{locked = Locked})->
-  maps:map(fun(_Key, {Manager, _Count})-> Manager end, Locked);
+  Locked;
 held_locks(_NoContext)->
   #{}.
+
+held_count(Context)->
+  map_size(held_locks(Context)).
 
 ready_nodes(Scope)->
   [node(PID)|| PID <- pg:get_members(?pg_scope(Scope), {?MODULE,'$members$'})].
@@ -267,74 +292,90 @@ ready_nodes(Scope)->
   ref,
   scope,
   term,
-  pending,
-  nodes,
-  queued
+  held,       % #{ {Scope, Term, Node} => Manager } - the locks the client holds
+  pending,    % #{ MonRef => Node } - the workers that have not returned yet
+  nodes,      % #{ Node => Manager } - the grants so far
+  queued      % #{ Node => Manager } - the managers the request waits at
 }).
 
-run_request(#request{
-  nodes = [Node]
-} = Request) when Node =:= node() ->
-  case elock_manager:lock(Request) of
+% The lock of this node alone: the client runs the request itself and
+% answers its manager from HeldLocks (see elock_manager:lock/2)
+run_request(
+    _Ref,
+    #request{
+      nodes = [Node]
+    } = Request,
+    HeldLocks
+) when Node =:= node() ->
+  case elock_manager:lock(Request, HeldLocks) of
     {ok, Manager} ->
       {ok, #{ Node => Manager }};
     Error ->
       Error
   end;
-run_request(#request{
-  nodes = [Node]
-} = Request) ->
-  case ecall:call(Node, elock_manager, lock, [Request]) of
-    {ok, {ok, Manager}} ->
-      {ok, #{ Node => Manager }};
-    Error ->
-      Error
-  end;
-run_request(#request{
-  ref = Ref,
-  scope = Scope,
-  term = Term,
-  nodes = Nodes
-} = Request) ->
+% A remote node or several nodes: a worker per node makes the call and
+% exits with its result, the client itself stays in the receive to
+% answer the managers the request waits at (see wait_verdict/2). The
+% workers are monitored with Ref as the tag, hence every message of
+% the wait carries Ref
+run_request(
+    Ref,
+    #request{
+      scope = Scope,
+      term = Term,
+      nodes = Nodes
+    } = Request,
+    HeldLocks
+)->
   Pending =
     lists:foldl(
       fun(N, Acc)->
-        {_Pid, MonRef} = spawn_monitor(
+        {_Pid, MonRef} = spawn_opt(
           fun()->
             exit( ecall_connection:call(N, elock_manager, lock, [Request]) )
-          end
+          end,
+          [{monitor, [{tag, Ref}]}]
         ),
         Acc#{ MonRef => N }
       end,
       #{},
       Nodes
     ),
-  wait_verdict(#waiting{
+  wait_verdict(Ref, #waiting{
     ref = Ref,
     scope = Scope,
     term = Term,
+    held = HeldLocks,
     pending = Pending,
     nodes = #{},
     queued = #{}
   }).
 
-wait_verdict(#waiting{
-  ref = Ref,
-  scope = Scope,
-  term = Term,
-  pending = Pending0,
-  queued = Queued0,
-  nodes = Nodes0
-} = Waiting0)
-  when map_size(Pending0) > 0->
+% Ref is an argument of its own and every clause of the receive matches
+% it: the receive skips the messages that were in the mailbox before
+% the request was made (see make_ref/0 in lock/4). Taken out of
+% #waiting{} it would not do, the record is opaque to the compiler
+wait_verdict(
+    Ref,
+    #waiting{
+      scope = Scope,
+      term = Term,
+      held = Held0,
+      pending = Pending0,
+      queued = Queued0,
+      nodes = Nodes0
+    } = Waiting0
+) when map_size(Pending0) > 0->
   receive
-    {'DOWN', MonRef, process, _P, NodeResult} when is_map_key(MonRef, Pending0)->
+    {Ref, MonRef, process, _Pid, NodeResult} when is_map_key(MonRef, Pending0)->
       {Node, Pending} = maps:take(MonRef, Pending0),
       case NodeResult of
         {ok, {ok,Manager}} ->
 
+          % The grant alone, the managers have got the rest with
+          % the answers to their #queued{}
           Queued = maps:remove(Node, Queued0),
-          notify_queued(Queued, #{Node => Manager}, Scope, Term, Ref),
+          notify_queued(Queued, #{ {Scope, Term, Node} => Manager }, Ref),
 
           Nodes = Nodes0#{
             Node => Manager
@@ -344,35 +385,55 @@ wait_verdict(#waiting{
             queued = Queued,
             nodes = Nodes
           },
-          wait_verdict(Waiting);
+          wait_verdict(Ref, Waiting);
         Error ->
           unlock_nodes(Nodes0, Ref),
           % The copies still queued elsewhere are withdrawn as well,
           % otherwise they hold the queue behind them and carry the
           % held locks the client has released into the probes
           unlock_nodes(Queued0, Ref),
-          wait_unlock(Pending, Ref),
+          wait_unlock(Ref, Pending),
           Error
       end;
     #queued{ref = Ref, manager = Manager, node = Node}->
-      notify_queued(#{Node => Manager}, Nodes0, Scope, Term, Ref),
+      % The request waits at the Manager and it asks what the request
+      % holds: the locks of the client and the grants so far. The few
+      % grants are put into the map of the client, it is not rebuilt
+      Held =
+        maps:fold(
+          fun(N, M, Acc)->
+            Acc#{
+              {Scope, Term, N} => M
+            }
+          end,
+          Held0,
+          Nodes0
+        ),
+      notify_queued(#{Node => Manager}, Held, Ref),
       Queued = Queued0#{
         Node => Manager
       },
       Waiting = Waiting0#waiting{
         queued = Queued
       },
-      wait_verdict(Waiting)
+      wait_verdict(Ref, Waiting)
   end;
-wait_verdict(#waiting{
-  nodes = Nodes
-})->
+wait_verdict(
+    _Ref,
+    #waiting{
+      nodes = Nodes
+    }
+)->
   {ok, Nodes}.
 
-wait_unlock(Pending0, Ref)
+% The request has failed, the workers that have not returned yet are
+% waited for: a grant is released, a manager that reports the request
+% queued is told to drop it - the held locks are of no use to it.
+% The receive is marked by Ref like the one of wait_verdict/2
+wait_unlock(Ref, Pending0)
   when map_size(Pending0) > 0->
   receive
-    {'DOWN', MonRef, process, _P, NodeResult} when is_map_key(MonRef, Pending0)->
+    {Ref, MonRef, process, _Pid, NodeResult} when is_map_key(MonRef, Pending0)->
       Pending = maps:remove(MonRef, Pending0),
       case NodeResult of
         {ok, {ok, Manager}} ->
@@ -380,33 +441,24 @@ wait_unlock(Pending0, Ref)
         _->
           ignore
       end,
-      wait_unlock(Pending, Ref);
+      wait_unlock(Ref, Pending);
     #queued{ref = Ref, manager = Manager}->
       catch ecall:send(Manager, #unlock{ref = Ref}),
-      wait_unlock(Pending0, Ref)
+      wait_unlock(Ref, Pending0)
   end;
-wait_unlock(_Calls, _Ref)->
+wait_unlock(_Ref, _Pending)->
   ok.
 
-notify_queued(Queued, Locked, Scope, Term, Ref)
-  when map_size(Queued) > 0, map_size(Locked) > 0->
-  Held =
-    maps:fold(
-      fun(Node, Manager, Acc)->
-        Acc#{
-          {Scope, Term, Node} => Manager
-        }
-      end,
-      #{},
-      Locked
-    ),
+% Send the held map to the queued managers
+notify_queued(Queued, Held, Ref)
+  when map_size(Queued) > 0, map_size(Held) > 0->
   Message = #add_held_locks{
     ref = Ref,
     held = Held
   },
   [ catch ecall:send(Manager, Message) || Manager <- maps:values(Queued) ],
   ok;
-notify_queued(_Queued, _Locked, _Scope, _Term, _Ref)->
+notify_queued(_Queued, _Held, _Ref)->
   ok.
 
 %%=================================================================

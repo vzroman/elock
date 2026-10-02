@@ -1,15 +1,17 @@
 #!/usr/bin/env escript
 %%=================================================================
-%%  The performance of the working tree against a git revision of
+%%  The performance of the working tree against git revisions of
 %%  elock (a branch, a tag, a commit):
 %%
 %%    make perf
 %%    make perf PERF_BASE=main
+%%    make perf PERF_BASE="lazy_deadlock pool"
 %%
-%%  Both implementations are compiled into _build/perf. A run is a
+%%  The implementations are compiled into _build/perf. A run is a
 %%  scenario of elock_perf.erl at a number of clients in a VM of its
 %%  own with all the schedulers of the machine. The implementations
-%%  take turns, the table shows the median run of each.
+%%  take turns, a table per revision shows the median run of the
+%%  revision and of the working tree.
 %%
 %%  The dependencies are taken from _build/default/lib as they are,
 %%  ./rebar3 compile comes first.
@@ -50,17 +52,19 @@
   duration :: pos_integer()
 }).
 
-main([BaseRef])->
+main([_ | _] = BaseRefs)->
   ok = file:set_cwd(filename:join([filename:dirname(escript:script_name()), "..", ".."])),
-  Base = build_base(BaseRef),
+  clean(filename:join(?BUILD, "base")),
+  Bases = [ build_base(BaseRef) || BaseRef <- BaseRefs ],
   Current = build_current(),
   build_bench(),
   Config = config(),
-  header(Base, Current, Config),
-  Results = run(Base, Current, Config),
-  table(Base, Current, Config, Results);
+  header(Bases, Current, Config),
+  Results = run(Bases ++ [Current], Config),
+  [ table(Base, Current, Config, Results) || Base <- Bases ],
+  legend();
 main(_Args)->
-  io:format("usage: elock_perf_compare.escript Revision~n"),
+  io:format("usage: elock_perf_compare.escript Revision...~n"),
   halt(1).
 
 %%=================================================================
@@ -71,8 +75,8 @@ build_base(Ref)->
   case exec("git", ["rev-parse", "--verify", "--quiet", "--short", Ref ++ "^{commit}"]) of
     {0, Output}->
       Commit = string:trim(Output),
-      Dir = filename:join(?BUILD, "base"),
-      clean(Dir),
+      Dir = filename:join([?BUILD, "base", Commit]),
+      ok = filelib:ensure_path(Dir),
       {0, _} = exec("sh", ["-c", "git archive " ++ Commit ++ " src include | tar -x -C " ++ Dir]),
       #impl{
         name = Ref,
@@ -164,9 +168,9 @@ env_integers(Name, Default)->
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  #{ {Scenario, Clients, ImplName} => the results of the runs }.
-%%  The order of the implementations alternates from run to run
+%%  The order of the implementations rotates from run to run
 %%-----------------------------------------------------------------
-run(Base, Current, #config{
+run(Impls, #config{
   scenarios = Scenarios,
   clients = ClientsCounts,
   runs = Runs
@@ -176,7 +180,7 @@ run(Base, Current, #config{
     || Scenario <- Scenarios,
        Clients <- ClientsCounts,
        Run <- lists:seq(1, Runs),
-       Impl <- case Run rem 2 of 1 -> [Base, Current]; 0 -> [Current, Base] end
+       Impl <- rotate(Run rem length(Impls), Impls)
   ],
   {Results, _N} =
     lists:foldl(
@@ -190,6 +194,10 @@ run(Base, Current, #config{
       Plan
     ),
   Results.
+
+rotate(N, Impls)->
+  {Head, Tail} = lists:split(N, Impls),
+  Tail ++ Head.
 
 run_vm(#impl{ebin = Ebin}, Scenario, Clients, #config{warmup = Warmup, duration = Duration})->
   ResultFile = filename:join(?BUILD, "result.term"),
@@ -231,8 +239,8 @@ exec_output(Port, Output)->
 %%  Report
 %%=================================================================
 header(
-    #impl{name = BaseName, revision = BaseRevision},
-    #impl{name = CurrentName, revision = CurrentRevision},
+    Bases,
+    #impl{name = CurrentName} = Current,
     #config{
       runs = Runs,
       warmup = Warmup,
@@ -240,14 +248,13 @@ header(
     }
 )->
   io:format(
-    "elock performance: ~s against ~s~n"
-    "  ~s: ~s~n"
-    "  ~s: ~s~n"
+    "elock performance: ~s against ~s~n",
+    [CurrentName, lists:join(", ", [ BaseName || #impl{name = BaseName} <- Bases ])]
+  ),
+  [ io:format("  ~s: ~s~n", [Name, Revision]) || #impl{name = Name, revision = Revision} <- Bases ++ [Current] ],
+  io:format(
     "  OTP ~s, ~p schedulers, ~p runs of ~p ms after ~p ms of warm-up~n~n",
     [
-      CurrentName, BaseName,
-      BaseName, BaseRevision,
-      CurrentName, CurrentRevision,
       erlang:system_info(otp_release), erlang:system_info(schedulers_online),
       Runs, Duration, Warmup
     ]
@@ -301,6 +308,9 @@ table(
     end
     || Scenario <- Scenarios, Clients <- ClientsCounts
   ],
+  ok.
+
+legend()->
   io:format(
     "~nlocks/s: the locks taken and released per second. p50, p99, p99.9: the latency of~n"
     "elock:lock/4. procs, MB: the peaks of the processes and of the memory of the node.~n"

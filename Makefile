@@ -1,8 +1,9 @@
 .PHONY: test perf
 
-# The performance of the working tree against the revision PERF_BASE
+# The performance of the working tree against the revisions PERF_BASE
 # (see test/performance/elock_perf_compare.escript):
 #   make perf
+#   make perf PERF_BASE="lazy_deadlock pool"
 #   make perf PERF_SCENARIOS="unique_terms hot_txn" PERF_CLIENTS="16 1024"
 #
 # PERF_SCENARIOS - the scenarios of test/performance/elock_perf.erl to

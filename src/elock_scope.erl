@@ -3,11 +3,13 @@
 %%  The scope: the process that owns the pool of the managers and
 %%  announces the node to the other nodes of the scope.
 %%
-%%  The pool is a tuple of the manager PIDs kept in a persistent
-%%  term, a Term is hashed to its slot (see manager/2). The managers
-%%  are linked to the scope and stop with it. The persistent term
-%%  stays: the monitor of a client tells it that the manager is dead
-%%  (see elock_manager:lock/2).
+%%  The pool is a tuple of the slots kept in a persistent term, a
+%%  slot is a manager, its table and its busy flag (see
+%%  elock_manager). A Term is hashed to its slot
+%%  (see slot/2). The managers are linked to the scope and stop with
+%%  it. The persistent term stays: the table of a dead manager has
+%%  gone, and the monitor of a client tells it that the manager is
+%%  dead (see elock_manager:lock/2).
 %%=================================================================
 -module(elock_scope).
 -moduledoc false.
@@ -23,7 +25,7 @@
 %%	API
 %%=================================================================
 -export([
-  manager/2,
+  slot/2,
   ready_nodes/1
 ]).
 
@@ -71,22 +73,12 @@ init(Scope, Sup)->
   end.
 
 %%-----------------------------------------------------------------
-%%  A manager per scheduler.
-%%  High priority: every client of a slot waits for its manager.
-%%  Off heap mailbox: request bursts stay out of its garbage
-%%  collection
+%%  A slot per scheduler
 %%-----------------------------------------------------------------
 -spec start_pool(atom()) -> ok.
 start_pool(Scope)->
   Size = erlang:system_info(schedulers_online),
-  Pool = [
-    spawn_opt(elock_manager, init, [Scope], [
-      link,
-      {priority, high},
-      {message_queue_data, off_heap}
-    ])
-    || _ <- lists:seq(1, Size)
-  ],
+  Pool = [ elock_manager:start_link(Scope) || _ <- lists:seq(1, Size) ],
   persistent_term:put(?pool(Scope), list_to_tuple(Pool)).
 
 %%-----------------------------------------------------------------
@@ -110,11 +102,12 @@ start_pg(PgScope)->
 %%	API
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The manager of the Term. badarg if the scope has never been
+%%  The slot of the Term: the table of its entry, its manager and
+%%  the busy flag of the manager. badarg if the scope has never been
 %%  started on the node
 %%-----------------------------------------------------------------
--spec manager(atom(), term()) -> pid().
-manager(Scope, Term)->
+-spec slot(atom(), term()) -> {ets:table(), pid(), atomics:atomics_ref()}.
+slot(Scope, Term)->
   Pool = persistent_term:get(?pool(Scope)),
   element(erlang:phash2(Term, tuple_size(Pool)) + 1, Pool).
 

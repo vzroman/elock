@@ -4,14 +4,34 @@
 %%  by elock_scope. A Term is hashed to a slot of the pool, a manager
 %%  keeps the locks of the terms of its slot.
 %%
-%%  The client sends the request to the manager of the Term and
-%%  waits for #locked{}, #deadlock{} or #timeout{}.
+%%  A Term that is not free has an entry in the ETS table of its
+%%  slot:
 %%
-%%  The requests of a Term are served in the order they arrive at
-%%  the manager: its mailbox is the only synchronization between the
-%%  clients.
+%%      { Term, Count, Ref, ClientPID, Shared }
 %%
-%%  A manager lives as long as its scope.
+%%  The client takes the entry by ets:update_counter/4. Count is not
+%%  a ticket, it only tells whether the Term was free:
+%%    * 1 - the Term was free. The client holds the lock, it tells
+%%      the manager with #hold{} and does not wait for an answer.
+%%    * N - the client sends the request to the manager and waits
+%%      for #locked{}, #deadlock{} or #timeout{}.
+%%
+%%  Ref, ClientPID and Shared are the hold of the client that has
+%%  taken the entry: a request may reach the manager before #hold{}.
+%%
+%%  The requests of a Term that is not free are served in the order
+%%  they arrive at the manager: its mailbox is the only
+%%  synchronization between them.
+%%
+%%  The manager deletes the entry when the Term is released.
+%%
+%%  The clients that take the entries by themselves do not wait for
+%%  the manager and can send faster than it handles. A manager with
+%%  a long mailbox raises the busy flag of its slot: the clients
+%%  send requests and wait until it has caught up.
+%%
+%%  A manager lives as long as its scope, its table lives as long as
+%%  the manager.
 %%=================================================================
 -module(elock_manager).
 -moduledoc false.
@@ -29,7 +49,8 @@
 %%	Pool API
 %%=================================================================
 -export([
-  init/1
+  start_link/1,
+  init/2
 ]).
 
 -type lock_result() ::
@@ -52,32 +73,83 @@
 -record(locked,{}).
 -record(timeout,{}).
 
+%%-----------------------------------------------------------------
+%%  The entry of a Term in the table of its slot
+%%-----------------------------------------------------------------
+-define(entry(Term, Count, Ref, ClientPID, Shared), {Term, Count, Ref, ClientPID, Shared}).
+-define(count, 2).
+
+%%-----------------------------------------------------------------
+%%  Client -> manager: the client has taken the entry of a free Term
+%%-----------------------------------------------------------------
+-record(hold,{
+  ref :: reference(),
+  term :: term(),
+  client :: pid(),
+  shared :: boolean()
+}).
+
 %%=================================================================
 %%  Client side
 %%
-%%  The proxy sends the request and waits for the verdict: the client
-%%  itself (lock/2) or a worker on its behalf (lock/1)
+%%  The client takes the entry of a free Term by itself (lock/2).
+%%  Otherwise the proxy sends the request and waits for the verdict:
+%%  the client itself (lock/2) or a worker on its behalf (lock/1)
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  The worker of elock_context:run_request/3, remote apply. It does
-%%  not have the held locks
+%%  not have the held locks. It does not take the entry either: its
+%%  #hold{} would not be ordered with #unlock{} and 'DOWN' of the
+%%  client
 %%-----------------------------------------------------------------
 -spec lock(#request{}) -> lock_result().
-lock(Request)->
-  lock(Request, undefined).
-
-%%-----------------------------------------------------------------
-%%  HeldLocks is undefined for a worker
-%%-----------------------------------------------------------------
--spec lock(#request{}, held_locks() | undefined) -> lock_result().
 lock(
     #request{
       scope = Scope,
       term = Term
+    } = Request
+)->
+  {_Table, Manager, _Busy} = elock_scope:slot(Scope, Term),
+  request(Manager, Request, undefined).
+
+%%-----------------------------------------------------------------
+%%  The client itself. A free Term is locked without a round trip to
+%%  the manager: #hold{}, #unlock{} and 'DOWN' of the client reach it
+%%  in this order. The entry of a client that has died before the
+%%  send stays until the next request for the Term (see
+%%  handle_request/2). A busy manager is waited for (see
+%%  check_load/1), it takes the entry itself. badarg from the table:
+%%  the scope is stopped on the node
+%%-----------------------------------------------------------------
+-spec lock(#request{}, held_locks()) -> lock_result().
+lock(
+    #request{
+      ref = Ref,
+      scope = Scope,
+      term = Term,
+      shared = Shared
     } = Request,
     HeldLocks
 )->
-  Manager = elock_scope:manager(Scope, Term),
+  {Table, Manager, Busy} = elock_scope:slot(Scope, Term),
+  case atomics:get(Busy, 1) of
+    0->
+      case ets:update_counter(Table, Term, {?count, 1}, ?entry(Term, 0, Ref, self(), Shared)) of
+        1->
+          Manager ! #hold{ref = Ref, term = Term, client = self(), shared = Shared},
+          {ok, Manager};
+        _->
+          request(Manager, Request, HeldLocks)
+      end;
+    _->
+      request(Manager, Request, HeldLocks)
+  end.
+
+%%-----------------------------------------------------------------
+%%  HeldLocks is undefined for a worker
+%%-----------------------------------------------------------------
+-spec request(pid(), #request{}, held_locks() | undefined) -> lock_result().
+request(Manager, Request, HeldLocks)->
   % A manager is down only with its scope. The monitor ref is also the
   % tag of the replies
   MonitorRef = erlang:monitor(process, Manager),
@@ -88,7 +160,7 @@ lock(
 
 %%-----------------------------------------------------------------
 %%  Every clause matches MonitorRef, a plain argument from
-%%  erlang:monitor/2 in lock/2: the receive skips the older messages.
+%%  erlang:monitor/2 in request/3: the receive skips the older messages.
 %%  The request Ref can not do it: it is made in elock_context, maybe
 %%  on another node. A worker passes #queued{} on to the client, the
 %%  client answers it with HeldLocks
@@ -159,9 +231,19 @@ wait_verdict(
 -type requests() :: #{reference() => #req{}}.
 -type clients() :: #{pid() => #client{}}.
 
+%%-----------------------------------------------------------------
+%%  The load of the manager (see check_load/1): the messages between
+%%  two looks at the mailbox, and the mailbox of a busy manager
+%%-----------------------------------------------------------------
+-define(LOAD_PERIOD, 32).
+-define(BUSY_QUEUE, 128).
+
 % One per pool slot
 -record(state,{
   scope :: atom(),
+  table :: ets:table(), % the entries of the terms of the slot
+  busy :: atomics:atomics_ref(), % the busy flag of the slot
+  load_check :: non_neg_integer(), % the messages until the next check_load/1
   locks :: locks(), % the live terms of the slot
   requests :: requests(), % the holders and the waiters of all the terms
   clients :: clients(),
@@ -172,11 +254,35 @@ wait_verdict(
 % on together with the state, put_lock/1 stores it
 -type ls() :: {#lock{}, #state{}}.
 
-% Spawned by elock_scope
--spec init(atom()) -> no_return().
-init(Scope)->
+%%-----------------------------------------------------------------
+%%  A slot of the pool, called by the scope.
+%%  High priority: every client of a slot waits for its manager.
+%%  Off heap mailbox: request bursts stay out of its garbage
+%%  collection
+%%-----------------------------------------------------------------
+-spec start_link(atom()) -> {ets:table(), pid(), atomics:atomics_ref()}.
+start_link(Scope)->
+  Manager = spawn_opt(?MODULE, init, [Scope, self()], [
+    link,
+    {priority, high},
+    {message_queue_data, off_heap}
+  ]),
+  receive
+    {Manager, Table, Busy}->
+      {Table, Manager, Busy}
+  end.
+
+% The table is owned by the manager: they stop together
+-spec init(atom(), pid()) -> no_return().
+init(Scope, ScopePID)->
+  Table = ets:new(?MODULE, [public, set, {write_concurrency, auto}]),
+  Busy = atomics:new(1, []),
+  ScopePID ! {self(), Table, Busy},
   loop(#state{
     scope = Scope,
+    table = Table,
+    busy = Busy,
+    load_check = ?LOAD_PERIOD,
     locks = #{},
     requests = #{},
     clients = #{},
@@ -185,9 +291,13 @@ init(Scope)->
 
 
 -spec loop(#state{}) -> no_return().
-loop(State0)->
+loop(#state{load_check = 0} = State)->
+  loop(check_load(State));
+loop(#state{load_check = LoadCheck} = State0)->
   State =
     receive
+      #hold{} = Hold->
+        handle_hold(Hold, State0);
       #unlock{ref = Ref}->
         handle_unlock(Ref, State0);
       #request{} = Request->
@@ -206,21 +316,72 @@ loop(State0)->
         ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
         State0
     end,
-  loop( State ).
+  loop(State#state{
+    load_check = LoadCheck - 1
+  }).
+
+%%-----------------------------------------------------------------
+%%  The busy flag of the slot follows the mailbox. It is looked at
+%%  every ?LOAD_PERIOD messages, so the flag of a manager that has
+%%  nothing to do is down: its mailbox has been seen short on the
+%%  way to empty
+%%-----------------------------------------------------------------
+-spec check_load(#state{}) -> #state{}.
+check_load(#state{busy = Busy} = State)->
+  {message_queue_len, Length} = process_info(self(), message_queue_len),
+  if
+    Length > ?BUSY_QUEUE -> atomics:put(Busy, 1, 1);
+    true -> atomics:put(Busy, 1, 0)
+  end,
+  State#state{
+    load_check = ?LOAD_PERIOD
+  }.
 
 %%=================================================================
-%%  New requests
+%%  New holds and requests
 %%
-%%  A Term that is not among the locks is free: its request is
-%%  granted at once. A request for a held Term joins the holders,
-%%  barges or queues (see add_request/2)
+%%  A Term that is not among the locks has no holder the manager
+%%  knows about
 %%=================================================================
+%%-----------------------------------------------------------------
+%%  The client has taken the entry of a free Term (see lock/2). The
+%%  Term is among the locks if a request has come first and has taken
+%%  the hold from the entry (see handle_request/2)
+%%-----------------------------------------------------------------
+-spec handle_hold(#hold{}, #state{}) -> #state{}.
+handle_hold(
+    #hold{
+      ref = Ref,
+      term = Term,
+      client = ClientPID,
+      shared = Shared
+    },
+    #state{
+      locks = Locks
+    } = State
+)->
+  case is_map_key(Term, Locks) of
+    false->
+      put_lock(hold(Ref, ClientPID, Shared, {new_lock(Term), State}));
+    true->
+      State
+  end.
+
+%%-----------------------------------------------------------------
+%%  A request for a held Term joins the holders, barges or queues
+%%  (see add_request/2). For a Term that is not among the locks the
+%%  manager takes the entry the way a client does (see lock/2)
+%%-----------------------------------------------------------------
 -spec handle_request(#request{}, #state{}) -> #state{}.
 handle_request(
     #request{
-      term = Term
+      ref = Ref,
+      term = Term,
+      client = ClientPID,
+      shared = Shared
     } = Request,
     #state{
+      table = Table,
       locks = Locks
     } = State
 )->
@@ -228,15 +389,18 @@ handle_request(
     #{Term := Lock}->
       put_lock(add_request(Request, {Lock, State}));
     _->
-      Lock = #lock{
-        term = Term,
-        holders = #{},
-        queue = gb_sets:empty(),
-        can_share = true,
-        barging = undefined,
-        graph = undefined
-      },
-      put_lock(grant(Request, {Lock, State}))
+      LS = {new_lock(Term), State},
+      case ets:update_counter(Table, Term, {?count, 1}, ?entry(Term, 0, Ref, ClientPID, Shared)) of
+        1->
+          % The request of a worker, or the Term has been released while
+          % the request was on the way
+          put_lock(grant(Request, LS));
+        _->
+          % A client has taken the entry. Its #hold{} is on the way, or the
+          % client has died before the send: the hold is in the entry
+          [?entry(_Term, _Count, HoldRef, HoldPID, HoldShared)] = ets:lookup(Table, Term),
+          put_lock(add_request(Request, hold(HoldRef, HoldPID, HoldShared, LS)))
+      end
   end.
 
 %%=================================================================
@@ -617,6 +781,20 @@ grant(
       tag = Tag,
       shared = Shared
     },
+    LS
+)->
+  Proxy ! ?reply(Tag, #locked{}),
+  hold(Ref, ClientPID, Shared, LS).
+
+%%-----------------------------------------------------------------
+%%  A new holder that has never waited: granted by the manager (see
+%%  grant/2) or by the entry (see lock/2)
+%%-----------------------------------------------------------------
+-spec hold(reference(), pid(), boolean(), ls()) -> ls().
+hold(
+    Ref,
+    ClientPID,
+    Shared,
     {
       #lock{
         term = Term,
@@ -629,9 +807,6 @@ grant(
       } = State
     }
 )->
-
-  Proxy ! ?reply(Tag, #locked{}),
-
   Requests = Requests0#{
     Ref => #req{
       client = ClientPID,
@@ -904,6 +1079,17 @@ next(LS)->
 %%  queue with the state and stores it once. The queue never touches
 %%  #state.locks
 %%=================================================================
+-spec new_lock(term()) -> #lock{}.
+new_lock(Term)->
+  #lock{
+    term = Term,
+    holders = #{},
+    queue = gb_sets:empty(),
+    can_share = true,
+    barging = undefined,
+    graph = undefined
+  }.
+
 %%-----------------------------------------------------------------
 %%  A request by its ref, and its lock. undefined: the request has
 %%  left
@@ -925,7 +1111,8 @@ get_req(
 
 %%-----------------------------------------------------------------
 %%  The only place a Term is created or dropped. No holders: next/1
-%%  has left nobody waiting either
+%%  has left nobody waiting either, the Term is free. Its entry goes,
+%%  the next client takes it by itself (see lock/2)
 %%-----------------------------------------------------------------
 -spec put_lock(ls()) -> #state{}.
 put_lock({
@@ -934,9 +1121,11 @@ put_lock({
     holders = Holders
   },
   #state{
+    table = Table,
     locks = Locks
   } = State
 }) when map_size(Holders) =:= 0->
+  ets:delete(Table, Term),
   State#state{
     locks = maps:remove(Term, Locks)
   };

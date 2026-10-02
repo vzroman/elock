@@ -9,8 +9,6 @@
 -type held_locks() :: #{lock_key() => pid()}.
 
 -record(request,{
-  % The ticket must stay first: postponed requests are sorted by it.
-  queue :: pos_integer() | undefined,
   ref :: reference(),
   scope :: atom(),
   term :: term(),
@@ -24,7 +22,6 @@
 }).
 
 -record(unlock,{
-  manager :: pid() | undefined,
   ref :: reference()
 }).
 
@@ -50,9 +47,10 @@
 -record(deadlock_probe,{
   ref :: reference(),       % the origin request
   edge :: lock_key(), % the lock the origin waits for
+  target :: lock_key(), % the lock this copy is addressed to
   manager :: pid(),         % the origin manager
   weight :: non_neg_integer(), % the held count of the origin
-  sent_to :: #{pid() => true} % the managers that have got the probe
+  sent_to :: #{lock_key() => true} % the locks that have got the probe
 }).
 
 %%-------------------------------------------------------------------------------

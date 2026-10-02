@@ -1,8 +1,9 @@
 %%=================================================================
-%%  The wait-for graph of a manager and the deadlock probes
+%%  The wait-for graph of a lock and the deadlock probes
 %%
-%%  A lock is {Scope, Term, Node}. A held map spans all the scopes,
-%%  so a cycle through several scopes is found like any other.
+%%  A lock is {Scope, Term, Node}, its manager keeps a graph of its
+%%  waiters. A held map spans all the scopes, so a cycle through
+%%  several scopes is found like any other.
 %%
 %%  A waiting request joins the graph with its first hold: the held
 %%  map comes in as #add_held_locks{} only after the request queues.
@@ -13,17 +14,19 @@
 %%  lighter one, or the coin on a tie (see drop_coin/2).
 %%
 %%  Each new hold of a waiting request (the origin) is probed at the
-%%  manager of the held lock (run_probe/4). Every edge is probed as
-%%  it appears, so the probe of the edge that closes a cycle finds
-%%  the rest of the cycle in place. The waiters of the receiving
-%%  manager depend on the origin: it holds their lock, or a forwarded
-%%  probe has come through the holders:
+%%  held lock (run_probe/4). A probe is addressed to a lock by its
+%%  key (target) and goes to the mailbox of its manager, also when
+%%  that is the sending manager itself. Every edge is probed as it
+%%  appears, so the probe of the edge that closes a cycle finds the
+%%  rest of the cycle in place. The waiters of the target lock depend
+%%  on the origin: it holds their lock, or a forwarded probe has come
+%%  through the holders:
 %%    * a waiter that holds the origin's lock closes a cycle
-%%      (probe/3). If a closer beats the origin, #deadlock{} goes to
+%%      (probe/2). If a closer beats the origin, #deadlock{} goes to
 %%      the origin manager and the probe stops. Otherwise every
 %%      closer is aborted.
-%%    * the probe goes on to the managers of the locks the remaining
-%%      waiters hold (forward/2). sent_to keeps the flood finite.
+%%    * the probe goes on to the locks the remaining waiters hold
+%%      (forward/2). sent_to keeps the flood finite.
 %%
 %%  Only the manager changes the graph. forward/2 runs after the
 %%  aborts: an abort may grant the lock to a later waiter, and a
@@ -57,7 +60,7 @@
 -export([
   add_edges/5,
   remove_edges/2,
-  probe/3,
+  probe/2,
   forward/2
 ]).
 
@@ -65,8 +68,8 @@
 %%  The edges
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  Adds and probes the new holds of a waiting request. Edge is this
-%%  manager's lock. A request already in the graph keeps its weight.
+%%  Adds and probes the new holds of a waiting request. Edge is the
+%%  lock of the graph. A request already in the graph keeps its weight.
 %%  Update is never empty (see elock_context:notify_queued/3 and
 %%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
@@ -156,17 +159,12 @@ remove_edges(
       Edges =
         maps:fold(
           fun(Edge, _Manager, Acc)->
-            case Acc of
-              #{ Edge := EdgeAcc0 }->
-                EdgeAcc = maps:remove(Ref, EdgeAcc0),
-                if
-                  map_size(EdgeAcc) > 0 ->
-                    Acc#{ Edge => EdgeAcc };
-                  true ->
-                    maps:remove(Edge, Acc)
-                end;
-              _->
-                Acc
+            EdgeAcc = maps:remove(Ref, maps:get(Edge, Acc)),
+            if
+              map_size(EdgeAcc) > 0 ->
+                Acc#{ Edge => EdgeAcc };
+              true ->
+                maps:remove(Edge, Acc)
             end
           end,
           Edges0,
@@ -176,7 +174,7 @@ remove_edges(
         edges = Edges,
         index = Index
       };
-    _->
+    error->
       % Holds nothing, or its holds have not come in yet
       Graph0
   end;
@@ -189,17 +187,17 @@ remove_edges(_Ref, Graph)->
 %%-----------------------------------------------------------------
 %%  Returns the closers to abort, or stop if the origin loses: its
 %%  abort breaks every cycle through it, the lighter closers stay.
-%%  LocalEdge is this manager's lock, the one the winner waits for
+%%  The target is the lock of the graph, the one the winner waits for
 %%-----------------------------------------------------------------
--spec probe(#deadlock_probe{}, lock_key(), graph() | undefined) ->
+-spec probe(#deadlock_probe{}, graph() | undefined) ->
   stop | {forward, [reference()]}.
 probe(
     #deadlock_probe{
       ref = Ref,
       edge = Edge,
+      target = Target,
       manager = Manager
     } = Probe,
-    LocalEdge,
     #graph{
       edges = Edges,
       index = Index
@@ -209,7 +207,7 @@ probe(
     #{ Edge := Holders }->
       case check_cycles(maps:to_list(Holders), Probe, Index, []) of
         origin->
-          ecall:send(Manager, #deadlock{ref = Ref, winner = LocalEdge}),
+          ecall:send(Manager, #deadlock{ref = Ref, winner = Target}),
           stop;
         Closers->
           {forward, Closers}
@@ -217,7 +215,7 @@ probe(
     _->
       {forward, []}
   end;
-probe(_Probe, _LocalEdge, _Graph)->
+probe(_Probe, _Graph)->
   {forward, []}.
 
 %%-----------------------------------------------------------------
@@ -240,7 +238,7 @@ check_cycles(
 
 %%-----------------------------------------------------------------
 %%  Only a hold by the origin manager's PID closes a cycle. Another PID
-%%  is a stale hold: that manager has died and a new one took the term
+%%  is a stale hold: the scope has restarted on that node
 %%-----------------------------------------------------------------
 check_cycles(
     [{CloserRef, CloserWeight}|Rest],
@@ -293,33 +291,29 @@ drop_coin(Ref1, Ref2)->
   element(Winner, Tie).
 
 %%-----------------------------------------------------------------
-%%  Sends the probe to the managers of the new holds, except this one:
-%%  a barging request holds the term it waits for
+%%  Sends a probe to every new hold, except the lock the origin waits
+%%  for: a barging request holds it
 %%-----------------------------------------------------------------
 -spec run_probe(reference(), lock_key(), held_locks(),
                 non_neg_integer()) -> ok.
 run_probe(Ref, Edge, Held, Weight)->
   Self = self(),
-  SentTo =
-    maps:fold(
-      fun(_Edge, Manager, Acc)->
-        Acc#{ Manager => true }
-      end,
-      #{Self => true},
-      Held
-    ),
-  Probe = #deadlock_probe{
-    ref = Ref,
-    edge = Edge,
-    manager = Self,
-    weight = Weight,
-    sent_to = SentTo
-  },
+  SentTo = maps:from_keys([Edge|maps:keys(Held)], true),
   maps:foreach(
-    fun(Manager, _)->
-      ecall:send(Manager, Probe)
+    fun
+      (Key, Manager) when Key =/= Edge->
+        ecall:send(Manager, #deadlock_probe{
+          ref = Ref,
+          edge = Edge,
+          target = Key,
+          manager = Self,
+          weight = Weight,
+          sent_to = SentTo
+        });
+      (_Edge, _Self)->
+        ok
     end,
-    maps:remove(Self, SentTo)
+    Held
   ).
 
 %%-----------------------------------------------------------------
@@ -336,20 +330,17 @@ forward(
     }
 )->
   Targets =
-    maps:from_keys(
-      [ Manager ||
-        {_Weight, Held} <- maps:values(Index),
-        Manager <- maps:values(Held),
-        not is_map_key(Manager, SentTo)
-      ],
-      true
-    ),
+    #{ Key => Manager ||
+      {_Weight, Held} <- maps:values(Index),
+      Key := Manager <- Held,
+      not is_map_key(Key, SentTo)
+    },
   Probe = Probe0#deadlock_probe{
-    sent_to = maps:merge(SentTo, Targets)
+    sent_to = maps:merge(SentTo, maps:from_keys(maps:keys(Targets), true))
   },
   maps:foreach(
-    fun(Manager, _)->
-      ecall:send(Manager, Probe)
+    fun(Key, Manager)->
+      ecall:send(Manager, Probe#deadlock_probe{target = Key})
     end,
     Targets
   );

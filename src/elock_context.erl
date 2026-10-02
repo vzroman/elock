@@ -176,7 +176,7 @@ unlock(_Ref, _NoContext)->
   ok.
 
 % {Locked, Counts} as in #context{}. A key held by another Manager is
-% stale: its manager has died and a new one has taken the Term
+% stale: the scope has restarted on that node
 -spec add_lock(#lock{}, {held_locks(), lock_counts()}) ->
   {held_locks(), lock_counts()}.
 add_lock(

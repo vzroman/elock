@@ -120,6 +120,8 @@ the winning request waits for.
 - A lock lives on the node it was taken on. If that node goes down, or the
   scope stops there, the lock is lost and its holder is not notified. The
   locks the holder has on the other nodes stay until it unlocks them.
+- A request that is waiting on a node when the scope stops there fails at
+  once, see `lock/4`.
 - A request fails as a whole when one of its nodes can not be reached or
   does not run the scope, see `lock/4`.
 """.
@@ -175,11 +177,12 @@ documentation. The locks of the scope can be taken on this node while the
 returned process is alive. When it exits, the locks taken on this node are
 lost.
 
-`Scope` also names an ETS table, so it must not be the name of another named
-table. The second start of a scope on a node returns `{ok, Pid}` as well,
-but that process exits at once with `badarg`.
+`Scope` is also the registered name of the returned process, so it must not
+be the name of another registered process. The second start of a scope on a
+node returns `{error, {already_started, Pid}}` with the process that already
+has the name.
 """.
--spec start_link(atom()) -> {ok, pid()}.
+-spec start_link(atom()) -> {ok, pid()} | {error, {already_started, pid()}}.
 start_link(Scope)->
   elock_scope:start_link(Scope).
 
@@ -210,8 +213,9 @@ are ignored.
   deadlock to a request that waits for the named lock. See the deadlocks in
   the module documentation.
 - `{error, {badrpc, Reason}}`: a node of `Nodes` can not be reached.
-- `{error, {exit, badarg}}`: the scope is not started on a node of `Nodes`.
-  If `Nodes` is the local node alone, the call raises `badarg` instead.
+- `{error, {exit, badarg}}`: the scope is not started on a node of `Nodes`,
+  or it has stopped there while the request was waiting. If `Nodes` is the
+  local node alone, the call raises `badarg` instead.
 
 After an error the request holds nothing on any node.
 

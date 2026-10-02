@@ -169,7 +169,7 @@ get_manager(Scope, Term, MyQueue)->
       retry;
     _->
       % The manager has not registered itself yet, wait
-      receive after 1 -> ok end,
+      erlang:yield(),
       get_manager(Scope, Term, MyQueue)
   end.
 

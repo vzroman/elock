@@ -6,17 +6,20 @@
 %%  the build, so that every node has elock, ecall and the compiled
 %%  test modules.
 %%
-%%  start_nodes/1 makes the controller (the ct node) distributed on
+%%  start_nodes/1,2 make the controller (the ct node) distributed on
 %%  demand with a unique cookie per run, starts the peers, connects
 %%  them pairwise, starts ecall on every one of them and establishes
 %%  the ecall connections in both directions, verified. The
 %%  controller itself does not run ecall: it only drives the clients
 %%  on the peers through rpc. The nodes started so far live in a
 %%  persistent_term, in the order they were started.
+%%  Modules requested by start_nodes/2 are loaded before each peer
+%%  is returned, including peers added or restarted later. This
+%%  avoids concurrent first-use loading of remote suite closures.
 %%
 %%  Every node name carries the OS pid of the controller and a
 %%  unique integer: a leftover node of a crashed run can never clash
-%%  in epmd and the name of a killed node is never reused.
+%%  in epmd. A peer_name override permits deliberate same-name restart tests.
 %%
 %%  The elock scopes are not the business of this module: the suites
 %%  start them per node with elock_test_utils:start_scope/2
@@ -30,6 +33,7 @@
 %% API
 -export([
   start_nodes/1,
+  start_nodes/2,
   stop_nodes/1,
   start_node/1,
   stop_node/1,
@@ -48,10 +52,16 @@
 %%-----------------------------------------------------------------
 %%  Start the nodes of the configs ([#{name => atom()}]), connect
 %%  them pairwise, start ecall on each and connect ecall both ways.
+%%  Modules are loaded on every peer before it is returned, also
+%%  on later start_node/1 calls. A load failure fails startup.
 %%  The result is the node names in the order of the configs
 %%-----------------------------------------------------------------
 start_nodes(Configs)->
+  start_nodes(Configs, []).
+
+start_nodes(Configs, Modules)->
   Cookie = ensure_controller(),
+  put_state((state())#{modules => Modules}),
   Nodes = [ start_peer(Config, Cookie) || Config <- Configs ],
   ok = connect_nodes(Nodes),
   ok = start_ecall(Nodes),
@@ -133,7 +143,7 @@ ensure_controller()->
           ok
       end,
       true = erlang:set_cookie(node(), Cookie),
-      put_state(#{cookie => Cookie, nodes => []}),
+      put_state(#{cookie => Cookie, nodes => [], modules => []}),
       Cookie
   end.
 
@@ -173,10 +183,10 @@ unique_suffix()->
 %%  ping proves the controller can talk to it. The node is recorded
 %%  as the last one started
 %%-----------------------------------------------------------------
-start_peer(#{name := Name}, Cookie)->
+start_peer(#{name := Name} = Config, Cookie)->
   BuildPaths = [ P || P <- code:get_path(), string:find(P, "_build") =/= nomatch ],
   {ok, Peer, Node} = peer:start(#{
-    name => node_name(Name),
+    name => maps:get(peer_name, Config, node_name(Name)),
     host => ?HOST,
     longnames => true,
     connection => standard_io,
@@ -185,6 +195,7 @@ start_peer(#{name := Name}, Cookie)->
   }),
   pong = net_adm:ping(Node),
   add_node(Node, Peer),
+  ok = rpc(Node, code, ensure_modules_loaded, [maps:get(modules, state())]),
   Node.
 
 node_name(Name)->

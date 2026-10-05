@@ -77,6 +77,7 @@
   locked,
   counts
 }).
+-record(node,{manager, holder}).
 -record(lock,{
   scope,
   term,
@@ -242,7 +243,11 @@ exclusive_blocks_exclusive_test(Config)->
   Ref2 = granted(R2),
   ?assertEqual(undefined, elock_test_utils:context(C1)),
   ?assertEqual(#context{
-    ref2lock = #{ Ref2 => #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } } },
+    ref2lock = #{ Ref2 => #lock{
+      scope = Scope,
+      term = t,
+      nodes = #{ Node => #node{manager = Manager} }
+    } },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{}
   }, elock_test_utils:context(C2)),
@@ -270,7 +275,11 @@ shared_shares_test(Config)->
   {ok, Ref3} = elock_test_utils:lock(C3, Scope, t, [Node], ?SHARED),
   ?assertEqual([{t, Manager, 3}], elock_test_utils:locks(Scope)),
   [ ?assertEqual(#context{
-      ref2lock = #{ Ref => #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } } },
+      ref2lock = #{ Ref => #lock{
+        scope = Scope,
+        term = t,
+        nodes = #{ Node => #node{manager = Manager} }
+      } },
       locked = #{ {Scope, t, Node} => Manager },
       counts = #{}
     }, elock_test_utils:context(C)) || {C, Ref} <- [{C1, Ref1}, {C2, Ref2}, {C3, Ref3}] ],
@@ -465,7 +474,7 @@ reentrant_exclusive_test(Config)->
   Manager = elock_test_utils:wait_manager(Scope, t),
   {ok, Ref2} = elock_test_utils:lock(C1, Scope, t, [Node]),
   ?assertNotEqual(Ref1, Ref2),
-  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
+  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => Lock, Ref2 => Lock },
     locked = #{ {Scope, t, Node} => Manager },
@@ -508,7 +517,7 @@ reentrant_shared_with_exclusive_waiter_test(Config)->
   still_waiting(R2),
 
   {ok, Ref3} = elock_test_utils:lock(C1, Scope, t, [Node], ?SHARED),
-  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
+  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => Lock, Ref3 => Lock },
     locked = #{ {Scope, t, Node} => Manager },
@@ -550,7 +559,7 @@ upgrade_test(Config)->
 
   ?assertEqual(ok, elock_test_utils:unlock(C2, Ref2)),
   Ref3 = granted(Up),
-  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
+  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => Lock, Ref3 => Lock },
     locked = #{ {Scope, t, Node} => Manager },
@@ -592,7 +601,7 @@ upgrade_conflict_test(Config)->
 
   ?assertEqual({error, {deadlock, {Scope, t, Node}}},
     elock_test_utils:lock(C2, Scope, t, [Node], ?EXCLUSIVE)),
-  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
+  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref2 => Lock },
     locked = #{ {Scope, t, Node} => Manager },
@@ -662,7 +671,7 @@ exclusive_holder_requests_shared_test(Config)->
   R2 = elock_test_utils:lock_queued(C2, Scope, t, [Node], ?EXCLUSIVE),
 
   {ok, Ref3} = elock_test_utils:lock(C1, Scope, t, [Node], ?SHARED),
-  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
+  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => Lock, Ref3 => Lock },
     locked = #{ {Scope, t, Node} => Manager },
@@ -763,8 +772,8 @@ different_scopes_independent_test(Config)->
   ?assertNotEqual(M1, M2),
   ?assertEqual(#context{
     ref2lock = #{
-      Ref1 => #lock{ scope = Scope1, term = t, nodes = #{ Node => M1 } },
-      Ref2 => #lock{ scope = Scope2, term = t, nodes = #{ Node => M2 } }
+      Ref1 => #lock{ scope = Scope1, term = t, nodes = #{ Node => #node{manager = M1} } },
+      Ref2 => #lock{ scope = Scope2, term = t, nodes = #{ Node => #node{manager = M2} } }
     },
     locked = #{
       {Scope1, t, Node} => M1,
@@ -900,7 +909,11 @@ timeout_granted_first_test(Config)->
   R3 = elock_test_utils:lock_async(C3, Scope, t, [Node], ?EXCLUSIVE),
   ?assertEqual(timeout, elock_test_utils:result(R3, Timeout + 200)),
   ?assertEqual(#context{
-    ref2lock = #{ Ref2 => #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } } },
+    ref2lock = #{ Ref2 => #lock{
+      scope = Scope,
+      term = t,
+      nodes = #{ Node => #node{manager = Manager} }
+    } },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{}
   }, elock_test_utils:context(C2)),
@@ -987,7 +1000,7 @@ timeout_upgrade_test(Config)->
   R3 = timed_lock(C1, Scope, t, [Node], #{timeout => Timeout}),
   {ok, {{error, timeout}, Elapsed}} = elock_test_utils:result(R3, ?DEADLINE),
   elapsed_within(Elapsed, Timeout),
-  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } },
+  Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => Lock },
     locked = #{ {Scope, t, Node} => Manager },
@@ -1049,7 +1062,11 @@ timeout_on_free_term_test(Config)->
   ?assertEqual(timeout, elock_test_utils:result(R2, 300)),
   ?assertEqual([{t, Manager, 2}], elock_test_utils:locks(Scope)),
   ?assertEqual(#context{
-    ref2lock = #{ Ref1 => #lock{ scope = Scope, term = t, nodes = #{ Node => Manager } } },
+    ref2lock = #{ Ref1 => #lock{
+      scope = Scope,
+      term = t,
+      nodes = #{ Node => #node{manager = Manager} }
+    } },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{}
   }, elock_test_utils:context(C1)),
@@ -1261,7 +1278,11 @@ manager_killed_holder_unlocks_test(Config)->
   ?assertNotEqual(Manager1, Manager2),
   ?assertEqual([{t, Manager2, 1}], elock_test_utils:locks(Scope)),
   ?assertEqual(#context{
-    ref2lock = #{ Ref2 => #lock{ scope = Scope, term = t, nodes = #{ Node => Manager2 } } },
+    ref2lock = #{ Ref2 => #lock{
+      scope = Scope,
+      term = t,
+      nodes = #{ Node => #node{manager = Manager2} }
+    } },
     locked = #{ {Scope, t, Node} => Manager2 },
     counts = #{}
   }, elock_test_utils:context(C2)),
@@ -1374,7 +1395,11 @@ unlock_after_failed_request_test(Config)->
   ?assertEqual({error, {deadlock, {Scope, t2, Node}}},
     elock_test_utils:lock(C2, Scope, t2, [Node], ?EXCLUSIVE)),
   ?assertEqual(#context{
-    ref2lock = #{ Ref3 => #lock{ scope = Scope, term = t2, nodes = #{ Node => M2 } } },
+    ref2lock = #{ Ref3 => #lock{
+      scope = Scope,
+      term = t2,
+      nodes = #{ Node => #node{manager = M2} }
+    } },
     locked = #{ {Scope, t2, Node} => M2 },
     counts = #{}
   }, elock_test_utils:context(C2)),
@@ -1407,9 +1432,9 @@ unlock_order_independent_test(Config)->
   M1 = elock_test_utils:wait_manager(Scope, t1),
   M2 = elock_test_utils:wait_manager(Scope, t2),
   M3 = elock_test_utils:wait_manager(Scope, t3),
-  L1 = #lock{ scope = Scope, term = t1, nodes = #{ Node => M1 } },
-  L2 = #lock{ scope = Scope, term = t2, nodes = #{ Node => M2 } },
-  L3 = #lock{ scope = Scope, term = t3, nodes = #{ Node => M3 } },
+  L1 = #lock{ scope = Scope, term = t1, nodes = #{ Node => #node{manager = M1} } },
+  L2 = #lock{ scope = Scope, term = t2, nodes = #{ Node => #node{manager = M2} } },
+  L3 = #lock{ scope = Scope, term = t3, nodes = #{ Node => #node{manager = M3} } },
   ?assertEqual(#context{
     ref2lock = #{ Ref1 => L1, Ref2 => L2, Ref3 => L3, Ref4 => L1 },
     locked = #{ {Scope, t1, Node} => M1, {Scope, t2, Node} => M2, {Scope, t3, Node} => M3 },
@@ -1553,8 +1578,8 @@ waiting_client_mailbox_test(Config)->
   ?assertEqual({messages, Mailbox}, process_info(C1, messages)),
   ?assertEqual(#context{
     ref2lock = #{
-      Ref1 => #lock{ scope = Scope, term = t1, nodes = #{ Node => M1 } },
-      Ref3 => #lock{ scope = Scope, term = t2, nodes = #{ Node => M2 } }
+      Ref1 => #lock{ scope = Scope, term = t1, nodes = #{ Node => #node{manager = M1} } },
+      Ref3 => #lock{ scope = Scope, term = t2, nodes = #{ Node => #node{manager = M2} } }
     },
     locked = #{ {Scope, t1, Node} => M1, {Scope, t2, Node} => M2 },
     counts = #{}

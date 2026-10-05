@@ -90,6 +90,9 @@
   can_share_test/1,
   only_holder_test/1,
   client_monitor_test/1,
+  reset_keeps_node_monitors_test/1,
+  handle_nodedown_test/1,
+  remote_client_monitor_test/1,
   holder_has_no_tag_test/1,
   untagged_request_test/1,
   enqueue_graph_test/1,
@@ -128,6 +131,7 @@
   has_lock,
   timer
 }).
+-record(clients,{clients, nodes}).
 -record(client,{
   requests,
   monitor_ref
@@ -213,6 +217,9 @@ groups()->
       can_share_test,
       only_holder_test,
       client_monitor_test,
+      reset_keeps_node_monitors_test,
+      handle_nodedown_test,
+      remote_client_monitor_test,
       holder_has_no_tag_test,
       untagged_request_test,
       enqueue_graph_test,
@@ -275,7 +282,7 @@ end_per_testcase(_TestCase, Config)->
 %%  A free term is taken the same way in both modes, by the client
 %%  itself (lock/2) and by a proxy on its behalf (lock/1):
 %%  {ok, Manager}, the entry {Term, Manager, 1}, the manager runs
-%%  with the priority high and an off heap mailbox and monitors the
+%%  with normal priority and an off heap mailbox and monitors the
 %%  client, not the proxy; #unlock{} of the only holder ends it
 %%  normally and the table is empty
 %%-----------------------------------------------------------------
@@ -293,7 +300,7 @@ lock_free_term_test(Config)->
       ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 1}]),
       ?WAIT(elock_test_utils:managers() =:= [Manager]),
 
-      ?assertEqual({priority, high}, process_info(Manager, priority)),
+      ?assertEqual({priority, normal}, process_info(Manager, priority)),
       ?assertEqual({message_queue_data, off_heap}, process_info(Manager, message_queue_data)),
       ?WAIT(lists:member(Manager, monitored_by())),
       ?assertEqual({monitors, [{process, Self}]}, process_info(Manager, monitors)),
@@ -666,7 +673,10 @@ add_request_shared_joins_test(Config)->
 
   State1 = elock_manager:add_request(Req2, State0),
 
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State1,
   ?assert(is_reference(Mon2)),
   ?assertEqual(plain(State0#state{
     holders = #{ Ref1 => {true, C1}, Ref2 => {true, C2} },
@@ -676,8 +686,10 @@ add_request_shared_joins_test(Config)->
         shared = true, held_count = 2, has_lock = true, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C2 => #client{ requests = #{ Ref2 => true }, monitor_ref = Mon2 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C2 => #client{ requests = #{ Ref2 => true }, monitor_ref = Mon2 }
+      }
     },
     can_share = true
   }), plain(State1)),
@@ -701,7 +713,10 @@ add_request_exclusive_queues_test(Config)->
   #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, false),
   State0 = initial_state(Scope, Req1),
   State1 = elock_manager:add_request(Req2, State0),
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State1,
   ?assert(is_reference(Mon2)),
   ?assertEqual(plain(State0#state{
     queue = gb_sets:from_list([{2, Ref2}]),
@@ -711,8 +726,10 @@ add_request_exclusive_queues_test(Config)->
         shared = false, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
+      }
     }
   }), plain(State1)),
   ?assertEqual(lists:sort([{process, C1}, {process, C2}]), monitors()),
@@ -723,7 +740,10 @@ add_request_exclusive_queues_test(Config)->
   #request{ref = Ref3, tag = Tag3} = Req3 = request(Scope, 2, C3, true),
   State0x = initial_state(Scope, Req1x),
   State1x = elock_manager:add_request(Req3, State0x),
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State1x,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State1x,
   ?assertEqual(plain(State0x#state{
     queue = gb_sets:from_list([{2, Ref3}]),
     requests = (State0x#state.requests)#{
@@ -732,8 +752,10 @@ add_request_exclusive_queues_test(Config)->
         shared = true, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State0x#state.clients)#{
-      C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+    clients = (State0x#state.clients)#clients{
+      clients = ((State0x#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+      }
     },
     can_share = false
   }), plain(State1x)),
@@ -756,7 +778,10 @@ add_request_shared_behind_exclusive_waiter_test(Config)->
 
   State2 = elock_manager:add_request(Req3, State1),
 
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State2,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State2,
   ?assertEqual(plain(State1#state{
     queue = gb_sets:from_list([{2, Ref2}, {3, Ref3}]),
     requests = (State1#state.requests)#{
@@ -765,8 +790,10 @@ add_request_shared_behind_exclusive_waiter_test(Config)->
         shared = true, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State1#state.clients)#{
-      C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+    clients = (State1#state.clients)#clients{
+      clients = ((State1#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+      }
     }
   }), plain(State2)),
   ?assertEqual(State0#state.holders, State2#state.holders),
@@ -786,7 +813,10 @@ add_request_when_no_holders_test(Config)->
   State0 = empty_state(Scope),
 
   State1 = elock_manager:add_request(Req1, State0),
-  #state{clients = #{ C1 := #client{monitor_ref = Mon1} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C1 := #client{monitor_ref = Mon1} },
+    nodes = #{}
+  }} = State1,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref1 => {true, C1} },
     requests = #{
@@ -795,15 +825,18 @@ add_request_when_no_holders_test(Config)->
         shared = true, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C1 => #client{ requests = #{ Ref1 => true }, monitor_ref = Mon1 }
-    },
+    }, nodes = #{}},
     can_share = true
   }), plain(State1)),
   ?assertEqual([?reply(Tag1, #locked{ref = Ref1})], elock_test_utils:collected(C1, 1)),
 
   State2 = elock_manager:add_request(Req2, State0),
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State2,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State2,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref2 => {false, C2} },
     requests = #{
@@ -812,9 +845,9 @@ add_request_when_no_holders_test(Config)->
         shared = false, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
-    },
+    }, nodes = #{}},
     can_share = false
   }), plain(State2)),
   ?assertEqual([?reply(Tag2, #locked{ref = Ref2})], elock_test_utils:collected(C2, 1)),
@@ -861,7 +894,10 @@ add_request_shared_behind_pending_upgrade_test(Config)->
   % the exclusive ref is released: the lock is shared again, the newcomer joins
   State5 = elock_manager:handle_unlock(Ref3, State4),
   ?assertEqual([?reply(Tag4, #locked{ref = Ref4})], elock_test_utils:collected(C3, 1)),
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State5,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State5,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref1 => {true, C1}, Ref4 => {true, C3} },
     requests = (State0#state.requests)#{
@@ -870,8 +906,10 @@ add_request_shared_behind_pending_upgrade_test(Config)->
         shared = true, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C3 => #client{ requests = #{ Ref4 => true }, monitor_ref = Mon3 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref4 => true }, monitor_ref = Mon3 }
+      }
     },
     can_share = true
   }), plain(State5)),
@@ -907,7 +945,10 @@ add_request_timeout_test(Config)->
 
   ?assertEqual([?reply(Tag2, #timeout{ref = Ref2})], elock_test_utils:collected(C2, 1)),
   ?assertEqual([?reply(Tag3, #locked{ref = Ref3})], elock_test_utils:collected(C3, 1)),
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State3,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State3,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref1 => {true, C1}, Ref3 => {true, C3} },
     requests = (State0#state.requests)#{
@@ -916,8 +957,10 @@ add_request_timeout_test(Config)->
         shared = true, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+      }
     },
     can_share = true
   }), plain(State3)),
@@ -1002,7 +1045,7 @@ handle_unlock_last_holder_new_ticket_test(Config)->
     holders = #{},
     queue = gb_sets:empty(),
     requests = #{},
-    clients = #{},
+    clients = #clients{clients = #{}, nodes = #{}},
     can_share = true,
     graph = undefined,
     postpone_timer = Timer
@@ -1026,7 +1069,10 @@ handle_unlock_grants_next_test(Config)->
   #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, false),
   State0 = initial_state(Scope, Req1),
   State1 = elock_manager:add_request(Req2, State0),
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State1,
 
   State2 = elock_manager:handle_unlock(Ref1, State1),
 
@@ -1039,9 +1085,9 @@ handle_unlock_grants_next_test(Config)->
         shared = false, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
-    },
+    }, nodes = #{}},
     can_share = false
   }), plain(State2)),
   ?assertEqual([{process, C2}], monitors()),
@@ -1091,7 +1137,10 @@ handle_unlock_shared_batch_test(Config)->
   % the last shared after the exclusive
   State5 = elock_manager:handle_unlock(Ref4, State4),
   ?assertEqual([?reply(Tag5, #locked{ref = Ref5})], elock_test_utils:collected(C5, 1)),
-  #state{clients = #{ C5 := #client{monitor_ref = Mon5} }} = State5,
+  #state{clients = #clients{
+    clients = #{ C5 := #client{monitor_ref = Mon5} },
+    nodes = #{}
+  }} = State5,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref5 => {true, C5} },
     requests = #{
@@ -1100,9 +1149,9 @@ handle_unlock_shared_batch_test(Config)->
         shared = true, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C5 => #client{ requests = #{ Ref5 => true }, monitor_ref = Mon5 }
-    },
+    }, nodes = #{}},
     can_share = true
   }), plain(State5)),
   ?assertEqual([{process, C5}], monitors()),
@@ -1217,7 +1266,10 @@ waiting_client_requests_again_test(Config)->
   #request{ref = Ref2} = Req2 = request(Scope, 2, C2, false),
   State0 = initial_state(Scope, Req1),
   State1 = elock_manager:add_request(Req2, State0),
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State1,
 
   lists:foreach(
     fun(Shared)->
@@ -1231,10 +1283,12 @@ waiting_client_requests_again_test(Config)->
             shared = Shared, held_count = 0, has_lock = false, timer = undefined
           }
         },
-        clients = (State1#state.clients)#{
-          C2 => #client{
-            requests = #{ Ref2 => false, Ref3 => Shared },
-            monitor_ref = Mon2
+        clients = (State1#state.clients)#clients{
+          clients = ((State1#state.clients)#clients.clients)#{
+            C2 => #client{
+              requests = #{ Ref2 => false, Ref3 => Shared },
+              monitor_ref = Mon2
+            }
           }
         }
       }), plain(State2)),
@@ -1267,7 +1321,10 @@ barging_exclusive_holder_test(Config)->
   State3 = elock_manager:add_request(Req4, State2),
   ?assertEqual([?reply(Tag4, #locked{ref = Ref4})], elock_test_utils:collected(C1, 1)),
 
-  #state{clients = #{ C1 := #client{monitor_ref = Mon1} }} = State0,
+  #state{clients = #clients{
+    clients = #{ C1 := #client{monitor_ref = Mon1} },
+    nodes = #{}
+  }} = State0,
   ?assertEqual(plain(State1#state{
     holders = #{ Ref1 => {false, C1}, Ref3 => {true, C1}, Ref4 => {false, C1} },
     requests = (State1#state.requests)#{
@@ -1280,8 +1337,13 @@ barging_exclusive_holder_test(Config)->
         shared = false, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = (State1#state.clients)#{
-      C1 => #client{ requests = #{ Ref1 => false, Ref3 => true, Ref4 => false }, monitor_ref = Mon1 }
+    clients = (State1#state.clients)#clients{
+      clients = ((State1#state.clients)#clients.clients)#{
+        C1 => #client{
+          requests = #{ Ref1 => false, Ref3 => true, Ref4 => false },
+          monitor_ref = Mon1
+        }
+      }
     },
     can_share = false
   }), plain(State3)),
@@ -1307,7 +1369,10 @@ barging_shared_again_with_exclusive_waiter_test(Config)->
   State2 = elock_manager:add_request(Req3, State1),
 
   ?assertEqual([?reply(Tag3, #locked{ref = Ref3})], elock_test_utils:collected(C1, 1)),
-  #state{clients = #{ C1 := #client{monitor_ref = Mon1} }} = State0,
+  #state{clients = #clients{
+    clients = #{ C1 := #client{monitor_ref = Mon1} },
+    nodes = #{}
+  }} = State0,
   ?assertEqual(plain(State1#state{
     holders = #{ Ref1 => {true, C1}, Ref3 => {true, C1} },
     requests = (State1#state.requests)#{
@@ -1316,8 +1381,10 @@ barging_shared_again_with_exclusive_waiter_test(Config)->
         shared = true, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = (State1#state.clients)#{
-      C1 => #client{ requests = #{ Ref1 => true, Ref3 => true }, monitor_ref = Mon1 }
+    clients = (State1#state.clients)#clients{
+      clients = ((State1#state.clients)#clients.clients)#{
+        C1 => #client{ requests = #{ Ref1 => true, Ref3 => true }, monitor_ref = Mon1 }
+      }
     },
     can_share = true
   }), plain(State2)),
@@ -1338,7 +1405,10 @@ upgrade_only_holder_test(Config)->
   State1 = elock_manager:add_request(Req2, State0),
 
   ?assertEqual([?reply(Tag2, #locked{ref = Ref2})], elock_test_utils:collected(C1, 1)),
-  #state{clients = #{ C1 := #client{monitor_ref = Mon1} }} = State0,
+  #state{clients = #clients{
+    clients = #{ C1 := #client{monitor_ref = Mon1} },
+    nodes = #{}
+  }} = State0,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref1 => {true, C1}, Ref2 => {false, C1} },
     requests = (State0#state.requests)#{
@@ -1347,9 +1417,9 @@ upgrade_only_holder_test(Config)->
         shared = false, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C1 => #client{ requests = #{ Ref1 => true, Ref2 => false }, monitor_ref = Mon1 }
-    },
+    }, nodes = #{}},
     can_share = false,
     barging = undefined
   }), plain(State1)),
@@ -1375,7 +1445,10 @@ upgrade_waits_test(Config)->
 
   State2 = elock_manager:add_request(Req3, State1),
 
-  #state{clients = #{ C1 := #client{monitor_ref = Mon1} }} = State0,
+  #state{clients = #clients{
+    clients = #{ C1 := #client{monitor_ref = Mon1} },
+    nodes = #{}
+  }} = State0,
   ?assertEqual(plain(State1#state{
     requests = (State1#state.requests)#{
       Ref3 => #req{
@@ -1383,8 +1456,10 @@ upgrade_waits_test(Config)->
         shared = false, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State1#state.clients)#{
-      C1 => #client{ requests = #{ Ref1 => true, Ref3 => false }, monitor_ref = Mon1 }
+    clients = (State1#state.clients)#clients{
+      clients = ((State1#state.clients)#clients.clients)#{
+        C1 => #client{ requests = #{ Ref1 => true, Ref3 => false }, monitor_ref = Mon1 }
+      }
     },
     barging = Req3
   }), plain(State2)),
@@ -1405,9 +1480,9 @@ upgrade_waits_test(Config)->
         shared = false, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C1 => #client{ requests = #{ Ref1 => true, Ref3 => false }, monitor_ref = Mon1 }
-    },
+    }, nodes = #{}},
     can_share = false,
     barging = undefined
   }), plain(State3)),
@@ -1496,7 +1571,10 @@ handle_deadlock_test(Config)->
 
   ?assertEqual([?reply(Tag2, #deadlock{ref = Ref2, winner = ?WINNER})], elock_test_utils:collected(C2, 1)),
   ?assertEqual([?reply(Tag3, #locked{ref = Ref3})], elock_test_utils:collected(C3, 1)),
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State3,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State3,
   ?assertEqual(plain(State0#state{
     holders = #{ Ref1 => {true, C1}, Ref3 => {true, C3} },
     requests = (State0#state.requests)#{
@@ -1505,8 +1583,10 @@ handle_deadlock_test(Config)->
         shared = true, held_count = 0, has_lock = true, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon3 }
+      }
     },
     can_share = true
   }), plain(State3)),
@@ -1547,7 +1627,10 @@ handle_down_test(Config)->
 
   State4 = elock_manager:handle_down(C2, State3),
 
-  #state{clients = #{ C4 := #client{monitor_ref = Mon4} }} = State3,
+  #state{clients = #clients{
+    clients = #{ C4 := #client{monitor_ref = Mon4} },
+    nodes = #{}
+  }} = State3,
   ?assertEqual(plain(State0#state{
     queue = gb_sets:from_list([{4, Ref4}]),
     requests = (State0#state.requests)#{
@@ -1556,8 +1639,10 @@ handle_down_test(Config)->
         shared = false, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C4 => #client{ requests = #{ Ref4 => false }, monitor_ref = Mon4 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C4 => #client{ requests = #{ Ref4 => false }, monitor_ref = Mon4 }
+      }
     },
     barging = undefined
   }), plain(State4)),
@@ -1575,7 +1660,9 @@ handle_down_test(Config)->
   ?assertEqual([?reply(Tag4, #locked{ref = Ref4})], elock_test_utils:collected(C4, 1)),
   ?assertEqual(#{ Ref4 => {false, C4} }, State5#state.holders),
   ?assertEqual([], gb_sets:to_list(State5#state.queue)),
-  ?assertEqual(#{ C4 => #client{ requests = #{ Ref4 => false }, monitor_ref = Mon4 } }, State5#state.clients),
+  ?assertEqual(#{
+    C4 => #client{ requests = #{ Ref4 => false }, monitor_ref = Mon4 }
+  }, (State5#state.clients)#clients.clients),
   ?assertEqual([{process, C4}], monitors()),
   ?NO_MESSAGE,
 
@@ -1603,7 +1690,10 @@ handle_request_awaited_ticket_test(Config)->
 
   State1 = elock_manager:handle_request(Req2, State0),
 
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State1,
   ?assertEqual(plain(State0#state{
     queue = gb_sets:from_list([{2, Ref2}]),
     requests = (State0#state.requests)#{
@@ -1612,8 +1702,10 @@ handle_request_awaited_ticket_test(Config)->
         shared = false, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
+      }
     },
     last = 2,
     postponed = [],
@@ -1738,7 +1830,10 @@ postpone_timeout_test(Config)->
 
   State2 = elock_manager:handle_postpone_timeout(Timer, State1),
 
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State2,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State2,
   ?assertEqual(plain(State0#state{
     queue = gb_sets:from_list([{3, Ref3}]),
     requests = (State0#state.requests)#{
@@ -1747,8 +1842,10 @@ postpone_timeout_test(Config)->
         shared = false, held_count = 0, has_lock = false, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C3 => #client{ requests = #{ Ref3 => false }, monitor_ref = Mon3 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref3 => false }, monitor_ref = Mon3 }
+      }
     },
     last = 3,
     postponed = [],
@@ -2042,37 +2139,154 @@ client_monitor_test(_Config)->
   Ref2 = make_ref(),
   Ref3 = make_ref(),
 
-  Clients1 = elock_manager:add_client_request(C1, Ref1, true, #{}),
-  #{ C1 := #client{monitor_ref = Mon1} } = Clients1,
+  Clients1 = elock_manager:add_client_request(C1, Ref1, true, #clients{clients = #{}, nodes = #{}}),
+  #clients{clients = #{ C1 := #client{monitor_ref = Mon1} }, nodes = #{}} = Clients1,
   ?assert(is_reference(Mon1)),
-  ?assertEqual(#{ C1 => #client{ requests = #{ Ref1 => true }, monitor_ref = Mon1 } }, Clients1),
+  ?assertEqual(#clients{
+    clients = #{ C1 => #client{ requests = #{ Ref1 => true }, monitor_ref = Mon1 } },
+    nodes = #{}
+  }, Clients1),
   ?assertEqual([{process, C1}], monitors()),
 
   Clients2 = elock_manager:add_client_request(C1, Ref2, false, Clients1),
-  ?assertEqual(#{ C1 => #client{ requests = #{ Ref1 => true, Ref2 => false }, monitor_ref = Mon1 } }, Clients2),
+  ?assertEqual(#clients{
+    clients = #{ C1 => #client{ requests = #{ Ref1 => true, Ref2 => false }, monitor_ref = Mon1 } },
+    nodes = #{}
+  }, Clients2),
   ?assertEqual([{process, C1}], monitors()),
 
   Clients3 = elock_manager:add_client_request(C2, Ref3, true, Clients2),
-  #{ C2 := #client{monitor_ref = Mon2} } = Clients3,
-  ?assertEqual(#{
+  #clients{clients = #{ C2 := #client{monitor_ref = Mon2} }, nodes = #{}} = Clients3,
+  ?assertEqual(#clients{clients = #{
     C1 => #client{ requests = #{ Ref1 => true, Ref2 => false }, monitor_ref = Mon1 },
     C2 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon2 }
-  }, Clients3),
+  }, nodes = #{}}, Clients3),
   ?assertEqual(lists:sort([{process, C1}, {process, C2}]), monitors()),
 
   Clients4 = elock_manager:remove_client_request(C1, Ref1, Clients3),
-  ?assertEqual(#{
+  ?assertEqual(#clients{clients = #{
     C1 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon1 },
     C2 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon2 }
-  }, Clients4),
+  }, nodes = #{}}, Clients4),
   ?assertEqual(lists:sort([{process, C1}, {process, C2}]), monitors()),
 
   Clients5 = elock_manager:remove_client_request(C1, Ref2, Clients4),
-  ?assertEqual(#{ C2 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon2 } }, Clients5),
+  ?assertEqual(#clients{
+    clients = #{ C2 => #client{ requests = #{ Ref3 => true }, monitor_ref = Mon2 } },
+    nodes = #{}
+  }, Clients5),
   ?assertEqual([{process, C2}], monitors()),
 
-  ?assertEqual(#{}, elock_manager:remove_client_request(C2, Ref3, Clients5)),
+  ?assertEqual(#clients{
+    clients = #{},
+    nodes = #{}
+  }, elock_manager:remove_client_request(C2, Ref3, Clients5)),
   ?assertEqual([], monitors()),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  Remote clients share a node monitor and never acquire process
+%%  monitors. Removing their last requests keeps the node registration.
+%%-----------------------------------------------------------------
+remote_client_monitor_test(_Config)->
+  [] = distributed_tests_utils:start_nodes([]),
+  Node = 'fake@127.0.0.1',
+  C1 = remote_pid(Node, 1),
+  C2 = remote_pid(Node, 2),
+  Ref1 = make_ref(),
+  Ref2 = make_ref(),
+  Empty = #clients{clients = #{}, nodes = #{}},
+  Clients1 = elock_manager:add_client_request(C1, Ref1, true, Empty),
+  ?assertEqual(#clients{
+    clients = #{ C1 => #client{requests = #{ Ref1 => true }} },
+    nodes = #{ Node => true }
+  }, Clients1),
+  ?assertEqual([], monitors()),
+  ?RECEIVE({nodedown, Node}),
+
+  % The registry is unchanged until handle_nodedown/2 consumes the event.
+  Clients2 = elock_manager:add_client_request(C2, Ref2, false, Clients1),
+  ?assertEqual(#{ Node => true }, Clients2#clients.nodes),
+  ?assertEqual([], monitors()),
+  Clients3 = elock_manager:remove_client_request(C1, Ref1, Clients2),
+  Clients4 = elock_manager:remove_client_request(C2, Ref2, Clients3),
+  ?assertEqual(Empty#clients{nodes = #{ Node => true }}, Clients4),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  Node failure removes only that node's clients, including a queued
+%%  proxy. The surviving node's failure then grants the local waiter.
+%%-----------------------------------------------------------------
+handle_nodedown_test(Config)->
+  [] = distributed_tests_utils:start_nodes([]),
+  Scope = ?config(scope, Config),
+  Node = 'fake@127.0.0.1',
+  OtherNode = 'other_fake@127.0.0.1',
+  C1 = remote_pid(Node, 1),
+  C2 = remote_pid(OtherNode, 1),
+  C3 = remote_pid(Node, 2),
+  C4 = elock_test_utils:collector(),
+  P1 = elock_test_utils:collector(),
+  P2 = elock_test_utils:collector(),
+  P3 = elock_test_utils:collector(),
+  #request{ref = Ref1, tag = Tag1} = Req1 =
+    request(Scope, 1, C1, true, #{proxy => P1}),
+  #request{ref = Ref2, tag = Tag2} = Req2 =
+    request(Scope, 2, C2, true, #{proxy => P2}),
+  #request{ref = Ref3} = Req3 =
+    request(Scope, 3, C3, false, #{proxy => P3}),
+  #request{ref = Ref4, tag = Tag4} = Req4 =
+    request(Scope, 4, C4, false),
+  State1 = elock_manager:add_request(Req1, empty_state(Scope)),
+  State2 = elock_manager:add_request(Req2, State1),
+  State3 = elock_manager:add_request(Req3, State2),
+  State4 = elock_manager:add_request(Req4, State3),
+  [?reply(Tag1, #locked{ref = Ref1})] = elock_test_utils:collected(P1, 1),
+  [?reply(Tag2, #locked{ref = Ref2})] = elock_test_utils:collected(P2, 1),
+  ?RECEIVE({nodedown, Node}),
+  ?RECEIVE({nodedown, OtherNode}),
+
+  State5 = elock_manager:handle_nodedown(Node, State4),
+  ?assertEqual(#{ Ref2 => {true, C2} }, State5#state.holders),
+  ?assertEqual([{4, Ref4}], gb_sets:to_list(State5#state.queue)),
+  ?assertEqual(false, is_map_key(Ref3, State5#state.requests)),
+  #clients{clients = Remaining, nodes = RemainingNodes} = State5#state.clients,
+  ?assertEqual(lists:sort([C2, C4]), lists:sort(maps:keys(Remaining))),
+  ?assertEqual(#{ OtherNode => true }, RemainingNodes),
+  elock_test_utils:wait_dead(P3),
+  ?assertEqual([{process, C4}], monitors()),
+  ?NO_MESSAGE,
+
+  State6 = elock_manager:handle_nodedown(OtherNode, State5),
+  ?assertEqual(#{ Ref4 => {false, C4} }, State6#state.holders),
+  ?assertEqual([], gb_sets:to_list(State6#state.queue)),
+  ?assertEqual(#{}, (State6#state.clients)#clients.nodes),
+  [?reply(Tag4, #locked{ref = Ref4})] = elock_test_utils:collected(C4, 1),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  A last remote holder leaves while the next ticket is in flight.
+%%  The reset empties its clients but keeps the armed node registration.
+%%-----------------------------------------------------------------
+reset_keeps_node_monitors_test(Config)->
+  [] = distributed_tests_utils:start_nodes([]),
+  Scope = ?config(scope, Config),
+  Node = 'fake@127.0.0.1',
+  Client = remote_pid(Node, 1),
+  Proxy = elock_test_utils:collector(),
+  #request{ref = Ref, tag = Tag} = Request =
+    request(Scope, 1, Client, false, #{proxy => Proxy}),
+  State0 = elock_manager:add_request(Request, empty_state(Scope)),
+  [?reply(Tag, #locked{ref = Ref})] = elock_test_utils:collected(Proxy, 1),
+  ?RECEIVE({nodedown, Node}),
+  true = ets:insert(Scope, {?TERM, self(), 2}),
+  State1 = elock_manager:handle_unlock(Ref, State0),
+  ?assertEqual(#clients{clients = #{}, nodes = #{ Node => true }},
+    State1#state.clients),
+  ?assertEqual(#{}, State1#state.requests),
+  ?assertEqual(#{}, State1#state.holders),
+  #state{postpone_timer = Timer} = State1,
+  ?RECEIVE({timeout, Timer, postpone_timeout}),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -2129,11 +2343,14 @@ holder_has_no_tag_test(Config)->
   true = ets:insert(Scope, {?TERM, 0, 1}),
   {StandIn, Init} = init_state(Req0),
   ?assertEqual([{?TERM, StandIn, 1}], elock_test_utils:locks(Scope)),
-  #state{clients = #{ C0 := #client{monitor_ref = Mon0} }} = Init,
+  #state{clients = #clients{clients = #{ C0 := #client{monitor_ref = Mon0} }, nodes = #{}}} = Init,
   ?assert(is_reference(Mon0)),
   Expected = initial_state(Scope, Req0),
   ?assertEqual(plain(Expected#state{
-    clients = #{ C0 => #client{ requests = #{ Ref0 => false }, monitor_ref = Mon0 } }
+    clients = #clients{
+      clients = #{ C0 => #client{ requests = #{ Ref0 => false }, monitor_ref = Mon0 } },
+      nodes = #{}
+    }
   }), plain(Init)),
   ?assertMatch(#{ Ref0 := #req{ proxy = undefined, tag = undefined, has_lock = true } }, Init#state.requests),
   true = ets:delete(Scope, ?TERM),
@@ -2200,7 +2417,10 @@ enqueue_graph_test(Config)->
 
   State1 = elock_manager:enqueue(Req2, State0),
 
-  #state{clients = #{ C2 := #client{monitor_ref = Mon2} }} = State1,
+  #state{clients = #clients{
+    clients = #{ C2 := #client{monitor_ref = Mon2} },
+    nodes = #{}
+  }} = State1,
   ?assertEqual(plain(State0#state{
     queue = gb_sets:from_list([{2, Ref2}]),
     requests = (State0#state.requests)#{
@@ -2209,8 +2429,10 @@ enqueue_graph_test(Config)->
         shared = false, held_count = 1, has_lock = false, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C2 => #client{ requests = #{ Ref2 => false }, monitor_ref = Mon2 }
+      }
     },
     graph = undefined
   }), plain(State1)),
@@ -2300,7 +2522,10 @@ barging_graph_test(Config)->
 
   State2 = elock_manager:add_request(Req3, State1),
 
-  #state{clients = #{ C1 := #client{monitor_ref = Mon1} }} = State0,
+  #state{clients = #clients{
+    clients = #{ C1 := #client{monitor_ref = Mon1} },
+    nodes = #{}
+  }} = State0,
   ?assertEqual(plain(State1#state{
     requests = (State1#state.requests)#{
       Ref3 => #req{
@@ -2308,8 +2533,10 @@ barging_graph_test(Config)->
         shared = false, held_count = 2, has_lock = false, timer = undefined
       }
     },
-    clients = (State1#state.clients)#{
-      C1 => #client{ requests = #{ Ref1 => true, Ref3 => false }, monitor_ref = Mon1 }
+    clients = (State1#state.clients)#clients{
+      clients = ((State1#state.clients)#clients.clients)#{
+        C1 => #client{ requests = #{ Ref1 => true, Ref3 => false }, monitor_ref = Mon1 }
+      }
     },
     barging = Req3,
     graph = undefined
@@ -2355,9 +2582,9 @@ barging_graph_test(Config)->
         shared = false, held_count = 2, has_lock = true, timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       C1 => #client{ requests = #{ Ref1 => true, Ref3 => false }, monitor_ref = Mon1 }
-    },
+    }, nodes = #{}},
     can_share = false,
     barging = undefined,
     graph = undefined
@@ -2540,7 +2767,10 @@ handle_deadlock_probe_test(Config)->
 
   ?assertEqual([?reply(Tag2, #deadlock{ref = Ref2, winner = OEdge})], elock_test_utils:collected(C2, 1)),
   ?assertEqual([Probe#deadlock_probe{ sent_to = #{ OM => true, M3 => true } }], elock_test_utils:collected(M3, 1)),
-  #state{clients = #{ C3 := #client{monitor_ref = Mon3} }} = State2,
+  #state{clients = #clients{
+    clients = #{ C3 := #client{monitor_ref = Mon3} },
+    nodes = #{}
+  }} = State2,
   ?assertEqual(plain(State0#state{
     queue = gb_sets:from_list([{3, Ref3}]),
     requests = (State0#state.requests)#{
@@ -2549,8 +2779,10 @@ handle_deadlock_probe_test(Config)->
         shared = false, held_count = 1, has_lock = false, timer = undefined
       }
     },
-    clients = (State0#state.clients)#{
-      C3 => #client{ requests = #{ Ref3 => false }, monitor_ref = Mon3 }
+    clients = (State0#state.clients)#clients{
+      clients = ((State0#state.clients)#clients.clients)#{
+        C3 => #client{ requests = #{ Ref3 => false }, monitor_ref = Mon3 }
+      }
     },
     graph = #graph{
       edges = #{ K3 => #{ Ref3 => 1 } },
@@ -2804,12 +3036,12 @@ initial_state(Scope, #request{
         timer = undefined
       }
     },
-    clients = #{
+    clients = #clients{clients = #{
       Client => #client{
         requests = #{ Ref => Shared },
         monitor_ref = erlang:monitor(process, Client)
       }
-    },
+    }, nodes = #{}},
     scope = Scope,
     term = ?TERM,
     can_share = Shared,
@@ -2826,7 +3058,7 @@ empty_state(Scope)->
     holders = #{},
     queue = gb_sets:empty(),
     requests = #{},
-    clients = #{},
+    clients = #clients{clients = #{}, nodes = #{}},
     scope = Scope,
     term = ?TERM,
     can_share = true,
@@ -2878,3 +3110,9 @@ stand_in(Fun)->
       go-> exit({returned, Fun()})
     end
   end).
+
+% NEW_PID_EXT with a bounded fake node name, for state-only remote clients.
+remote_pid(Node, ID)->
+  Name = atom_to_binary(Node, latin1),
+  binary_to_term(<<131, 88, 100, (byte_size(Name)):16, Name/binary,
+    ID:32, 0:32, 1:32>>).

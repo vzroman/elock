@@ -17,9 +17,15 @@
   unlock/1
 ]).
 
--type node_managers() :: #{node() => pid()}.
+-record(node,{
+  manager :: pid(),
+  holder :: pid() | undefined % worker PID; undefined for a single local request
+}).
+
+-type node_managers() :: #{node() => #node{}}.
+-type queued_managers() :: #{node() => pid()}.
 -type lock_counts() :: #{lock_key() => pos_integer()}.
--type pending_workers() :: #{reference() => node()}.
+-type pending_workers() :: #{node() => pid()}.
 -type request_result() :: {ok, node_managers()} | {error, term()}.
 
 -define(context,'$elock_context$').
@@ -156,7 +162,7 @@ unlock(
   #lock{
     nodes = Nodes
   } = Lock,
-  unlock_nodes(Nodes, Ref),
+  release(Nodes, Ref),
   if
     map_size(Ref2Lock) =:= 0 ->
       no_locks_remain;
@@ -188,7 +194,7 @@ add_lock(
     LockedCounts
 )->
   maps:fold(
-    fun(Node, Manager, {Locked, Counts})->
+    fun(Node, #node{manager = Manager}, {Locked, Counts})->
       Key = {Scope, Term, Node},
       case Locked of
         #{Key := Manager}->
@@ -216,7 +222,7 @@ remove_lock(
     LockedCounts
 )->
   maps:fold(
-    fun(Node, Manager, {Locked, Counts} = Acc)->
+    fun(Node, #node{manager = Manager}, {Locked, Counts} = Acc)->
       Key = {Scope, Term, Node},
       case Locked of
         #{Key := Manager} ->
@@ -259,7 +265,7 @@ held_count(Context)->
   held :: held_locks(),         % the locks the client holds
   pending :: pending_workers(), % the workers that have not returned yet
   nodes :: node_managers(),     % the grants so far
-  queued :: node_managers()     % the managers the request waits at
+  queued :: queued_managers()   % the managers the request waits at
 }).
 
 % The local node alone: the client is the proxy itself
@@ -273,13 +279,13 @@ run_request(
 ) when Node =:= node() ->
   case elock_manager:lock(Request, HeldLocks) of
     {ok, Manager} ->
-      {ok, #{ Node => Manager }};
+      {ok, #{ Node => #node{manager = Manager} }};
     Error ->
       Error
   end;
-% A worker per node is the proxy, it exits with the result. The client
-% answers #queued{} meanwhile. The monitor tag is Ref, so every message
-% of the wait carries Ref
+% A worker per node sends its result tagged with Ref. A remote grant
+% keeps the worker as its holder, monitoring the client locally until
+% release. The client answers #queued{} meanwhile
 run_request(
     Ref,
     #request{
@@ -289,16 +295,21 @@ run_request(
     } = Request,
     HeldLocks
 )->
+  Client = self(),
   Pending =
     lists:foldl(
       fun(N, Acc)->
-        {_Pid, MonRef} = spawn_opt(
-          fun()->
-            exit( ecall_connection:call(N, elock_manager, lock, [Request]) )
-          end,
-          [{monitor, [{tag, Ref}]}]
-        ),
-        Acc#{ MonRef => N }
+        Holder = spawn(fun()->
+          Result = ecall_connection:call(N, elock_manager, lock, [Request]),
+          Client ! {Ref, N, Result},
+          case Result of
+            {ok, {ok, Manager}} when N =/= node()->
+              hold(Manager, Ref, Client);
+            _->
+              ok
+          end
+        end),
+        Acc#{ N => Holder }
       end,
       #{},
       Nodes
@@ -313,6 +324,7 @@ run_request(
     queued = #{}
   }).
 
+% Workers reply with their node and result; remote grants keep a holder.
 % Every clause matches Ref, a plain argument from make_ref/0 in lock/4:
 % the receive skips the older messages. Ref taken from #waiting{} would
 % break the optimization
@@ -329,8 +341,8 @@ wait_verdict(
     } = Waiting0
 ) when map_size(Pending0) > 0->
   receive
-    {Ref, MonRef, process, _Pid, NodeResult} when is_map_key(MonRef, Pending0)->
-      {Node, Pending} = maps:take(MonRef, Pending0),
+    {Ref, Node, NodeResult}->
+      {Holder, Pending} = maps:take(Node, Pending0),
       case NodeResult of
         {ok, {ok,Manager}} ->
           % The queued managers already have the rest
@@ -338,7 +350,7 @@ wait_verdict(
           notify_queued(Queued, #{ {Scope, Term, Node} => Manager }, Ref),
 
           Nodes = Nodes0#{
-            Node => Manager
+            Node => #node{manager = Manager, holder = Holder}
           },
           Waiting = Waiting0#waiting{
             pending = Pending,
@@ -347,17 +359,30 @@ wait_verdict(
           },
           wait_verdict(Ref, Waiting);
         Error ->
-          unlock_nodes(Nodes0, Ref),
+          release(Nodes0, Ref),
           % Otherwise they block their queues and probe with the released locks
           unlock_nodes(Queued0, Ref),
+          % A local worker is also its proxy and withdrawal may kill it
+          % before it can reply. Remote workers report their proxy's exit.
+          LocalMonRef = case maps:find(node(), Pending) of
+            {ok, LocalWorker}->
+              erlang:monitor(process, LocalWorker, [{tag, {local, Ref}}]);
+            error->
+              undefined
+          end,
           wait_unlock(Ref, Pending),
+          % A result can finish the drain before the worker's DOWN arrives.
+          case LocalMonRef of
+            undefined-> ok;
+            _-> erlang:demonitor(LocalMonRef, [flush])
+          end,
           Error
       end;
     #queued{ref = Ref, manager = Manager, node = Node}->
       % The locks of the client and the grants so far
       Held =
         maps:fold(
-          fun(N, M, Acc)->
+          fun(N, #node{manager = M}, Acc)->
             Acc#{
               {Scope, Term, N} => M
             }
@@ -388,23 +413,26 @@ wait_verdict(
 wait_unlock(Ref, Pending0)
   when map_size(Pending0) > 0->
   receive
-    {Ref, MonRef, process, _Pid, NodeResult} when is_map_key(MonRef, Pending0)->
-      Pending = maps:remove(MonRef, Pending0),
+    {Ref, Node, NodeResult}->
+      {Holder, Pending} = maps:take(Node, Pending0),
       case NodeResult of
         {ok, {ok, Manager}} ->
-          ecall:send(Manager, #unlock{ref = Ref});
+          ecall:send(Manager, #unlock{ref = Ref}),
+          kill_holder(Holder);
         _->
           ignore
       end,
       wait_unlock(Ref, Pending);
     #queued{ref = Ref, manager = Manager}->
       ecall:send(Manager, #unlock{ref = Ref}),
-      wait_unlock(Ref, Pending0)
+      wait_unlock(Ref, Pending0);
+    {{local, Ref}, _MonRef, process, _Worker, _Reason}->
+      wait_unlock(Ref, maps:remove(node(), Pending0))
   end;
 wait_unlock(_Ref, _Pending)->
   ok.
 
--spec notify_queued(node_managers(), held_locks(), reference()) -> ok.
+-spec notify_queued(queued_managers(), held_locks(), reference()) -> ok.
 notify_queued(Queued, Held, Ref)
   when map_size(Queued) > 0, map_size(Held) > 0->
   Message = #add_held_locks{
@@ -415,6 +443,38 @@ notify_queued(Queued, Held, Ref)
   ok;
 notify_queued(_Queued, _Held, _Ref)->
   ok.
+
+%%=================================================================
+%%  Remote holders
+%%=================================================================
+-spec hold(pid(), reference(), pid()) -> #unlock{}.
+hold(Manager, Ref, Client)->
+  MonRef = erlang:monitor(process, Client),
+  holding(MonRef, Manager, Ref).
+
+-spec holding(reference(), pid(), reference()) -> #unlock{}.
+holding(MonRef, Manager, Ref)->
+  receive
+    {'DOWN', MonRef, process, _Client, _Reason}->
+      ecall:send(Manager, #unlock{ref = Ref});
+    Unexpected->
+      ?LOGWARNING("unexpected message received: ~p",[Unexpected]),
+      holding(MonRef, Manager, Ref)
+  end.
+
+-spec release(node_managers(), reference()) -> ok.
+release(Nodes, Ref)->
+  maps:foreach(
+    fun(_Node, #node{manager = Manager, holder = Holder})->
+      ecall:send(Manager, #unlock{ref = Ref}),
+      kill_holder(Holder)
+    end,
+    Nodes
+  ).
+
+-spec kill_holder(pid() | undefined) -> ok | true.
+kill_holder(undefined)-> ok;
+kill_holder(Holder)-> exit(Holder, kill).
 
 %%=================================================================
 %%	UTILITIES
@@ -475,7 +535,7 @@ put_context(Context)->
 erase_context()->
   erase(?context).
 
--spec unlock_nodes(node_managers(), reference()) -> ok.
+-spec unlock_nodes(queued_managers(), reference()) -> ok.
 unlock_nodes(Nodes, Ref) when map_size(Nodes) > 0->
   [ ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes) ],
   ok;

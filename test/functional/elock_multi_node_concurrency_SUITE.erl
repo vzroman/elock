@@ -121,7 +121,9 @@ suite()->
 %%  connected both ways between every pair
 %%-----------------------------------------------------------------
 init_per_suite(Config)->
-  Nodes = distributed_tests_utils:start_nodes([#{name => n1}, #{name => n2}, #{name => n3}]),
+  Nodes = distributed_tests_utils:start_nodes(
+    [#{name => n1}, #{name => n2}, #{name => n3}], [?MODULE]
+  ),
   ?assertEqual(?CLUSTER, length(Nodes)),
   Config.
 

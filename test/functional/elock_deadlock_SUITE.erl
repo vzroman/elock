@@ -71,6 +71,7 @@
   locked,
   counts
 }).
+-record(node,{manager, holder}).
 -record(lock,{
   scope,
   term,
@@ -582,8 +583,16 @@ loser_keeps_other_locks_test(Config)->
   OtherManager = elock_test_utils:wait_manager(Scope, OtherTerm),
   ?assertEqual(#context{
     ref2lock = #{
-      CycleRef => #lock{ scope = Scope, term = CycleTerm, nodes = #{ Node => CycleManager } },
-      OtherRef => #lock{ scope = Scope, term = OtherTerm, nodes = #{ Node => OtherManager } }
+      CycleRef => #lock{
+        scope = Scope,
+        term = CycleTerm,
+        nodes = #{ Node => #node{manager = CycleManager} }
+      },
+      OtherRef => #lock{
+        scope = Scope,
+        term = OtherTerm,
+        nodes = #{ Node => #node{manager = OtherManager} }
+      }
     },
     locked = #{
       {Scope, CycleTerm, Node} => CycleManager,
@@ -847,12 +856,20 @@ deadlock_and_timeout_test(Config)->
   M1 = elock_test_utils:wait_manager(Scope, t1),
   M2 = elock_test_utils:wait_manager(Scope, t2),
   ?assertEqual(#context{
-    ref2lock = #{ RefA => #lock{ scope = Scope, term = t1, nodes = #{ Node => M1 } } },
+    ref2lock = #{ RefA => #lock{
+      scope = Scope,
+      term = t1,
+      nodes = #{ Node => #node{manager = M1} }
+    } },
     locked = #{ {Scope, t1, Node} => M1 },
     counts = #{}
   }, elock_test_utils:context(A)),
   ?assertEqual(#context{
-    ref2lock = #{ RefB => #lock{ scope = Scope, term = t2, nodes = #{ Node => M2 } } },
+    ref2lock = #{ RefB => #lock{
+      scope = Scope,
+      term = t2,
+      nodes = #{ Node => #node{manager = M2} }
+    } },
     locked = #{ {Scope, t2, Node} => M2 },
     counts = #{}
   }, elock_test_utils:context(B)),

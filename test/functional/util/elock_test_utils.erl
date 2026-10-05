@@ -328,7 +328,7 @@ lock_async(Client, Scope, Term, Nodes, Options)->
 %%  probes. Hence three things are awaited, in this order - each
 %%  one is what makes the next one conclusive:
 %%  * taken - the entry shows the ticket the request took and the
-%%    manager monitors the client, which it does once the request
+%%    manager monitors a local client, which it does once the request
 %%    is in its queue (or granted). The manager registers the
 %%    client after it has sent #queued{}, if it asks at all, hence
 %%    the question is in the mailbox of the client by now
@@ -360,11 +360,13 @@ lock_queued(Client, Scope, Term, Nodes, Options)->
 %%-----------------------------------------------------------------
 %%  The same for a request of a remote scope: Watch is the node, or
 %%  the nodes, whose managers must have taken the request (the
-%%  tables and the monitors are read there through rpc) - for a
+%%  tables and local-client monitors are read through rpc) - for a
 %%  multi node request every node of it. The client and the managers
 %%  of every node are looked at through rpc the same way, but
-%%  across nodes this is not a guarantee: #queued{}, the answer and
-%%  the probes travel through ecall, and a message on its way
+%%  remote clients have no process monitor at their managers: only
+%%  the ticket and settled/2 are checked there. Across nodes this is
+%%  not a guarantee: #queued{}, the answer and the probes travel through
+%%  ecall, and a message on its way
 %%  between two nodes is in nobody's mailbox. The checks only
 %%  narrow the window there
 %%-----------------------------------------------------------------
@@ -405,9 +407,13 @@ next_ticket(Node, Scope, Term)->
   end.
 
 % The manager of the term on the node has taken the ticket and
-% monitors the client, or what is in the way
+% monitors a local client, or what is in the way. A remote client has no
+% process monitor: the ticket and settled/2 narrow the transport window.
 taken(Node, Client, Scope, Term, Ticket)->
   case rpc(Node, ets, lookup, [Scope, Term]) of
+    [{Term, Manager, Taken}]
+        when is_pid(Manager), Taken >= Ticket, node(Client) =/= Node->
+      true;
     [{Term, Manager, Taken}] when is_pid(Manager), Taken >= Ticket->
       case rpc(Node, erlang, process_info, [Manager, monitors]) of
         {monitors, Monitors}->

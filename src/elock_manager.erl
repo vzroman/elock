@@ -38,6 +38,8 @@
 
 %%=================================================================
 %%  Client <-> manager protocol
+%%  Local clients have process monitors; remote clients share one node
+%%  monitor per node. Their holders send #unlock{} when they exit.
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  Every message from the manager to the proxy. Tag is #request.tag
@@ -173,12 +175,10 @@ get_manager(Scope, Term, MyQueue)->
       get_manager(Scope, Term, MyQueue)
   end.
 
-% High priority: every client of the Term waits for the manager.
 % Off heap mailbox: request bursts stay out of its garbage collection
 -spec start_manager(#request{}) -> pid().
 start_manager(Request)->
   spawn_opt(fun()->init(Request) end, [
-    % {priority, high},
     {message_queue_data, off_heap}
   ]).
 
@@ -217,11 +217,16 @@ start_manager(Request)->
 
 -record(client,{
   requests :: client_requests(), % the holders and the waiters
-  monitor_ref :: reference() % one monitor per client, while it has requests
+  monitor_ref :: reference() | undefined % local monitor; undefined remotely
+}).
+
+-record(clients,{
+  clients :: #{pid() => #client{}},
+  nodes :: #{node() => true} % armed node monitors, kept until nodedown
 }).
 
 -type requests() :: #{reference() => #req{}}.
--type clients() :: #{pid() => #client{}}.
+-type clients() :: #clients{}.
 
 % Started by the holder of ticket 1
 -spec init(#request{}) -> no_return().
@@ -235,6 +240,16 @@ init(#request{
 })->
 
   ets:update_element(Scope, Term, {2,self()}),
+
+  Clients = add_client_request(
+    Client,
+    Ref,
+    Shared,
+    #clients{
+      clients = #{},
+      nodes = #{}
+    }
+  ),
 
   State = #state{
     holders = #{ Ref => {Shared, Client} },
@@ -250,12 +265,7 @@ init(#request{
         timer = undefined
       }
     },
-    clients = #{
-      Client => #client{
-        requests = #{ Ref => Shared },
-        monitor_ref = erlang:monitor(process, Client)
-      }
-    },
+    clients = Clients,
     scope = Scope,
     term = Term,
     can_share = Shared,
@@ -287,6 +297,8 @@ loop(State0)->
         handle_add_held_locks(Update, State0);
       {'DOWN', _Ref, process, ClientPID, _Reason}->
         handle_down(ClientPID, State0);
+      {nodedown, Node}->
+        handle_nodedown(Node, State0);
       {timeout, TimerRef, postpone_timeout}->
         handle_postpone_timeout(TimerRef, State0);
       Unexpected->
@@ -476,7 +488,9 @@ handle_unlock(
       queue = Queue,
       barging = undefined,
       requests = Requests,
-      clients = Clients
+      clients = #clients{
+        clients = Clients
+      }
     } = State0
 ) when map_size(Holders) =:= 1, is_map_key(Ref, Holders)->
 
@@ -488,8 +502,7 @@ handle_unlock(
       % reset state has lost the leaving client's monitor, drop it here
       Req = #req{client = Client} = maps:get(Ref, Requests),
       kill_proxy(Req),
-      #client{monitor_ref = MonRef} =  maps:get(Client, Clients),
-      erlang:demonitor(MonRef),
+      demonitor_client(maps:get(Client, Clients)),
 
       State;
     false->
@@ -561,7 +574,9 @@ handle_deadlock(
 handle_down(
     ClientPID,
     #state{
-      clients = Clients
+      clients = #clients{
+        clients = Clients
+      }
     } = State
 )->
   case Clients of
@@ -577,6 +592,38 @@ handle_down(
     _->
       State
   end.
+
+% The runtime removes a node monitor when it delivers nodedown. Requests
+% from a later connection arm it again through add_client_request/4.
+-spec handle_nodedown(node(), #state{}) -> #state{}.
+handle_nodedown(
+    Node,
+    #state{
+      clients = #clients{
+        clients = ClientsClients,
+        nodes = Nodes0
+      } = Clients0
+    } = State0
+)->
+
+  Nodes = maps:remove(Node, Nodes0),
+  Clients = Clients0#clients{
+    nodes = Nodes
+  },
+  State = State0#state{
+    clients = Clients
+  },
+
+  maps:fold(
+    fun
+      (Client, _ClientState, Acc) when node(Client) =:= Node->
+        handle_down(Client, Acc);
+      (_Client, _ClientState, Acc)->
+        Acc
+    end,
+    State,
+    ClientsClients
+  ).
 
 %%=================================================================
 %%  The queue
@@ -624,7 +671,9 @@ add_busy_request(
       client = ClientPID
     } = Request,
     #state{
-      clients = Clients,
+      clients = #clients{
+        clients = Clients
+      },
       requests = Requests
     } = State
 )->
@@ -918,7 +967,9 @@ try_barging(
       holders = Holders,
       can_share = CanShare,
       barging = BargingRequest,
-      clients = Clients,
+      clients = #clients{
+        clients = Clients
+      },
       scope = Scope,
       term = Term
     } = State
@@ -961,7 +1012,9 @@ next(#state{
     ref = Ref
   },
   holders = Holders,
-  clients = Clients,
+  clients = #clients{
+    clients = Clients
+  },
   requests = Requests
 } = State)->
 
@@ -1026,7 +1079,8 @@ next(State)->
 try_unlock(#state{
   scope = Scope,
   term = Term,
-  last = LastQueue
+  last = LastQueue,
+  clients = Clients
 } = State)->
   Self = self(),
   ets:delete_object(Scope, {Term, Self, LastQueue}),
@@ -1038,7 +1092,9 @@ try_unlock(#state{
         holders = #{},
         queue = gb_sets:empty(),
         requests = #{},
-        clients = #{},
+        clients = Clients#clients{
+          clients = #{}
+        },
         can_share = true,
         graph = undefined
       });
@@ -1112,44 +1168,111 @@ handle_deadlock_probe(
 %%  Utilities
 %%=================================================================
 -spec add_client_request(pid(), reference(), boolean(), clients()) -> clients().
-add_client_request(ClientPID, Ref, Shared, Clients)->
-  Client =
-    case Clients of
-      #{ClientPID := Client0}->
-        #client{ requests = Requests} = Client0,
-        Client0#client{
-          requests = Requests#{ Ref => Shared }
-        };
-      _->
-        #client{
-          requests = #{ Ref => Shared },
-          monitor_ref = erlang:monitor(process, ClientPID)
-        }
-    end,
-  Clients#{
-    ClientPID => Client
-  }.
-
--spec remove_client_request(pid(), reference(), clients()) -> clients().
-remove_client_request(ClientPID, Ref, Clients0)->
-  Client0 = maps:get(ClientPID, Clients0),
-  #client{
-    requests = Requests0,
-    monitor_ref = MonRef
-  } = Client0,
-
-  case maps:remove(Ref, Requests0) of
-    Requests when map_size(Requests) =:= 0 ->
-      erlang:demonitor(MonRef),
-      maps:remove(ClientPID, Clients0);
-    Requests->
+add_client_request(
+    ClientPID,
+    Ref,
+    Shared,
+    #clients{
+      clients = ClientsClients0
+    } = Clients0
+)->
+  case ClientsClients0 of
+    #{ClientPID := Client0}->
+      #client{ requests = Requests0 } = Client0,
+      Requests = Requests0#{
+        Ref => Shared
+      },
       Client = Client0#client{
         requests = Requests
       },
-      Clients0#{
+      ClientsClients = ClientsClients0#{
         ClientPID => Client
+      },
+      Clients0#clients{
+        clients = ClientsClients
+      };
+    _->
+      {MonRef, Clients} = monitor_client(ClientPID, Clients0),
+      Requests = #{
+        Ref => Shared
+      },
+      Client = #client{
+        requests = Requests,
+        monitor_ref = MonRef
+      },
+      ClientsClients = ClientsClients0#{
+        ClientPID => Client
+      },
+      Clients#clients{
+        clients = ClientsClients
       }
   end.
+
+-spec monitor_client(pid(), clients()) -> {reference() | undefined, clients()}.
+monitor_client(
+    Client,
+    Clients
+) when node(Client) =:= node()->
+  MonRef = erlang:monitor(process, Client),
+  {MonRef, Clients};
+monitor_client(
+    Client,
+    #clients{
+      nodes = Nodes0
+    } = Clients0
+)->
+  Node = node(Client),
+  if
+    is_map_key(Node, Nodes0) ->
+      ignore;
+    true ->
+      erlang:monitor_node(Node, true)
+  end,
+  Nodes = Nodes0#{
+    Node => true
+  },
+  Clients = Clients0#clients{
+    nodes = Nodes
+  },
+  { _MonRef = undefined, Clients }.
+
+-spec remove_client_request(pid(), reference(), clients()) -> clients().
+remove_client_request(
+    ClientPID,
+    Ref,
+    #clients{
+      clients = ClientsClients0
+    } = Clients
+)->
+  Client0 = maps:get(ClientPID, ClientsClients0),
+  #client{
+    requests = Requests0
+  } = Client0,
+
+  Requests = maps:remove(Ref, Requests0),
+  ClientsClients =
+    if
+      map_size(Requests) =:= 0->
+        demonitor_client(Client0),
+        maps:remove(ClientPID, ClientsClients0);
+      true ->
+        Client = Client0#client{
+          requests = Requests
+        },
+        ClientsClients0#{
+          ClientPID => Client
+        }
+    end,
+  Clients#clients{
+    clients = ClientsClients
+  }.
+
+-spec demonitor_client(#client{}) -> ok | boolean().
+demonitor_client(#client{ monitor_ref = MonRef })
+  when is_reference(MonRef)->
+  erlang:demonitor(MonRef);
+demonitor_client(_Client)->
+  ok.
 
 -spec client_holds_lock(#client{}, requests()) -> boolean().
 client_holds_lock(

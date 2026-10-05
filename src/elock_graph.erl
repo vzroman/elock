@@ -23,7 +23,9 @@
 %%      the origin manager and the probe stops. Otherwise every
 %%      closer is aborted.
 %%    * the probe goes on to the managers of the locks the remaining
-%%      waiters hold (forward/2). sent_to keeps the flood finite.
+%%      waiters hold (forward/2). A manager handles a launch once
+%%      while its graph lives; sent_to keeps the flood finite even
+%%      if a graph is dropped and forgets the launch.
 %%
 %%  Only the manager changes the graph. forward/2 runs after the
 %%  aborts: an abort may grant the lock to a later waiter, and a
@@ -42,11 +44,14 @@
 % #graph{
 %   edges = #{ {Scope, Term, Node} => #{ Ref => Weight } }, - the waiters holding the lock
 %   index = #{ Ref => {Weight, HeldMap} }                  - HeldMap as in #add_held_locks{}
+%   seen = #{ Id => true }                               - launches handled here
 % }
-% undefined while no waiter holds anything, so index is never empty
+% undefined while no waiter holds anything, so index is never empty.
+% The seen set lives and dies with the graph; entries are not removed otherwise.
 -record(graph,{
   edges :: edges(),
-  index :: index()
+  index :: index(),
+  seen :: #{reference() => true}
 }).
 
 -opaque graph() :: #graph{}.
@@ -102,7 +107,8 @@ add_edges(
 add_edges(Ref, Edge, Update, Weight, _Graph)->
   add_edges(Ref, Edge, Update, Weight, #graph{
     edges = #{},
-    index = #{}
+    index = #{},
+    seen = #{}
   }).
 
 %%-----------------------------------------------------------------
@@ -187,14 +193,28 @@ remove_edges(_Ref, Graph)->
 %%  The probes
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  Returns the closers to abort, or stop if the origin loses: its
-%%  abort breaks every cycle through it, the lighter closers stay.
+%%  Returns the closers to abort and the graph with the launch seen.
+%%  Stops without a graph, for a seen launch, or if the origin loses:
+%%  its abort breaks every cycle through it, the lighter closers stay.
+%%  A losing origin is told on every copy; its launch is not recorded.
 %%  LocalEdge is this manager's lock, the one the winner waits for
 %%-----------------------------------------------------------------
 -spec probe(#deadlock_probe{}, lock_key(), graph() | undefined) ->
-  stop | {forward, [reference()]}.
+  stop | {forward, [reference()], graph()}.
 probe(
     #deadlock_probe{
+      id = Id
+    },
+    _LocalEdge,
+    #graph{
+      seen = Seen
+    }
+) when is_map_key(Id, Seen)->
+  stop;
+
+probe(
+    #deadlock_probe{
+      id = Id,
       ref = Ref,
       edge = Edge,
       manager = Manager
@@ -202,23 +222,28 @@ probe(
     LocalEdge,
     #graph{
       edges = Edges,
-      index = Index
-    }
+      index = Index,
+      seen = Seen
+    } = Graph
 )->
-  case Edges of
-    #{ Edge := Holders }->
-      case check_cycles(maps:to_list(Holders), Probe, Index, []) of
-        origin->
-          ecall:send(Manager, #deadlock{ref = Ref, winner = LocalEdge}),
-          stop;
-        Closers->
-          {forward, Closers}
-      end;
+  Closers =
+    case Edges of
+      #{ Edge := Holders }->
+        check_cycles(maps:to_list(Holders), Probe, Index, []);
+      _->
+        []
+    end,
+  case Closers of
+    origin->
+      ecall:send(Manager, #deadlock{ref = Ref, winner = LocalEdge}),
+      stop;
     _->
-      {forward, []}
+      {forward, Closers, Graph#graph{
+        seen = Seen#{ Id => true }
+      }}
   end;
 probe(_Probe, _LocalEdge, _Graph)->
-  {forward, []}.
+  stop.
 
 %%-----------------------------------------------------------------
 %%  Returns the losing closers, or origin as soon as a closer beats it.
@@ -309,6 +334,7 @@ run_probe(Ref, Edge, Held, Weight)->
       Held
     ),
   Probe = #deadlock_probe{
+    id = make_ref(),
     ref = Ref,
     edge = Edge,
     manager = Self,

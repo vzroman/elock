@@ -1137,8 +1137,9 @@ handle_add_held_locks(
 
 %%-----------------------------------------------------------------
 %%  The closers are aborted by the ref: an abort may grant a later
-%%  closer, which handle_deadlock/2 then skips. The probe is forwarded
-%%  on the graph after the aborts
+%%  closer, which handle_deadlock/2 then skips. The graph from probe/3
+%%  is taken before the aborts, which may drop it with its seen set.
+%%  The probe is forwarded on the graph after the aborts
 %%-----------------------------------------------------------------
 -spec handle_deadlock_probe(#deadlock_probe{}, #state{}) -> #state{}.
 handle_deadlock_probe(
@@ -1150,12 +1151,12 @@ handle_deadlock_probe(
     } = State0
 )->
   case elock_graph:probe(Probe, {Scope, Term, node()}, Graph0) of
-    {forward, AbortRefs}->
+    {forward, AbortRefs, Graph1}->
       State = #state{graph = Graph} = lists:foldl(
         fun(Ref, Acc)->
           handle_deadlock(#deadlock{ref = Ref, winner = Winner}, Acc)
         end,
-        State0,
+        State0#state{graph = Graph1},
         AbortRefs
       ),
       elock_graph:forward(Probe, Graph),

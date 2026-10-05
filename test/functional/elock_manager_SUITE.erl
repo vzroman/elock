@@ -99,10 +99,12 @@
   barging_graph_test/1,
   handle_add_held_locks_test/1,
   handle_deadlock_probe_test/1,
+  handle_deadlock_probe_drops_graph_test/1,
   manager_lifecycle_test/1,
   manager_new_round_test/1,
   manager_ignores_unexpected_message_test/1,
-  manager_tagged_replies_test/1
+  manager_tagged_replies_test/1,
+  manager_probe_branches_test/1
 ]).
 
 % mirrors elock_manager.erl
@@ -150,7 +152,8 @@
 % mirrors elock_graph.erl
 -record(graph,{
   edges,
-  index
+  index,
+  seen = #{}
 }).
 
 % The term every test locks
@@ -225,13 +228,15 @@ groups()->
       enqueue_graph_test,
       barging_graph_test,
       handle_add_held_locks_test,
-      handle_deadlock_probe_test
+      handle_deadlock_probe_test,
+      handle_deadlock_probe_drops_graph_test
     ]},
     {real_manager, [], [
       manager_lifecycle_test,
       manager_new_round_test,
       manager_ignores_unexpected_message_test,
-      manager_tagged_replies_test
+      manager_tagged_replies_test,
+      manager_probe_branches_test
     ]}
   ].
 
@@ -2454,13 +2459,13 @@ enqueue_graph_test(Config)->
       index = #{ Ref2 => {1, Held} }
     }
   }, State3),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M1, #deadlock_probe{
     ref = Ref2,
     edge = {Scope, ?TERM, node()},
     manager = Self,
     weight = 1,
     sent_to = #{ Self => true, M1 => true }
-  }], elock_test_utils:collected(M1, 1)),
+  }),
   ?NO_MESSAGE,
 
   % the next waiter leaves the graph as it is
@@ -2556,13 +2561,13 @@ barging_graph_test(Config)->
       index = #{ Ref3 => {2, Held} }
     }
   }, State3),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M1, #deadlock_probe{
     ref = Ref3,
     edge = Edge,
     manager = Self,
     weight = 2,
     sent_to = #{ Self => true, M1 => true }
-  }], elock_test_utils:collected(M1, 1)),
+  }),
   ?NO_MESSAGE,
 
   % dequeued by a deadlock verdict: out of the graph
@@ -2635,14 +2640,13 @@ handle_add_held_locks_test(Config)->
       index = #{ Ref2 => {1, #{ K1 => M1, K2 => M2 }} }
     }
   }, State2),
-  Probe2 = #deadlock_probe{
+  Probe2 = assert_probe(M1, #deadlock_probe{
     ref = Ref2,
     edge = Edge,
     manager = Self,
     weight = 1,
     sent_to = #{ Self => true, M1 => true, M2 => true }
-  },
-  ?assertEqual([Probe2], elock_test_utils:collected(M1, 1)),
+  }),
   ?assertEqual([Probe2], elock_test_utils:collected(M2, 1)),
   ?NO_MESSAGE,
 
@@ -2659,13 +2663,13 @@ handle_add_held_locks_test(Config)->
       index = #{ Ref2 => {1, #{ K1 => M1, K2 => M2, K3 => M3 }} }
     }
   }, State3),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M3, #deadlock_probe{
     ref = Ref2,
     edge = Edge,
     manager = Self,
     weight = 1,
     sent_to = #{ Self => true, M3 => true }
-  }], elock_test_utils:collected(M3, 1)),
+  }),
   ?NO_MESSAGE,
 
   % a multi node request of a client that held nothing: the weight 0,
@@ -2696,8 +2700,13 @@ handle_add_held_locks_test(Config)->
     manager = Self,
     weight = 0
   },
-  ?assertEqual([Probe3#deadlock_probe{ sent_to = #{ Self => true, M2 => true } }], elock_test_utils:collected(M2, 1)),
-  ?assertEqual([Probe3#deadlock_probe{ sent_to = #{ Self => true, M3 => true } }], elock_test_utils:collected(M3, 1)),
+  #deadlock_probe{id = Id3} = assert_probe(M2, Probe3#deadlock_probe{
+    sent_to = #{ Self => true, M2 => true }
+  }),
+  #deadlock_probe{id = Id4} = assert_probe(M3, Probe3#deadlock_probe{
+    sent_to = #{ Self => true, M3 => true }
+  }),
+  ?assertNotEqual(Id3, Id4),
   ?NO_MESSAGE,
 
   % a holder and an unknown ref
@@ -2730,7 +2739,9 @@ handle_deadlock_probe_test(Config)->
   OEdge = {origin_scope, origin_term, 'origin@node'},
   K3 = {Scope, t3, node()},
   ORef = make_ref(),
+  Id = make_ref(),
   Probe = #deadlock_probe{
+    id = Id,
     ref = ORef,
     edge = OEdge,
     manager = OM,
@@ -2786,23 +2797,83 @@ handle_deadlock_probe_test(Config)->
     },
     graph = #graph{
       edges = #{ K3 => #{ Ref3 => 1 } },
-      index = #{ Ref3 => {1, #{ K3 => M3 }} }
+      index = #{ Ref3 => {1, #{ K3 => M3 }} },
+      seen = #{Id => true}
     }
   }), plain(State3)),
   ?assertEqual(#{ Ref1 => {false, C1} }, State3#state.holders),
   ?assertEqual(lists:sort([{process, C1}, {process, C3}]), monitors()),
   ?NO_MESSAGE,
 
-  % a heavier closer (weight 3 > 2): the origin loses, nothing else moves
+  % the second copy neither aborts nor forwards
+  ?assertEqual(State3, elock_manager:handle_deadlock_probe(Probe, State3)),
+  ?NO_MESSAGE,
+
+  % a heavier closer (weight 3 > 2) arrives: the old launch stays ignored
   State4 = waiting(Req4, Held4, State3),
   [_] = elock_test_utils:collected(OM, 1),
   [_] = elock_test_utils:collected(M3, 1),
   ?assertEqual([{3, Ref3}, {4, Ref4}], gb_sets:to_list(State4#state.queue)),
 
   ?assertEqual(State4, elock_manager:handle_deadlock_probe(Probe, State4)),
+  ?NO_MESSAGE,
+
+  % a later launch of the same origin must find the new closer
+  Next = Probe#deadlock_probe{id = make_ref()},
+  ?assertEqual(State4, elock_manager:handle_deadlock_probe(Next, State4)),
 
   ?assertEqual([#deadlock{ref = ORef, winner = {Scope, ?TERM, node()}}],
     elock_test_utils:collected(OM, 1)),
+  ?assertEqual(State4, elock_manager:handle_deadlock_probe(Next, State4)),
+
+  ?assertEqual([#deadlock{ref = ORef, winner = {Scope, ?TERM, node()}}],
+    elock_test_utils:collected(OM, 1)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  Aborting all closers drops the graph and its seen set even when a
+%%  waiter without holds remains. Nothing is forwarded to their holds
+%%-----------------------------------------------------------------
+handle_deadlock_probe_drops_graph_test(Config)->
+  Scope = ?config(scope, Config),
+  C1 = elock_test_utils:collector(),
+  C2 = elock_test_utils:collector(),
+  C3 = elock_test_utils:collector(),
+  C4 = elock_test_utils:collector(),
+  OM = elock_test_utils:collector(),
+  Target = elock_test_utils:collector(),
+  OEdge = {origin_scope, origin_term, node()},
+  Held = #{ OEdge => OM, {other_scope, other_term, node()} => Target },
+  Req1 = request(Scope, 1, C1, false),
+  #request{ref = Ref2, tag = Tag2} = Req2 =
+    request(Scope, 2, C2, false, #{held => Held}),
+  #request{ref = Ref3, tag = Tag3} = Req3 =
+    request(Scope, 3, C3, false, #{held => Held}),
+  #request{ref = Ref4} = Req4 = request(Scope, 4, C4, false),
+  State0 = initial_state(Scope, Req1),
+  State1 = waiting(Req2, Held, State0),
+  State2 = waiting(Req3, Held, State1),
+  State3 = elock_manager:add_request(Req4, State2),
+  [_, _] = elock_test_utils:collected(OM, 2),
+  [_, _] = elock_test_utils:collected(Target, 2),
+
+  Probe = #deadlock_probe{
+    id = make_ref(),
+    ref = make_ref(),
+    edge = OEdge,
+    manager = OM,
+    weight = 3,
+    sent_to = #{ OM => true, self() => true }
+  },
+  State4 = elock_manager:handle_deadlock_probe(Probe, State3),
+  ?assertEqual(undefined, State4#state.graph),
+  ?assertEqual([{4, Ref4}], gb_sets:to_list(State4#state.queue)),
+  ?assertEqual(State0#state.holders, State4#state.holders),
+  ?assertEqual([?reply(Tag2, #deadlock{ref = Ref2, winner = OEdge})],
+    elock_test_utils:collected(C2, 1)),
+  ?assertEqual([?reply(Tag3, #deadlock{ref = Ref3, winner = OEdge})],
+    elock_test_utils:collected(C3, 1)),
+  ?assertEqual(State4, elock_manager:handle_deadlock_probe(Probe, State4)),
   ?NO_MESSAGE.
 
 %%=================================================================
@@ -2931,13 +3002,13 @@ manager_tagged_replies_test(Config)->
   Manager ! Req2,
   ?assertEqual(?reply(Tag2, #queued{ ref = Ref2, manager = Manager, node = node() }), ?RECEIVE(?reply(_, #queued{}))),
   Manager ! #add_held_locks{ ref = Ref2, held = Held },
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M1, #deadlock_probe{
     ref = Ref2,
     edge = {Scope, ?TERM, node()},
     manager = Manager,
     weight = 1,
     sent_to = #{ Manager => true, M1 => true }
-  }], elock_test_utils:collected(M1, 1)),
+  }),
   Manager ! #deadlock{ref = Ref2, winner = ?WINNER},
   ?assertEqual(?reply(Tag2, #deadlock{ref = Ref2, winner = ?WINNER}), ?RECEIVE(?reply(_, #deadlock{}))),
 
@@ -2967,9 +3038,77 @@ manager_tagged_replies_test(Config)->
   ?NO_MESSAGE,
   elock_test_utils:stop(C1).
 
+%%-----------------------------------------------------------------
+%%  Two branches of one launch meet at a real manager. Its waiter
+%%  holds a collector's lock, which receives only the first copy
+%%-----------------------------------------------------------------
+manager_probe_branches_test(Config)->
+  Scope = ?config(scope, Config),
+  Self = self(),
+  C1 = elock_test_utils:client(),
+  Target = elock_test_utils:collector(),
+  OM = elock_test_utils:collector(),
+  Branch1 = elock_test_utils:collector(),
+  Branch2 = elock_test_utils:collector(),
+  Held = #{ {other_scope, other_term, node()} => Target },
+  #request{ref = Ref1} = Req1 = request(Scope, undefined, C1, false),
+  {ok, Manager} = elock_test_utils:call(C1,
+    fun()-> elock_manager:lock(Req1, #{}) end),
+  ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 1}]),
+  MonRef = erlang:monitor(process, Manager),
+
+  ?assertEqual(2, ets:update_counter(Scope, ?TERM, {3, 1})),
+  #request{ref = Ref2, tag = Tag2} = Req2 =
+    request(Scope, 2, Self, false, #{held => Held}),
+  Manager ! Req2,
+  ?RECEIVE(?reply(Tag2, #queued{ref = Ref2})),
+  Manager ! #add_held_locks{ref = Ref2, held = Held},
+  assert_probe(Target, #deadlock_probe{
+    ref = Ref2,
+    edge = {Scope, ?TERM, node()},
+    manager = Manager,
+    weight = 1,
+    sent_to = #{ Manager => true, Target => true }
+  }),
+
+  SentTo = #{ OM => true, Manager => true, Branch1 => true },
+  Probe = #deadlock_probe{
+    id = make_ref(),
+    ref = make_ref(),
+    edge = {origin_scope, origin_term, node()},
+    manager = OM,
+    weight = 1,
+    sent_to = SentTo
+  },
+  Manager ! Probe,
+  Manager ! Probe#deadlock_probe{
+    sent_to = #{ OM => true, Manager => true, Branch2 => true }
+  },
+  % The grant acknowledges that both preceding copies have been handled.
+  Manager ! #unlock{ref = Ref1},
+  ?RECEIVE(?reply(Tag2, #locked{ref = Ref2})),
+  ?assertEqual([Probe#deadlock_probe{sent_to = SentTo#{Target => true}}],
+    elock_test_utils:collected(Target, 1)),
+  ?NO_MESSAGE,
+
+  Manager ! #unlock{ref = Ref2},
+  ?assertEqual({'DOWN', MonRef, process, Manager, normal},
+    ?RECEIVE({'DOWN', MonRef, process, Manager, _Reason})),
+  ?assertEqual([], elock_test_utils:locks(Scope)),
+  ?NO_MESSAGE,
+  elock_test_utils:stop(C1).
+
 %%=================================================================
 %%  Utilities
 %%=================================================================
+% Checks every field of a launched probe, including its fresh reference.
+% Returns the copy so other recipients can be checked against the same id.
+assert_probe(Collector, Expected)->
+  [#deadlock_probe{id = Id} = Probe] = elock_test_utils:collected(Collector, 1),
+  ?assert(is_reference(Id)),
+  ?assertEqual(Expected#deadlock_probe{id = Id}, Probe),
+  Probe.
+
 % The request of Client. Without a ticket it is the request as
 % elock:lock/4 builds it: lock/2 takes the ticket and names the
 % proxy and the tag. With a ticket it is the request as the manager

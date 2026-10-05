@@ -48,6 +48,7 @@
 }).
 
 -record(deadlock_probe,{
+  id :: reference(),        % the launch, the same in every copy
   ref :: reference(),       % the origin request
   edge :: lock_key(), % the lock the origin waits for
   manager :: pid(),         % the origin manager

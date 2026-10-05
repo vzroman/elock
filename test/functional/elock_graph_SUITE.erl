@@ -37,6 +37,10 @@
   probe_stale_hold_test/1,
   probe_skips_origin_test/1,
   probe_multiple_closers_test/1,
+  probe_seen_test/1,
+  probe_new_launch_test/1,
+  probe_seen_lifecycle_test/1,
+  launch_ids_test/1,
   forward_test/1,
   drop_coin_test/1
 ]).
@@ -44,7 +48,8 @@
 % mirrors elock_graph.erl
 -record(graph,{
   edges,
-  index
+  index,
+  seen = #{}
 }).
 
 % The lock of "this manager", the one its waiters wait for
@@ -80,6 +85,10 @@ groups()->
       probe_stale_hold_test,
       probe_skips_origin_test,
       probe_multiple_closers_test,
+      probe_seen_test,
+      probe_new_launch_test,
+      probe_seen_lifecycle_test,
+      launch_ids_test,
       forward_test,
       drop_coin_test
     ]}
@@ -135,14 +144,13 @@ add_edges_new_graph_test(_Config)->
     }
   }, Graph),
 
-  Probe = #deadlock_probe{
+  Probe = assert_probe(M1, #deadlock_probe{
     ref = Ref,
     edge = ?EDGE,
     manager = self(),
     weight = 2,
     sent_to = #{ self() => true, M1 => true, M2 => true }
-  },
-  ?assertEqual([Probe], elock_test_utils:collected(M1, 1)),
+  }),
   ?assertEqual([Probe], elock_test_utils:collected(M2, 1)),
   ?NO_MESSAGE.
 
@@ -169,13 +177,13 @@ add_edges_self_held_test(_Config)->
     }
   }, Graph),
 
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M2, #deadlock_probe{
     ref = Ref,
     edge = ?EDGE,
     manager = self(),
     weight = 2,
     sent_to = #{ self() => true, M2 => true }
-  }], elock_test_utils:collected(M2, 1)),
+  }),
   ?NO_MESSAGE,
 
   % the only held lock is this manager's - the graph is built, nothing is sent
@@ -220,14 +228,13 @@ add_edges_second_waiter_test(_Config)->
     }
   }, Graph2),
 
-  Probe2 = #deadlock_probe{
+  Probe2 = assert_probe(M1, #deadlock_probe{
     ref = Ref2,
     edge = ?EDGE,
     manager = self(),
     weight = 2,
     sent_to = #{ self() => true, M1 => true, M2 => true }
-  },
-  ?assertEqual([Probe2], elock_test_utils:collected(M1, 1)),
+  }),
   ?assertEqual([Probe2], elock_test_utils:collected(M2, 1)),
   ?NO_MESSAGE.
 
@@ -252,13 +259,13 @@ add_held_locks_new_request_test(_Config)->
     edges = #{ K1 => #{ Ref => 0 } },
     index = #{ Ref => {0, #{ K1 => M1 }} }
   }, Graph),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M1, #deadlock_probe{
     ref = Ref,
     edge = ?EDGE,
     manager = self(),
     weight = 0,
     sent_to = #{ self() => true, M1 => true }
-  }], elock_test_utils:collected(M1, 1)),
+  }),
   ?NO_MESSAGE,
 
   % the same for a ref unknown to an existing graph
@@ -275,13 +282,13 @@ add_held_locks_new_request_test(_Config)->
       Ref2 => {0, #{ K2 => M2 }}
     }
   }, Graph2),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M2, #deadlock_probe{
     ref = Ref2,
     edge = ?EDGE,
     manager = self(),
     weight = 0,
     sent_to = #{ self() => true, M2 => true }
-  }], elock_test_utils:collected(M2, 1)),
+  }),
   ?NO_MESSAGE,
 
   % a positive weight: the one passed, not the size of the update
@@ -299,13 +306,13 @@ add_held_locks_new_request_test(_Config)->
       Ref3 => {3, #{ K3 => M3 }}
     }
   }, elock_graph:add_edges(Ref3, ?EDGE, #{ K3 => M3 }, 3, Graph2)),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M3, #deadlock_probe{
     ref = Ref3,
     edge = ?EDGE,
     manager = self(),
     weight = 3,
     sent_to = #{ self() => true, M3 => true }
-  }], elock_test_utils:collected(M3, 1)),
+  }),
   ?NO_MESSAGE,
 
   % and without a graph: the update is larger than the weight (the
@@ -320,14 +327,13 @@ add_held_locks_new_request_test(_Config)->
     },
     index = #{ Ref4 => {1, Held4} }
   }, elock_graph:add_edges(Ref4, ?EDGE, Held4, 1, undefined)),
-  Probe4 = #deadlock_probe{
+  Probe4 = assert_probe(M1, #deadlock_probe{
     ref = Ref4,
     edge = ?EDGE,
     manager = self(),
     weight = 1,
     sent_to = #{ self() => true, M1 => true, M2 => true, M3 => true }
-  },
-  ?assertEqual([Probe4], elock_test_utils:collected(M1, 1)),
+  }),
   ?assertEqual([Probe4], elock_test_utils:collected(M2, 1)),
   ?assertEqual([Probe4], elock_test_utils:collected(M3, 1)),
   ?NO_MESSAGE.
@@ -370,14 +376,13 @@ add_held_locks_update_test(_Config)->
       Ref => {1, #{ K1 => M1, K2 => M2, K3 => M3 }}
     }
   }, Graph1),
-  Probe1 = #deadlock_probe{
+  Probe1 = assert_probe(M2, #deadlock_probe{
     ref = Ref,
     edge = ?EDGE,
     manager = self(),
     weight = 1,
     sent_to = #{ self() => true, M2 => true, M3 => true }
-  },
-  ?assertEqual([Probe1], elock_test_utils:collected(M2, 1)),
+  }),
   ?assertEqual([Probe1], elock_test_utils:collected(M3, 1)),
   ?NO_MESSAGE,
 
@@ -399,13 +404,13 @@ add_held_locks_update_test(_Config)->
       Ref => {1, #{ K1 => M1b, K2 => M2, K3 => M3 }}
     }
   }, Graph2),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M1b, #deadlock_probe{
     ref = Ref,
     edge = ?EDGE,
     manager = self(),
     weight = 1,
     sent_to = #{ self() => true, M1b => true }
-  }], elock_test_utils:collected(M1b, 1)),
+  }),
   ?NO_MESSAGE,
 
   % the other waiters are not touched by the update of this one
@@ -425,13 +430,13 @@ add_held_locks_update_test(_Config)->
       Ref2 => {4, #{ K1 => M1b, K2 => M2 }}
     }
   }, elock_graph:add_edges(Ref2, ?EDGE, #{ K1 => M1b }, 1, Graph3)),
-  ?assertEqual([#deadlock_probe{
+  assert_probe(M1b, #deadlock_probe{
     ref = Ref2,
     edge = ?EDGE,
     manager = self(),
     weight = 4,
     sent_to = #{ self() => true, M1b => true }
-  }], elock_test_utils:collected(M1b, 1)),
+  }),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -499,7 +504,7 @@ probe_no_graph_test(_Config)->
   OM = elock_test_utils:collector(),
   Probe = probe(make_ref(), OM, 1),
 
-  ?assertEqual({forward, []}, elock_graph:probe(Probe, ?EDGE, undefined)),
+  ?assertEqual(stop, elock_graph:probe(Probe, ?EDGE, undefined)),
   ?assertEqual(ok, elock_graph:forward(Probe, undefined)),
   ?NO_MESSAGE.
 
@@ -517,11 +522,11 @@ probe_edge_not_held_test(_Config)->
   },
   Probe = probe(make_ref(), OM, 1),
 
-  ?assertEqual({forward, []}, elock_graph:probe(Probe, ?EDGE, Graph)),
+  Graph1 = assert_forward(Probe, Graph, []),
   ?NO_MESSAGE,
 
   % and the probe goes on to the managers of the locks the waiters hold
-  ?assertEqual(ok, elock_graph:forward(Probe, Graph)),
+  ?assertEqual(ok, elock_graph:forward(Probe, Graph1)),
   ?assertEqual([Probe#deadlock_probe{
     sent_to = #{ OM => true, self() => true, M1 => true }
   }], elock_test_utils:collected(M1, 1)),
@@ -530,7 +535,8 @@ probe_edge_not_held_test(_Config)->
 %%-----------------------------------------------------------------
 %%  A closer heavier than the origin: the origin loses - #deadlock{}
 %%  with the origin's ref goes to the origin manager, the probe
-%%  stops, the closer is left alone
+%%  stops, the closer is left alone. The launch is not recorded, so
+%%  the same copy gives the same verdict again
 %%-----------------------------------------------------------------
 probe_origin_loses_test(_Config)->
   OM = elock_test_utils:collector(),
@@ -541,7 +547,10 @@ probe_origin_loses_test(_Config)->
     index = #{ CRef => {2, #{ ?ORIGIN_EDGE => OM }} }
   },
 
-  ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, Graph)),
+  Probe = probe(ORef, OM, 1),
+  ?assertEqual(stop, elock_graph:probe(Probe, ?EDGE, Graph)),
+  ?assertEqual([#deadlock{ref = ORef, winner = ?EDGE}], elock_test_utils:collected(OM, 1)),
+  ?assertEqual(stop, elock_graph:probe(Probe, ?EDGE, Graph)),
   ?assertEqual([#deadlock{ref = ORef, winner = ?EDGE}], elock_test_utils:collected(OM, 1)),
   ?NO_MESSAGE.
 
@@ -558,7 +567,7 @@ probe_closer_loses_test(_Config)->
     index = #{ CRef => {1, #{ ?ORIGIN_EDGE => OM }} }
   },
 
-  ?assertEqual({forward, [CRef]}, elock_graph:probe(probe(ORef, OM, 2), ?EDGE, Graph)),
+  assert_forward(probe(ORef, OM, 2), Graph, [CRef]),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -583,7 +592,7 @@ probe_tie_test(_Config)->
     edges = #{ ?ORIGIN_EDGE => #{ Loser => 1 } },
     index = #{ Loser => {1, #{ ?ORIGIN_EDGE => OM }} }
   },
-  ?assertEqual({forward, [Loser]}, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, LoserGraph)),
+  assert_forward(probe(ORef, OM, 1), LoserGraph, [Loser]),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -600,7 +609,7 @@ probe_stale_hold_test(_Config)->
     index = #{ CRef => {5, #{ ?ORIGIN_EDGE => Stale }} }
   },
 
-  ?assertEqual({forward, []}, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, Graph)),
+  assert_forward(probe(ORef, OM, 1), Graph, []),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -615,7 +624,7 @@ probe_skips_origin_test(_Config)->
     index = #{ ORef => {5, #{ ?ORIGIN_EDGE => OM }} }
   },
 
-  ?assertEqual({forward, []}, elock_graph:probe(probe(ORef, OM, 1), ?EDGE, Graph)),
+  assert_forward(probe(ORef, OM, 1), Graph, []),
   ?NO_MESSAGE,
 
   % the origin among real closers is skipped as well
@@ -627,7 +636,7 @@ probe_skips_origin_test(_Config)->
       CRef => {1, #{ ?ORIGIN_EDGE => OM }}
     }
   },
-  ?assertEqual({forward, [CRef]}, elock_graph:probe(probe(ORef, OM, 2), ?EDGE, Graph2)),
+  assert_forward(probe(ORef, OM, 2), Graph2, [CRef]),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -655,8 +664,10 @@ probe_multiple_closers_test(_Config)->
     }
   },
 
-  {forward, Closers} = elock_graph:probe(probe(ORef, OM, 3), ?EDGE, Graph),
+  #deadlock_probe{id = Id} = Probe = probe(ORef, OM, 3),
+  {forward, Closers, Graph1} = elock_graph:probe(Probe, ?EDGE, Graph),
   ?assertEqual(lists:sort([C1, C2]), lists:sort(Closers)),
+  ?assertEqual(Graph#graph{seen = #{Id => true}}, Graph1),
   ?NO_MESSAGE,
 
   Graph2 = #graph{
@@ -673,6 +684,104 @@ probe_multiple_closers_test(_Config)->
   },
   ?assertEqual(stop, elock_graph:probe(probe(ORef, OM, 3), ?EDGE, Graph2)),
   ?assertEqual([#deadlock{ref = ORef, winner = ?EDGE}], elock_test_utils:collected(OM, 1)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  A launch is handled once, even when another branch brings a copy
+%%  with different sent_to. Its closers are not returned again
+%%-----------------------------------------------------------------
+probe_seen_test(_Config)->
+  OM = elock_test_utils:collector(),
+  Branch = elock_test_utils:collector(),
+  CRef = make_ref(),
+  Graph = #graph{
+    edges = #{ ?ORIGIN_EDGE => #{ CRef => 1 } },
+    index = #{ CRef => {1, #{ ?ORIGIN_EDGE => OM }} }
+  },
+  Probe = probe(make_ref(), OM, 2),
+  Graph1 = assert_forward(Probe, Graph, [CRef]),
+  ?assertEqual(stop, elock_graph:probe(Probe, ?EDGE, Graph1)),
+  Copy = Probe#deadlock_probe{
+    sent_to = #{ OM => true, self() => true, Branch => true }
+  },
+  ?assertEqual(stop, elock_graph:probe(Copy, ?EDGE, Graph1)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  A new launch of the same origin passes a manager that saw the old
+%%  launch: only the id differs, both are remembered
+%%-----------------------------------------------------------------
+probe_new_launch_test(_Config)->
+  OM = elock_test_utils:collector(),
+  CRef = make_ref(),
+  Graph = #graph{
+    edges = #{ ?ORIGIN_EDGE => #{ CRef => 1 } },
+    index = #{ CRef => {1, #{ ?ORIGIN_EDGE => OM }} }
+  },
+  Probe = probe(make_ref(), OM, 2),
+  Graph1 = assert_forward(Probe, Graph, [CRef]),
+  Next = Probe#deadlock_probe{id = make_ref()},
+  Graph2 = assert_forward(Next, Graph1, [CRef]),
+  ?assertEqual(2, map_size(Graph2#graph.seen)),
+  ?assertEqual(stop, elock_graph:probe(Next, ?EDGE, Graph2)),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  Edge updates and removals retain seen launches until the last
+%%  waiter leaves. A rebuilt graph handles an old copy again
+%%-----------------------------------------------------------------
+probe_seen_lifecycle_test(_Config)->
+  OM = elock_test_utils:collector(),
+  Ref1 = make_ref(),
+  Ref2 = make_ref(),
+  Held = #{ ?EDGE => self() },
+  Graph0 = elock_graph:add_edges(Ref1, ?EDGE, Held, 1, undefined),
+  ?assertEqual(#{}, Graph0#graph.seen),
+  #deadlock_probe{id = Id} = Probe = probe(make_ref(), OM, 2),
+  Graph1 = assert_forward(Probe, Graph0, []),
+  ?assertEqual(Graph1, elock_graph:add_edges(Ref1, ?EDGE, Held, 1, Graph1)),
+  Graph2 = elock_graph:add_edges(Ref2, ?EDGE, Held, 1, Graph1),
+  ?assertEqual(#{Id => true}, Graph2#graph.seen),
+  Graph3 = elock_graph:add_edges(Ref1, ?EDGE,
+    #{ {s2, t2, node()} => self() }, 1, Graph2),
+  ?assertEqual(#{Id => true}, Graph3#graph.seen),
+  ?assertEqual(Graph3, elock_graph:remove_edges(make_ref(), Graph3)),
+  Graph4 = elock_graph:remove_edges(Ref1, Graph3),
+  ?assertEqual(#{Id => true}, Graph4#graph.seen),
+  ?assertEqual(stop, elock_graph:probe(Probe, ?EDGE, Graph4)),
+  ?assertEqual(undefined, elock_graph:remove_edges(Ref2, Graph4)),
+
+  Rebuilt = elock_graph:add_edges(Ref1, ?EDGE, Held, 1, undefined),
+  ?assertEqual(#{}, Rebuilt#graph.seen),
+  assert_forward(Probe, Rebuilt, []),
+  ?NO_MESSAGE.
+
+%%-----------------------------------------------------------------
+%%  Later holds of one request launch fresh ids, including after its
+%%  graph is dropped; the request, edge and origin manager stay the same
+%%-----------------------------------------------------------------
+launch_ids_test(_Config)->
+  M1 = elock_test_utils:collector(),
+  Ref = make_ref(),
+  Held = #{ {s1, t1, node()} => M1 },
+  Expected = #deadlock_probe{
+    ref = Ref,
+    edge = ?EDGE,
+    manager = self(),
+    weight = 1,
+    sent_to = #{ self() => true, M1 => true }
+  },
+  Graph1 = elock_graph:add_edges(Ref, ?EDGE, Held, 1, undefined),
+  #deadlock_probe{id = Id1} = assert_probe(M1, Expected),
+  Graph2 = elock_graph:add_edges(Ref, ?EDGE,
+    #{ {s1, t2, node()} => M1 }, 1, Graph1),
+  #deadlock_probe{id = Id2} = assert_probe(M1, Expected),
+  ?assertNotEqual(Id1, Id2),
+  undefined = elock_graph:remove_edges(Ref, Graph2),
+  elock_graph:add_edges(Ref, ?EDGE, Held, 1, undefined),
+  #deadlock_probe{id = Id3} = assert_probe(M1, Expected),
+  ?assertNotEqual(Id1, Id3),
+  ?assertNotEqual(Id2, Id3),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
@@ -707,6 +816,7 @@ forward_test(_Config)->
     }
   },
   Probe = #deadlock_probe{
+    id = make_ref(),
     ref = make_ref(),
     edge = ?ORIGIN_EDGE,
     manager = OM,
@@ -748,9 +858,25 @@ drop_coin_test(_Config)->
 %%=================================================================
 %%  Utilities
 %%=================================================================
+% The closers and the whole graph must match, with only this launch added.
+assert_forward(#deadlock_probe{id = Id} = Probe, Graph, Closers)->
+  Expected = Graph#graph{seen = (Graph#graph.seen)#{Id => true}},
+  ?assertEqual({forward, Closers, Expected},
+    elock_graph:probe(Probe, ?EDGE, Graph)),
+  Expected.
+
+% Checks every field of a launched probe, including its fresh reference.
+% Returns the copy so other recipients can be checked against the same id.
+assert_probe(Collector, Expected)->
+  [#deadlock_probe{id = Id} = Probe] = elock_test_utils:collected(Collector, 1),
+  ?assert(is_reference(Id)),
+  ?assertEqual(Expected#deadlock_probe{id = Id}, Probe),
+  Probe.
+
 % A probe of the origin request Ref waiting at the origin manager OM
 probe(Ref, OM, Weight)->
   #deadlock_probe{
+    id = make_ref(),
     ref = Ref,
     edge = ?ORIGIN_EDGE,
     manager = OM,

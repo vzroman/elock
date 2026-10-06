@@ -220,14 +220,16 @@ end_per_testcase(transactions_test, Config)->
   ok.
 
 %%-----------------------------------------------------------------
-%%  elock: the scope on every node, linked to a holder that lives
-%%  for the test case, ready on all the nodes.
+%%  elock: the application on every node (the graph process), then
+%%  the scope on every node, linked to a holder that lives for the
+%%  test case, ready on all the nodes.
 %%  mnesia: a ram schema on every node, joined to the first one,
 %%  the table with ram_copies on all the nodes.
 %%  global: nothing
 %%-----------------------------------------------------------------
 start_path(elock, Config)->
   Nodes = node_list(Config),
+  [ {ok, _Started} = rpc(Node, application, ensure_all_started, [elock]) || Node <- Nodes ],
   Holders = [ spawn(Node, fun scope_holder/0) || Node <- Nodes ],
   ok = performance_nodes:wait_until(fun()-> scope_ready(Nodes) end),
   [{holders, Holders} | Config];
@@ -244,6 +246,7 @@ start_path(global, Config)->
 
 stop_path(elock, Config)->
   [ exit(Holder, kill) || Holder <- ?config(holders, Config) ],
+  [ ok = rpc(Node, application, stop, [elock]) || Node <- node_list(Config) ],
   ok;
 stop_path(mnesia, Config)->
   [ stopped = rpc(Node, mnesia, stop, []) || Node <- node_list(Config) ],

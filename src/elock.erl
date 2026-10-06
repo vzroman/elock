@@ -19,8 +19,10 @@ are implementation details.
 
 ## Setup
 
-`elock` is a library application: list it in the `applications` of your own
-application. The nodes must be connected by Erlang distribution.
+`elock` is an application: list it in the `applications` of your own
+application and it is started before yours. It runs one process per node,
+the wait-for graph of the node, where the deadlocks are detected. The nodes
+must be connected by Erlang distribution.
 
 A scope is an independent set of locks named by an atom. Start it under a
 supervisor of yours, on every node that is to keep locks of the scope:
@@ -114,6 +116,10 @@ the winning request waits for.
   verdicts are made independently of each other, without the coordination
   it takes to agree on a single loser. Issued one after another, the
   requests of a cycle yield exactly one loser.
+- A request can also lose while its cycle has just dissolved: the verdict is
+  made on the edges as the graph process has them, which lag the managers
+  by its backlog. The loser keeps its locks and the caller repeats the
+  request, as after a real deadlock.
 
 ## Failures
 

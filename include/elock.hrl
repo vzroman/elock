@@ -41,19 +41,36 @@
   held :: held_locks()
 }).
 
-% To the client, or to the origin manager as the answer to its probe
+% Graph -> manager, manager -> client: the request has lost
 -record(deadlock,{
   ref :: reference(),
   winner :: lock_key() % the lock the winning request waits for
 }).
 
+% Manager -> graph of its node: the new holds of a waiting request
+-record(add_edges,{
+  lock :: lock_key(),           % the manager's lock
+  ref :: reference(),
+  weight :: non_neg_integer(),  % #request.held_count
+  manager :: pid(),
+  held :: held_locks()          % #add_held_locks.held as it came
+}).
+
+% Manager -> graph of its node: the request has stopped waiting
+-record(remove_edges,{
+  lock :: lock_key(),
+  ref :: reference()
+}).
+
+% Graph -> graph of another node: expand these locks there. expand and
+% visited are set for the hop, a launch walks without them
 -record(deadlock_probe,{
-  id :: reference(),        % the launch, the same in every copy
-  ref :: reference(),       % the origin request
-  edge :: lock_key(), % the lock the origin waits for
-  manager :: pid(),         % the origin manager
-  weight :: non_neg_integer(), % the held count of the origin
-  sent_to :: #{pid() => true} % the managers that have got the probe
+  ref :: reference(),           % the origin request
+  edge :: lock_key(),           % the lock the origin waits for
+  manager :: pid(),             % the origin manager
+  weight :: non_neg_integer(),  % the held count of the origin
+  expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
+  visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
 }).
 
 %%-------------------------------------------------------------------------------

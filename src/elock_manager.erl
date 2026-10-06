@@ -16,6 +16,12 @@
 %%  The requests may arrive out of order, the manager takes them in
 %%  by the ticket (see handle_request/2).
 %%
+%%  A waiting request that holds something is an edge of the wait-for
+%%  graph of the node (elock_graph): the manager casts its held map
+%%  to the graph process when the client sends it, and casts the
+%%  remove when the waiter leaves. The graph process walks the graph
+%%  and sends #deadlock{} to the manager of a request that has lost.
+%%
 %%  The manager exits once it has removed the entry from ETS.
 %%=================================================================
 -module(elock_manager).
@@ -199,8 +205,7 @@ start_manager(Request)->
   barging :: #request{} | undefined, % the pending upgrade, not in the queue
   last :: pos_integer(), % the last ticket taken in
   postponed :: ordsets:ordset(#request{}), % ahead of a missing ticket
-  postpone_timer :: reference() | undefined,
-  graph :: elock_graph:graph() | undefined
+  postpone_timer :: reference() | undefined
 }).
 
 -record(req,{
@@ -212,7 +217,8 @@ start_manager(Request)->
   shared :: boolean(),
   held_count :: non_neg_integer() | undefined, % unused for the first holder
   has_lock :: boolean(),
-  timer :: reference() | undefined % the timeout timer, while waiting
+  timer :: reference() | undefined, % the timeout timer, while waiting
+  edges = false :: boolean() % the graph has the edges of this request
 }).
 
 -record(client,{
@@ -272,8 +278,7 @@ init(#request{
     barging = undefined,
     last = 1,
     postponed = [],
-    postpone_timer = undefined,
-    graph = undefined
+    postpone_timer = undefined
   },
 
   loop(State).
@@ -291,8 +296,6 @@ loop(State0)->
         handle_timeout(Ref, State0);
       #deadlock{} = Deadlock->
         handle_deadlock(Deadlock, State0);
-      #deadlock_probe{} = Probe->
-        handle_deadlock_probe(Probe, State0);
       #add_held_locks{} = Update->
         handle_add_held_locks(Update, State0);
       {'DOWN', _Ref, process, ClientPID, _Reason}->
@@ -546,8 +549,9 @@ handle_timeout(
   end.
 
 %%-----------------------------------------------------------------
-%%  The answer to this manager's probe, or a local closer that has
-%%  lost to a foreign probe (see handle_deadlock_probe/2)
+%%  The verdict of the graph process: the request has lost a walk
+%%  of its own, or a walk of another request it closed a cycle for
+%%  (see elock_graph)
 %%-----------------------------------------------------------------
 -spec handle_deadlock(#deadlock{}, #state{}) -> #state{}.
 handle_deadlock(
@@ -810,19 +814,17 @@ dequeue(
         ref = Ref
       },
       requests = Requests0,
-      clients = Clients0,
-      graph = Graph0
+      clients = Clients0
     } = State
 )->
-  {_, Graph} = stop_waiting(Req, Graph0),
+  stop_waiting(Req, State),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
 
   State#state{
     requests = Requests,
     clients = Clients,
-    barging = undefined,
-    graph = Graph
+    barging = undefined
   };
 
 dequeue(
@@ -834,20 +836,18 @@ dequeue(
     #state{
       requests = Requests0,
       clients = Clients0,
-      queue = Queue0,
-      graph = Graph0
+      queue = Queue0
     } = State
 )->
   Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
-  {_, Graph} = stop_waiting(Req, Graph0),
+  stop_waiting(Req, State),
 
   State#state{
     queue = Queue,
     requests = Requests,
-    clients = Clients,
-    graph = Graph
+    clients = Clients
   }.
 
 %%-----------------------------------------------------------------
@@ -885,18 +885,17 @@ locked(
       holders = Holders0,
       queue = Queue0,
       requests = Requests0,
-      can_share = CanShare0,
-      graph = Graph0
+      can_share = CanShare0
     } = State)->
 
   Proxy ! ?reply(Tag, #locked{ref = Ref}),
-  {Req, Graph} = stop_waiting(
+  Req = stop_waiting(
     Req0#req{
       has_lock = true,
       proxy = undefined,
       tag = undefined
     },
-    Graph0
+    State
   ),
 
   Requests = Requests0#{
@@ -913,8 +912,7 @@ locked(
     holders = Holders,
     queue = Queue,
     requests = Requests,
-    can_share = CanShare,
-    graph = Graph
+    can_share = CanShare
   }.
 
 -spec unlocked(#req{}, #state{}) -> #state{}.
@@ -1095,74 +1093,48 @@ try_unlock(#state{
         clients = Clients#clients{
           clients = #{}
         },
-        can_share = true,
-        graph = undefined
+        can_share = true
       });
     _->
       exit(normal)
   end.
 
 %%=================================================================
-%%  Deadlock probes (see elock_graph)
+%%  The edges of the wait-for graph (see elock_graph)
 %%
-%%  A waiting request joins the graph in handle_add_held_locks/2 and
-%%  leaves it in stop_waiting/2
+%%  A waiting request joins the graph of the node in
+%%  handle_add_held_locks/2, with every held map the client sends,
+%%  and leaves it in stop_waiting/2. The verdict comes back as
+%%  #deadlock{} (see handle_deadlock/2)
 %%=================================================================
 -spec handle_add_held_locks(#add_held_locks{}, #state{}) -> #state{}.
 handle_add_held_locks(
     #add_held_locks{
       ref = Ref,
-      held = Update
+      held = Held
     },
     #state{
       requests = Requests,
       scope = Scope,
-      term = Term,
-      graph = Graph0
+      term = Term
     } = State
 )->
   case Requests of
     #{Ref := #req{
       has_lock = false,
-      held_count = Weight
-    }}->
-      Graph = elock_graph:add_edges(Ref, {Scope, Term, node()}, Update, Weight, Graph0),
+      held_count = HeldCount
+    } = Req}->
+      elock_graph:add_edges({Scope, Term, node()}, Ref, HeldCount, Held),
       State#state{
-        graph = Graph
+        requests = Requests#{
+          Ref => Req#req{
+            edges = true
+          }
+        }
       };
     _->
       % Granted or left meanwhile
       State
-  end.
-
-%%-----------------------------------------------------------------
-%%  The closers are aborted by the ref: an abort may grant a later
-%%  closer, which handle_deadlock/2 then skips. The graph from probe/3
-%%  is taken before the aborts, which may drop it with its seen set.
-%%  The probe is forwarded on the graph after the aborts
-%%-----------------------------------------------------------------
--spec handle_deadlock_probe(#deadlock_probe{}, #state{}) -> #state{}.
-handle_deadlock_probe(
-    #deadlock_probe{edge = Winner} = Probe,
-    #state{
-      graph = Graph0,
-      scope = Scope,
-      term = Term
-    } = State0
-)->
-  case elock_graph:probe(Probe, {Scope, Term, node()}, Graph0) of
-    {forward, AbortRefs, Graph1}->
-      State = #state{graph = Graph} = lists:foldl(
-        fun(Ref, Acc)->
-          handle_deadlock(#deadlock{ref = Ref, winner = Winner}, Acc)
-        end,
-        State0#state{graph = Graph1},
-        AbortRefs
-      ),
-      elock_graph:forward(Probe, Graph),
-      State;
-    stop->
-      State0
   end.
 
 %%=================================================================
@@ -1308,17 +1280,25 @@ start_waiting(#request{
   notify_queued(Request),
   start_timer(new_req(Request), Timeout).
 
--spec stop_waiting(#req{}, elock_graph:graph() | undefined) ->
-  {#req{}, elock_graph:graph() | undefined}.
+%%-----------------------------------------------------------------
+%%  A waiter that was never asked for its held map, or was granted or
+%%  left before the answer came, has no edges: nothing to remove
+%%-----------------------------------------------------------------
+-spec stop_waiting(#req{}, #state{}) -> #req{}.
 stop_waiting(
     #req{
-      ref = Ref
-    } = Req0,
-    Graph0
+      ref = Ref,
+      edges = true
+    } = Req,
+    #state{
+      scope = Scope,
+      term = Term
+    }
 )->
-  Req = stop_timer(Req0),
-  Graph = elock_graph:remove_edges(Ref, Graph0),
-  {Req, Graph}.
+  elock_graph:remove_edges({Scope, Term, node()}, Ref),
+  stop_timer(Req);
+stop_waiting(Req, _State)->
+  stop_timer(Req).
 
 %%-----------------------------------------------------------------
 %%  The held map is asked for only on a wait: most requests never

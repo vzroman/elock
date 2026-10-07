@@ -2,10 +2,12 @@
 %%  Database transactions on elock, mnesia and global.
 %%
 %%  A client imitates database transactions in a loop: 1) it
-%%  acquires the locks of the transaction, 2) waits write_ms, the
-%%  imitated write to the database (timer:sleep/1), 3) releases the
-%%  locks; transactions_per_client times. clients_per_node clients
-%%  run on every node of the nodes config.
+%%  acquires the locks of the transaction one after another and
+%%  waits read_cost after every one of them, the imitated read under
+%%  the lock just taken, 2) waits write_ms, the imitated write to the
+%%  database (timer:sleep/1), 3) releases the locks;
+%%  transactions_per_client times. clients_per_node clients run on
+%%  every node of the nodes config.
 %%
 %%  The locks of a transaction are built before its clock starts:
 %%  - N (locks_per_transaction) terms. K of them are keys of the
@@ -60,7 +62,7 @@
 %%
 %%  The points come from the performance config (performance.config
 %%  merged over ?DEFAULTS). The nodes, transactions_per_client,
-%%  write_ms and deadlocks are fixed per run, the lists nest from
+%%  write_ms, read_cost and deadlocks are fixed per run, the lists nest from
 %%  the outermost to the innermost: clients_per_node,
 %%  locks_per_transaction, intersect_percents, exclusive_percents,
 %%  paths. So at every (clients, locks, intersect, exclusive) the
@@ -87,8 +89,11 @@
 %%
 %%  A client measures every transaction: the transaction time from
 %%  the start of the acquisition (restarts included) to the end of
-%%  the release (for mnesia: around mnesia:transaction/1), and the
-%%  write time, the measured sleep of the committed attempt.
+%%  the release (for mnesia: around mnesia:transaction/1), the write
+%%  time, the measured sleep of the committed attempt, and its read
+%%  time, the measured sleeps of the reads of the committed attempt.
+%%  The reads of an attempt thrown away by a restart are lost with
+%%  it: they are the price of the restart.
 %%
 %%  Before a point starts the controller writes the marker of the
 %%  running point for the performance report (its inputs, its index
@@ -100,14 +105,15 @@
 %%  performance_metrics:point/2):
 %%  - the inputs: path, nodes, clients_per_node,
 %%    transactions_per_client, locks_per_transaction,
-%%    exclusive_percent, intersect_percent, deadlocks, write_ms;
-%%    elapsed_ms;
+%%    exclusive_percent, intersect_percent, deadlocks, write_ms,
+%%    read_cost; elapsed_ms;
 %%  - transactions and transactions_per_second, locks
 %%    (transactions * N) and locks_per_second, over the elapsed
 %%    time;
 %%  - lock_time_percent, the share of the locks in the transaction
-%%    time: 100 * (transaction time - write time) / transaction
-%%    time, summed over all the transactions;
+%%    time: 100 * (transaction time - write time - read time) /
+%%    transaction time, summed over all the transactions. The reads
+%%    of the thrown away attempts stay in it;
 %%  - restarts (elock and mnesia);
 %%  - metrics, per node by role name: the maximum memory, the
 %%    scheduler utilization, the maximum run queue and the octets
@@ -158,8 +164,9 @@
 }).
 
 % The points, overridden by the performance map of performance.config.
-% transactions_per_client, write_ms and deadlocks (false: the locks are
-% taken in the sorted order, true: in a random order) are fixed per run,
+% transactions_per_client, write_ms, read_cost (ms of the imitated read
+% under every lock just taken, 0: none) and deadlocks (false: the locks
+% are taken in the sorted order, true: in a random order) are fixed per run,
 % the lists nest from the outermost to the innermost in this order.
 % global_max_locks: global skips the points with more locks held at
 % once (the nodes * clients_per_node * locks_per_transaction).
@@ -168,6 +175,7 @@
 -define(DEFAULTS, #{
   transactions_per_client => 1000,
   write_ms => 10,
+  read_cost => 0,
   deadlocks => false,
   clients_per_node => [1000, 10000, 100000],
   locks_per_transaction => [1, 10, 100, 1000],
@@ -188,6 +196,7 @@
   deadlocks,
   pool,
   write_ms,
+  read_cost,
   transactions
 }).
 
@@ -195,6 +204,7 @@
 -record(sums, {
   transaction_us = 0,
   write_us = 0,
+  read_us = 0,
   restarts = 0
 }).
 
@@ -290,6 +300,7 @@ run_points(Config)->
   #{
     transactions_per_client := Transactions,
     write_ms := WriteMs,
+    read_cost := ReadCost,
     deadlocks := Deadlocks,
     clients_per_node := ClientCounts,
     locks_per_transaction := LockCounts,
@@ -311,7 +322,8 @@ run_points(Config)->
       exclusive_percent => Exclusive,
       intersect_percent => Intersect,
       deadlocks => Deadlocks,
-      write_ms => WriteMs
+      write_ms => WriteMs,
+      read_cost => ReadCost
     }, Held}
     || Clients <- ClientCounts,
        Locks <- LockCounts,
@@ -361,7 +373,8 @@ run_point(#{
   exclusive_percent := Exclusive,
   intersect_percent := Intersect,
   deadlocks := Deadlocks,
-  write_ms := WriteMs
+  write_ms := WriteMs,
+  read_cost := ReadCost
 } = Point, Held, Index, Total, Config)->
   ok = performance_metrics:running(Config, Point#{index => Index, total => Total}),
   Nodes = ?config(nodes, Config),
@@ -375,6 +388,7 @@ run_point(#{
     % The size of the shared pool: the locks all the clients hold at once
     pool = Held,
     write_ms = WriteMs,
+    read_cost = ReadCost,
     transactions = PerClient
   },
   RunRef = make_ref(),
@@ -383,7 +397,10 @@ run_point(#{
     start_runner(Name, Node, Controller, RunRef, Clients, Client) || Name := Node <- Nodes
   ]),
   ok = await_runners_ready(map_size(Runners), RunRef, Runners),
-  #{trace := Trace} = ?config(performance, Config),
+  #{trace := Trace0} = ?config(performance, Config),
+  % global is not traced: it writes none of the steps of a transaction
+  % and the report has no model of it
+  Trace = case Path of global-> false; _-> Trace0 end,
   ok = performance_trace:start(Trace, Nodes),
   [ Runner ! {?TAG, RunRef, start} || Runner := _ <- Runners ],
   StartedAt = erlang:monotonic_time(microsecond),
@@ -440,6 +457,7 @@ result(#{
 } = Point, ElapsedUs, Transactions, #sums{
   transaction_us = TransactionUs,
   write_us = WriteUs,
+  read_us = ReadUs,
   restarts = Restarts
 }, Metrics)->
   Result = Point#{
@@ -448,7 +466,7 @@ result(#{
     transactions_per_second => Transactions * 1000000 / ElapsedUs,
     locks => Transactions * Locks,
     locks_per_second => Transactions * Locks * 1000000 / ElapsedUs,
-    lock_time_percent => 100 * (TransactionUs - WriteUs) / TransactionUs,
+    lock_time_percent => 100 * (TransactionUs - WriteUs - ReadUs) / TransactionUs,
     metrics => Metrics
   },
   case Path of
@@ -500,12 +518,13 @@ await_clients(Count, RunRef, Sums)->
   end.
 
 add(
-  #sums{transaction_us = TransactionUs1, write_us = WriteUs1, restarts = Restarts1},
-  #sums{transaction_us = TransactionUs2, write_us = WriteUs2, restarts = Restarts2}
+  #sums{transaction_us = TransactionUs1, write_us = WriteUs1, read_us = ReadUs1, restarts = Restarts1},
+  #sums{transaction_us = TransactionUs2, write_us = WriteUs2, read_us = ReadUs2, restarts = Restarts2}
 )->
   #sums{
     transaction_us = TransactionUs1 + TransactionUs2,
     write_us = WriteUs1 + WriteUs2,
+    read_us = ReadUs1 + ReadUs2,
     restarts = Restarts1 + Restarts2
   }.
 
@@ -526,15 +545,16 @@ transactions(Count, Client, Sums)->
 
 %%-----------------------------------------------------------------
 %%  A transaction of the path: its locks are built before the clock
-%%  starts. elock: a lost deadlock has the locks of the attempt
-%%  released and starts the transaction over. mnesia: every run of
-%%  the fun counts, the result is the write of the committed run
+%%  starts. Every lock taken is followed by its read. elock: a lost
+%%  deadlock has the locks of the attempt released and starts the
+%%  transaction over. mnesia: every run of the fun counts, the result
+%%  is the reads and the write of the committed run
 %%-----------------------------------------------------------------
-transaction(#client{path = elock, write_ms = WriteMs} = Client)->
+transaction(#client{path = elock, write_ms = WriteMs, read_cost = ReadCost} = Client)->
   Locks = elock_locks(Client),
   StartedAt = erlang:monotonic_time(microsecond),
   ?TRACE(tx_begin, self(), elock),
-  {Refs, Restarts} = elock_lock(Locks, Locks, [], 0),
+  {Refs, ReadUs, Restarts} = elock_lock(Locks, Locks, [], 0, 0, ReadCost),
   ?TRACE(tx_locked, self(), Restarts),
   WriteUs = write(WriteMs),
   ?TRACE(tx_written, self(), []),
@@ -543,71 +563,90 @@ transaction(#client{path = elock, write_ms = WriteMs} = Client)->
   #sums{
     transaction_us = erlang:monotonic_time(microsecond) - StartedAt,
     write_us = WriteUs,
+    read_us = ReadUs,
     restarts = Restarts
   };
-transaction(#client{path = mnesia, write_ms = WriteMs} = Client)->
+transaction(#client{path = mnesia, write_ms = WriteMs, read_cost = ReadCost} = Client)->
   Locks = mnesia_locks(Client),
   put(?RUNS, 0),
   StartedAt = erlang:monotonic_time(microsecond),
   ?TRACE(tx_begin, self(), mnesia),
-  {atomic, WriteUs} = mnesia:transaction(
+  {atomic, {ReadUs, WriteUs}} = mnesia:transaction(
     fun()->
       put(?RUNS, get(?RUNS) + 1),
       ?TRACE(tx_run, self(), get(?RUNS)),
-      mnesia_lock(Locks),
+      Read = mnesia_lock(Locks, ReadCost, 0),
       ?TRACE(tx_locked, self(), get(?RUNS) - 1),
       Written = write(WriteMs),
       ?TRACE(tx_written, self(), []),
-      Written
+      {Read, Written}
     end
   ),
   ?TRACE(tx_end, self(), []),
   #sums{
     transaction_us = erlang:monotonic_time(microsecond) - StartedAt,
     write_us = WriteUs,
+    read_us = ReadUs,
     restarts = get(?RUNS) - 1
   };
-transaction(#client{path = global, nodes = Nodes, write_ms = WriteMs} = Client)->
+transaction(#client{path = global, nodes = Nodes, write_ms = WriteMs, read_cost = ReadCost} = Client)->
   % global runs only at deadlocks = false
   Terms = order(terms(Client), false),
   StartedAt = erlang:monotonic_time(microsecond),
-  global_lock(Terms, Nodes),
+  ReadUs = global_lock(Terms, Nodes, ReadCost, 0),
   WriteUs = write(WriteMs),
   lists:foreach(fun(Term)-> true = global:del_lock({Term, self()}, Nodes) end, Terms),
   #sums{
     transaction_us = erlang:monotonic_time(microsecond) - StartedAt,
-    write_us = WriteUs
+    write_us = WriteUs,
+    read_us = ReadUs
   }.
 
+% The imitated write, its measured time
 write(WriteMs)->
+  work(WriteMs).
+
+% The imitated read under the lock just taken, its measured time.
+% read_cost 0: no read
+read(0)->
+  0;
+read(ReadCost)->
+  ?TRACE(tx_read, self(), []),
+  work(ReadCost).
+
+work(Ms)->
   StartedAt = erlang:monotonic_time(microsecond),
-  timer:sleep(WriteMs),
+  timer:sleep(Ms),
   erlang:monotonic_time(microsecond) - StartedAt.
 
-elock_lock([{Term, Nodes, Options} | Rest], Locks, Refs, Restarts)->
+% {Refs, ReadUs, Restarts} of the committed attempt
+elock_lock([{Term, Nodes, Options} | Rest], Locks, Refs, ReadUs, Restarts, ReadCost)->
   case elock:lock(?SCOPE, Term, Nodes, Options) of
     {ok, Ref}->
-      elock_lock(Rest, Locks, [Ref | Refs], Restarts);
+      elock_lock(Rest, Locks, [Ref | Refs], ReadUs + read(ReadCost), Restarts, ReadCost);
     {error, {deadlock, _Lock}}->
       ?TRACE(tx_restart, self(), length(Refs)),
       lists:foreach(fun elock:unlock/1, Refs),
       ?TRACE(tx_released, self(), []),
-      elock_lock(Locks, Locks, [], Restarts + 1)
+      % The reads of the attempt are lost with it
+      elock_lock(Locks, Locks, [], 0, Restarts + 1, ReadCost)
   end;
-elock_lock([], _Locks, Refs, Restarts)->
-  {Refs, Restarts}.
+elock_lock([], _Locks, Refs, ReadUs, Restarts, _ReadCost)->
+  {Refs, ReadUs, Restarts}.
 
-mnesia_lock([{Item, Kind} | Rest])->
+% ReadUs of the run. A run that restarts is left by mnesia:lock/2
+mnesia_lock([{Item, Kind} | Rest], ReadCost, ReadUs)->
   _ = mnesia:lock(Item, Kind),
-  mnesia_lock(Rest);
-mnesia_lock([])->
-  ok.
+  mnesia_lock(Rest, ReadCost, ReadUs + read(ReadCost));
+mnesia_lock([], _ReadCost, ReadUs)->
+  ReadUs.
 
-global_lock([Term | Rest], Nodes)->
+% ReadUs
+global_lock([Term | Rest], Nodes, ReadCost, ReadUs)->
   true = global:set_lock({Term, self()}, Nodes, infinity),
-  global_lock(Rest, Nodes);
-global_lock([], _Nodes)->
-  ok.
+  global_lock(Rest, Nodes, ReadCost, ReadUs + read(ReadCost));
+global_lock([], _Nodes, _ReadCost, ReadUs)->
+  ReadUs.
 
 %%=================================================================
 %%  The locks of a transaction

@@ -210,7 +210,7 @@ start_manager(Request)->
 
 %% k: the weight of the age in the queue key. 1 is the oldest first,
 %% mnesia's order; 0 is the order of arrival
--define(AGE_FACTOR, 1000).
+-define(AGE_FACTOR, 1).
 
 -record(state,{
   holders :: holders(),

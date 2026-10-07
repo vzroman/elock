@@ -10,7 +10,7 @@ Distributed locks on Erlang terms.
 
 A lock is a term locked in a scope on a node. `lock/4` takes it exclusively
 or shared, on one node or on several nodes at once, and returns a reference
-to release it with `unlock/1`. Waiting requests are served in order, the
+to release it with `unlock/1`. Waiting requests are served by age and arrival, the
 locks of a process are released when it exits, and deadlocks are detected,
 also across nodes and scopes.
 
@@ -70,9 +70,12 @@ end.
   compete only on the nodes that both of them name.
 - An exclusive lock has one holder. A shared lock has any number of holders
   and keeps the exclusive requests waiting.
-- The requests for a lock are served on each node in the order they arrive.
-  A shared request joins the shared holders at once only while nobody waits,
-  so a stream of shared requests does not starve an exclusive one.
+- The requests for a lock are served on each node by the birth of the
+  requesting process's lock context, the oldest first, in the order they
+  arrive among equals. The context is born at the process's first lock call
+  and dies with its last release. A shared request joins the shared holders
+  at once only while nobody waits, so a stream of shared requests does not
+  starve an exclusive one.
 - A lock belongs to the process that took it, and only that process can
   release it. The locks of a process are released and its waiting requests
   are withdrawn when it exits.
@@ -102,9 +105,8 @@ a scope, across scopes and across nodes. At least one request of the cycle
 fails with `{error, {deadlock, {Scope, Term, Node}}}`, which names the lock
 the winning request waits for.
 
-- A request of a process that holds fewer locks loses to a request of a
-  process that holds more, a lock on several nodes counting once per node.
-  Equal numbers are settled by a coin.
+- The request of the younger lock context loses. Equal ages are settled by
+  a coin.
 - The loser keeps the locks it holds, and the others keep waiting for them.
   To let them through, release those locks and then repeat the request.
 - Two processes that lock the same term on the same several nodes at the

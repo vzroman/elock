@@ -7,6 +7,12 @@
 %%-------------------------------------------------------------------------------
 -type lock_key() :: {atom(), term(), node()}.
 -type held_locks() :: #{lock_key() => pid()}.
+% The place of a request in the queue of its manager: its position, the
+% birth of the client's context derived by the manager from #request.age
+% on the system time, so the positions of two nodes compare as they are;
+% then the ticket, then the reference (see elock_manager). The position
+% alone is the weight in a deadlock, the smaller wins (see elock_graph)
+-type queue_key() :: {integer(), pos_integer(), reference()}.
 
 -record(request,{
   % The ticket must stay first: postponed requests are sorted by it.
@@ -18,7 +24,8 @@
   proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
-  held_count :: non_neg_integer(), % held locks, the weight in a deadlock
+  held_count :: non_neg_integer(), % held locks: a waiter that holds something may close a cycle
+  age :: non_neg_integer(), % the age of the client's lock context at the call, microseconds (see elock_context)
   nodes :: nonempty_list(node()),
   timeout :: pos_integer() | undefined
 }).
@@ -51,7 +58,7 @@
 -record(add_edges,{
   lock :: lock_key(),           % the manager's lock
   ref :: reference(),
-  weight :: non_neg_integer(),  % #request.held_count
+  position :: integer(),        % #req.position, the weight in a deadlock
   manager :: pid(),
   held :: held_locks()          % #add_held_locks.held as it came
 }).
@@ -68,10 +75,15 @@
   ref :: reference(),           % the origin request
   edge :: lock_key(),           % the lock the origin waits for
   manager :: pid(),             % the origin manager
-  weight :: non_neg_integer(),  % the held count of the origin
+  weight :: integer(),          % the queue position of the origin
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
   visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
 }).
+
+%%-------------------------------------------------------------------------------
+%% TRACING
+%%-------------------------------------------------------------------------------
+-include("elock_trace.hrl").
 
 %%-------------------------------------------------------------------------------
 %% LOGGING

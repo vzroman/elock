@@ -6,7 +6,7 @@
 %%  elock_sup. It owns a private ETS bag of the waiting requests of
 %%  the node that hold something, keyed by the lock they wait for:
 %%
-%%      #waiter{ lock, ref, weight, manager, held }
+%%      #waiter{ lock, ref, position, manager, held }
 %%
 %%  The waiters at a key all belong to one manager, which runs on
 %%  the lock's node: the rows of the waiters at lock L are complete
@@ -21,8 +21,10 @@
 %%  nothing clean and never stops on its own.
 %%
 %%  A walk serves one launch: the origin request, waiting for Edge
-%%  at Manager with Weight (#request.held_count, fixed for the life
-%%  of the request). Every new hold of a waiting request is probed
+%%  at Manager with Weight: its queue position, the birth of its
+%%  context on the system time of its manager, compared as it is
+%%  with the positions of the closers: the older wins, the coin on
+%%  a tie (see beats/3). Every new hold of a waiting request is probed
 %%  once, when it appears, so the walk of the edge that closes a
 %%  cycle finds the rest of the cycle in place. The waiters of an
 %%  expanded lock depend on the origin: it holds the lock, or a
@@ -70,7 +72,7 @@
 -record(waiter,{
   lock :: lock_key(),           % the lock the request waits for, the key
   ref :: reference(),           % the request
-  weight :: non_neg_integer(),  % #request.held_count, fixed for the life of the request
+  position :: integer(),        % #req.position, fixed for the life of the request
   manager :: pid(),             % the manager of lock, the sender of the edges
   held :: held_locks()          % #{lock_key() => pid()}, as the client sent it
 }).
@@ -103,9 +105,9 @@ init()->
 %%  Held is never empty (see elock_context:notify_queued/3 and
 %%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
--spec add_edges(lock_key(), reference(), non_neg_integer(), held_locks()) -> ok.
-add_edges(Lock, Ref, Weight, Held)->
-  ?MODULE ! #add_edges{lock = Lock, ref = Ref, weight = Weight, manager = self(), held = Held},
+-spec add_edges(lock_key(), reference(), integer(), held_locks()) -> ok.
+add_edges(Lock, Ref, Position, Held)->
+  ?MODULE ! #add_edges{lock = Lock, ref = Ref, position = Position, manager = self(), held = Held},
   ok.
 
 -spec remove_edges(lock_key(), reference()) -> ok.
@@ -137,22 +139,23 @@ loop()->
 %%  No row: the first answer of the client to #queued{}. A row: a
 %%  later grant of a multi node request, or a key held at a manager
 %%  that died and was replaced. The new keys only are launched: every
-%%  edge is probed once, when it appears. The weight is the row's
+%%  edge is probed once, when it appears, weighed then (see launch/2)
 %%-----------------------------------------------------------------
 -spec handle_add_edges(#add_edges{}) -> ok.
 handle_add_edges(#add_edges{
   lock = Lock,
   ref = Ref,
-  weight = Weight,
+  position = Position,
   manager = Manager,
   held = Held
 })->
+  ?TRACE(g_add, Ref, {map_size(Held), elock_trace:mailbox()}),
   case ets:match_object(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}) of
     []->
       Row = #waiter{
         lock = Lock,
         ref = Ref,
-        weight = Weight,
+        position = Position,
         manager = Manager,
         held = Held
       },
@@ -198,6 +201,7 @@ handle_remove_edges(#remove_edges{
   lock = Lock,
   ref = Ref
 })->
+  ?TRACE(g_remove, Ref, []),
   ets:match_delete(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}),
   ok.
 
@@ -214,7 +218,7 @@ launch(
     #waiter{
       lock = Edge,
       ref = Ref,
-      weight = Weight,
+      position = Position,
       manager = Manager
     },
     NewKeys
@@ -223,10 +227,12 @@ launch(
     ref = Ref,
     edge = Edge,
     manager = Manager,
-    weight = Weight
+    weight = Position
   },
   {Entry, Visited, Hops} = schedule(NewKeys, [], #{Edge => true}, #{}),
-  verdict(walk(Entry, Probe, Visited, [], Hops), Probe).
+  Result = walk(Entry, Probe, Visited, [], Hops),
+  ?TRACE(g_walk, Ref, elock_trace:walk(Result)),
+  verdict(Result, Probe).
 
 %%-----------------------------------------------------------------
 %%  A hop: the sender has scheduled the entry locks in visited
@@ -236,7 +242,10 @@ handle_probe(#deadlock_probe{
   expand = Entry,
   visited = Visited
 } = Probe)->
-  verdict(walk(Entry, Probe, Visited, [], #{}), Probe).
+  ?TRACE(g_probe, Probe#deadlock_probe.ref, {length(Entry), map_size(Visited), erlang:external_size(Probe), elock_trace:mailbox()}),
+  Result = walk(Entry, Probe, Visited, [], #{}),
+  ?TRACE(g_walk, Probe#deadlock_probe.ref, elock_trace:walk(Result)),
+  verdict(Result, Probe).
 
 %%-----------------------------------------------------------------
 %%  Expands the scheduled locks until none is left. Returns the
@@ -285,7 +294,7 @@ check_cycles(
 check_cycles(
     [#waiter{
       ref = Ref,
-      weight = Weight,
+      position = Position,
       manager = Manager,
       held = Held
     } | Rest],
@@ -298,7 +307,7 @@ check_cycles(
 )->
   case Held of
     #{Edge := OriginManager}->
-      case beats(Weight, Ref, Probe) of
+      case beats(Position, Ref, Probe) of
         true->
           origin;
         false->
@@ -311,21 +320,23 @@ check_cycles([], _Probe, Losers, Found)->
   {Losers, Found}.
 
 %%-----------------------------------------------------------------
-%%  Heavier wins, the coin on a tie
+%%  The smaller position wins, the older context; the coin on a tie.
+%%  The positions are stamped on the system time of their managers,
+%%  so they compare across nodes as they are
 %%-----------------------------------------------------------------
--spec beats(non_neg_integer(), reference(), #deadlock_probe{}) -> boolean().
+-spec beats(integer(), reference(), #deadlock_probe{}) -> boolean().
 beats(
-    CloserWeight,
+    CloserPosition,
     CloserRef,
     #deadlock_probe{
       ref = Ref,
-      weight = Weight
+      weight = Position
     }
 )->
   if
-    CloserWeight > Weight ->
+    CloserPosition < Position ->
       true;
-    CloserWeight < Weight ->
+    CloserPosition > Position ->
       false;
     true ->
       drop_coin(CloserRef, Ref) =:= CloserRef
@@ -378,6 +389,7 @@ verdict(
       manager = Manager
     }
 )->
+  ?TRACE(g_verdict, Ref, origin),
   ecall:send(Manager, #deadlock{ref = Ref, winner = Winner}),
   ok;
 verdict(
@@ -386,9 +398,13 @@ verdict(
       edge = Edge
     } = Probe
 )->
-  [ ecall:send(Manager, #deadlock{ref = Ref, winner = Edge}) || {Ref, Manager} <- Losers ],
+  [ begin
+      ?TRACE(g_verdict, Ref, {closer, Probe#deadlock_probe.ref}),
+      ecall:send(Manager, #deadlock{ref = Ref, winner = Edge})
+    end || {Ref, Manager} <- Losers ],
   maps:foreach(
     fun(Node, Locks)->
+      ?TRACE(g_hop, Probe#deadlock_probe.ref, {Node, length(Locks), map_size(Visited)}),
       ecall:send({?MODULE, Node}, Probe#deadlock_probe{expand = Locks, visited = Visited})
     end,
     Hops

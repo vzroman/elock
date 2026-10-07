@@ -3,6 +3,13 @@
 %%  The logic behind the lock API of elock.erl: the context of the
 %%  locks a client process holds (kept in its dictionary) and the
 %%  client side of a request.
+%%
+%%  The context is born at the first lock call of the process and
+%%  dies with its last release. Every request carries the age of the
+%%  context at the call, microseconds: a duration, so the clocks of
+%%  the nodes never meet. The manager derives the birth on its own
+%%  clock, queues by it, and the younger request of a cycle loses
+%%  (see elock_manager).
 %%=================================================================
 -module(elock_context).
 -moduledoc false.
@@ -40,7 +47,8 @@
   ref2lock :: #{reference() => #lock{}},
   % Sent to managers as is. The same Term in two scopes is two locks.
   locked :: held_locks(),
-  counts :: lock_counts() % N >= 2: the re-entered keys only
+  counts :: lock_counts(), % N >= 2: the re-entered keys only
+  birth :: integer() % monotonic time in microseconds of the first lock call
 }).
 
 -type context() :: #context{} | undefined.
@@ -64,14 +72,18 @@ lock(Scope, Term, Nodes, Options)->
     is_shared := IsShared
   } = validate_options(Options),
   Ref = make_ref(),
+  ?TRACE(call, Ref, {Scope, Term, Nodes, IsShared}),
   Context = get_context(),
   HeldLocks = held_locks(Context),
+  Now = erlang:monotonic_time(microsecond),
+  Birth = birth(Context, Now),
   Request = #request{
     ref = Ref,
     scope = Scope,
     term = Term,
     nodes = lists:usort(Nodes),
     held_count = held_count(Context),
+    age = Now - Birth,
     client = self(),
     timeout = Timeout,
     shared = IsShared
@@ -80,9 +92,11 @@ lock(Scope, Term, Nodes, Options)->
   % (see wait_verdict/2)
   case run_request(Ref, Request, HeldLocks) of
     {ok, LockedNodes} ->
-      locked(Request, LockedNodes, Context),
+      locked(Request, LockedNodes, Birth, Context),
+      ?TRACE(done, Ref, ok),
       {ok, Ref};
     Error ->
+      ?TRACE(done, Ref, Error),
       Error
   end.
 
@@ -107,7 +121,8 @@ lock(Scope, Term, IsShared, Timeout, Nodes)->
       Error
   end.
 
--spec locked(#request{}, node_managers(), context()) -> context().
+%% Birth: the context's, or the time of the call that makes it
+-spec locked(#request{}, node_managers(), integer(), context()) -> context().
 locked(
     #request{
       ref = Ref,
@@ -115,6 +130,7 @@ locked(
       term = Term
     },
     Nodes,
+    _Birth,
     #context{
       ref2lock = Ref2Lock0,
       locked = Locked0,
@@ -138,16 +154,18 @@ locked(
     counts = Counts
   },
   put_context(Context);
-locked(Request, Nodes, _NoContext)->
+locked(Request, Nodes, Birth, _NoContext)->
   Context = #context{
     ref2lock = #{},
     locked = #{},
-    counts = #{}
+    counts = #{},
+    birth = Birth
   },
-  locked(Request, Nodes, Context).
+  locked(Request, Nodes, Birth, Context).
 
 -spec unlock(reference()) -> ok.
 unlock(Ref)->
+  ?TRACE(unlock, Ref, []),
   unlock(Ref, erase_context()).
 -spec unlock(reference(), context()) -> ok.
 unlock(
@@ -255,6 +273,16 @@ held_locks(_NoContext)->
 held_count(Context)->
   map_size(held_locks(Context)).
 
+%%-----------------------------------------------------------------
+%%  No context: this call is the birth. A first request that fails
+%%  leaves no context, the next call is born again
+%%-----------------------------------------------------------------
+-spec birth(context(), integer()) -> integer().
+birth(#context{birth = Birth}, _Now)->
+  Birth;
+birth(_NoContext, Now)->
+  Now.
+
 %%=================================================================
 %%	REQUEST
 %%=================================================================
@@ -300,7 +328,9 @@ run_request(
     lists:foldl(
       fun(N, Acc)->
         Holder = spawn(fun()->
+          ?TRACE(w_start, Ref, N),
           Result = ecall_connection:call(N, elock_manager, lock, [Request]),
+          ?TRACE(w_done, Ref, N),
           Client ! {Ref, N, Result},
           case Result of
             {ok, {ok, Manager}} when N =/= node()->
@@ -314,6 +344,7 @@ run_request(
       #{},
       Nodes
     ),
+  ?TRACE(spawned, Ref, []),
   wait_verdict(Ref, #waiting{
     ref = Ref,
     scope = Scope,
@@ -342,6 +373,7 @@ wait_verdict(
 ) when map_size(Pending0) > 0->
   receive
     {Ref, Node, NodeResult}->
+      ?TRACE(node_result, Ref, Node),
       {Holder, Pending} = maps:take(Node, Pending0),
       case NodeResult of
         {ok, {ok,Manager}} ->
@@ -379,6 +411,7 @@ wait_verdict(
           Error
       end;
     #queued{ref = Ref, manager = Manager, node = Node}->
+      ?TRACE(queued_fwd, Ref, Node),
       % The locks of the client and the grants so far
       Held =
         maps:fold(

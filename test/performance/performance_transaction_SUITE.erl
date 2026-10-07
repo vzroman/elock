@@ -112,10 +112,22 @@
 %%  - metrics, per node by role name: the maximum memory, the
 %%    scheduler utilization, the maximum run queue and the octets
 %%    sent over the distribution to the other participating nodes.
+%%
+%%  With trace => true of the performance config every point is
+%%  traced (performance_trace): the trace points of elock, of the
+%%  mnesia copies in test/performance/mnesia and of the clients below
+%%  (?TRACE, the steps of a transaction) write the events of every
+%%  node, the controller saves them next to performance_data and
+%%  writes the report of the point, where the time of its lock calls
+%%  has gone step by step. trace is true or the limit of the events
+%%  a node keeps: at the limit the trace stops and the report covers
+%%  the point up to there (see performance_trace for the memory it
+%%  takes).
 %%=================================================================
 -module(performance_transaction_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("elock/include/elock_trace.hrl").
 
 %% Common Test API
 -export([
@@ -150,7 +162,9 @@
 % taken in the sorted order, true: in a random order) are fixed per run,
 % the lists nest from the outermost to the innermost in this order.
 % global_max_locks: global skips the points with more locks held at
-% once (the nodes * clients_per_node * locks_per_transaction)
+% once (the nodes * clients_per_node * locks_per_transaction).
+% trace: false, true or the limit of the events per node - the
+% points are traced and reported step by step (see performance_trace)
 -define(DEFAULTS, #{
   transactions_per_client => 1000,
   write_ms => 10,
@@ -160,7 +174,8 @@
   intersect_percents => [0, 20, 50, 100],
   exclusive_percents => [0, 20, 50, 100],
   paths => [elock, mnesia, global],
-  global_max_locks => 1000
+  global_max_locks => 1000,
+  trace => false
 }).
 
 % What a client runs
@@ -368,12 +383,16 @@ run_point(#{
     start_runner(Name, Node, Controller, RunRef, Clients, Client) || Name := Node <- Nodes
   ]),
   ok = await_runners_ready(map_size(Runners), RunRef, Runners),
+  #{trace := Trace} = ?config(performance, Config),
+  ok = performance_trace:start(Trace, Nodes),
   [ Runner ! {?TAG, RunRef, start} || Runner := _ <- Runners ],
   StartedAt = erlang:monotonic_time(microsecond),
   {Sums, Metrics} = await_runners(RunRef, Runners, #sums{}, #{}),
   ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
   Transactions = map_size(Nodes) * Clients * PerClient,
-  performance_metrics:point(Config, result(Point, ElapsedUs, Transactions, Sums, Metrics)).
+  Result = result(Point, ElapsedUs, Transactions, Sums, Metrics),
+  ok = performance_metrics:point(Config, Result),
+  performance_trace:finish(Trace, Nodes, Config, Result).
 
 start_runner(Name, Node, Controller, RunRef, Clients, Client)->
   {Runner, MonRef} = spawn_monitor(Node, fun()-> runner(Controller, RunRef, Clients, Client) end),
@@ -514,9 +533,13 @@ transactions(Count, Client, Sums)->
 transaction(#client{path = elock, write_ms = WriteMs} = Client)->
   Locks = elock_locks(Client),
   StartedAt = erlang:monotonic_time(microsecond),
+  ?TRACE(tx_begin, self(), elock),
   {Refs, Restarts} = elock_lock(Locks, Locks, [], 0),
+  ?TRACE(tx_locked, self(), Restarts),
   WriteUs = write(WriteMs),
+  ?TRACE(tx_written, self(), []),
   lists:foreach(fun elock:unlock/1, Refs),
+  ?TRACE(tx_end, self(), []),
   #sums{
     transaction_us = erlang:monotonic_time(microsecond) - StartedAt,
     write_us = WriteUs,
@@ -526,13 +549,19 @@ transaction(#client{path = mnesia, write_ms = WriteMs} = Client)->
   Locks = mnesia_locks(Client),
   put(?RUNS, 0),
   StartedAt = erlang:monotonic_time(microsecond),
+  ?TRACE(tx_begin, self(), mnesia),
   {atomic, WriteUs} = mnesia:transaction(
     fun()->
       put(?RUNS, get(?RUNS) + 1),
+      ?TRACE(tx_run, self(), get(?RUNS)),
       mnesia_lock(Locks),
-      write(WriteMs)
+      ?TRACE(tx_locked, self(), get(?RUNS) - 1),
+      Written = write(WriteMs),
+      ?TRACE(tx_written, self(), []),
+      Written
     end
   ),
+  ?TRACE(tx_end, self(), []),
   #sums{
     transaction_us = erlang:monotonic_time(microsecond) - StartedAt,
     write_us = WriteUs,
@@ -560,7 +589,9 @@ elock_lock([{Term, Nodes, Options} | Rest], Locks, Refs, Restarts)->
     {ok, Ref}->
       elock_lock(Rest, Locks, [Ref | Refs], Restarts);
     {error, {deadlock, _Lock}}->
+      ?TRACE(tx_restart, self(), length(Refs)),
       lists:foreach(fun elock:unlock/1, Refs),
+      ?TRACE(tx_released, self(), []),
       elock_lock(Locks, Locks, [], Restarts + 1)
   end;
 elock_lock([], _Locks, Refs, Restarts)->

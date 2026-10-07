@@ -1,8 +1,6 @@
 {application, elock,
  [{description, "erlang library for distributed term locks"},
   {vsn, git},
-  {registered, [elock_graph]},
-  {mod, {elock_app, []}},
   {applications,
    [kernel,
     stdlib,

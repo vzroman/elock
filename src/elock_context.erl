@@ -30,9 +30,9 @@
 }).
 
 -type node_managers() :: #{node() => #node{}}.
--type queued_managers() :: #{node() => pid()}.
 -type lock_counts() :: #{lock_key() => pos_integer()}.
 -type pending_workers() :: #{node() => pid()}.
+-type queued_managers() :: #{node() => pid()}.
 -type request_result() :: {ok, node_managers()} | {error, term()}.
 
 -define(context,'$elock_context$').
@@ -71,32 +71,31 @@ lock(Scope, Term, Nodes, Options)->
     timeout := Timeout,
     is_shared := IsShared
   } = validate_options(Options),
+
+  Now = erlang:system_time(microsecond),
   Ref = make_ref(),
-  ?TRACE(call, Ref, {Scope, Term, Nodes, IsShared}),
   Context = get_context(),
-  HeldLocks = held_locks(Context),
-  Now = erlang:monotonic_time(microsecond),
   Birth = birth(Context, Now),
+  Holds = length(Nodes) - 1 + held_locks(Context),
+
   Request = #request{
     ref = Ref,
     scope = Scope,
     term = Term,
     nodes = lists:usort(Nodes),
-    held_count = held_count(Context),
-    age = Now - Birth,
+    holds = Holds,
+    birth = Birth,
     client = self(),
     timeout = Timeout,
     shared = IsShared
   },
   % Ref is passed as a plain argument for the receive marker optimization
   % (see wait_verdict/2)
-  case run_request(Ref, Request, HeldLocks) of
+  case run_request(Ref, Request) of
     {ok, LockedNodes} ->
-      locked(Request, LockedNodes, Birth, Context),
-      ?TRACE(done, Ref, ok),
+      locked(Request, LockedNodes, Now, Context),
       {ok, Ref};
     Error ->
-      ?TRACE(done, Ref, Error),
       Error
   end.
 
@@ -130,7 +129,7 @@ locked(
       term = Term
     },
     Nodes,
-    _Birth,
+    _Now,
     #context{
       ref2lock = Ref2Lock0,
       locked = Locked0,
@@ -154,18 +153,17 @@ locked(
     counts = Counts
   },
   put_context(Context);
-locked(Request, Nodes, Birth, _NoContext)->
+locked(Request, Nodes, Now, _NoContext)->
   Context = #context{
     ref2lock = #{},
     locked = #{},
     counts = #{},
-    birth = Birth
+    birth = Now
   },
-  locked(Request, Nodes, Birth, Context).
+  locked(Request, Nodes, Now, Context).
 
 -spec unlock(reference()) -> ok.
 unlock(Ref)->
-  ?TRACE(unlock, Ref, []),
   unlock(Ref, erase_context()).
 -spec unlock(reference(), context()) -> ok.
 unlock(
@@ -263,25 +261,21 @@ remove_lock(
     Nodes
   ).
 
--spec held_locks(context()) -> held_locks().
-held_locks(#context{locked = Locked})->
-  Locked;
-held_locks(_NoContext)->
-  #{}.
 
--spec held_count(context()) -> non_neg_integer().
-held_count(Context)->
-  map_size(held_locks(Context)).
-
-%%-----------------------------------------------------------------
-%%  No context: this call is the birth. A first request that fails
-%%  leaves no context, the next call is born again
-%%-----------------------------------------------------------------
--spec birth(context(), integer()) -> integer().
-birth(#context{birth = Birth}, _Now)->
+birth(
+    #context{ birth = Birth},
+    _Now
+)->
   Birth;
-birth(_NoContext, Now)->
+birth(_Context, Now)->
   Now.
+
+held_locks(#context{
+  locked = Locked
+})->
+  map_size(Locked);
+held_locks(_Context)->
+  0.
 
 %%=================================================================
 %%	REQUEST
@@ -290,22 +284,19 @@ birth(_NoContext, Now)->
   ref :: reference(),
   scope :: atom(),
   term :: term(),
-  held :: held_locks(),         % the locks the client holds
   pending :: pending_workers(), % the workers that have not returned yet
-  nodes :: node_managers(),     % the grants so far
-  queued :: queued_managers()   % the managers the request waits at
+  nodes :: node_managers(),    % the grants so far
+  queued :: queued_managers()  % the managers the request waits at
 }).
 
 % The local node alone: the client is the proxy itself
--spec run_request(reference(), #request{}, held_locks()) -> request_result().
 run_request(
     _Ref,
     #request{
       nodes = [Node]
-    } = Request,
-    HeldLocks
+    } = Request
 ) when Node =:= node() ->
-  case elock_manager:lock(Request, HeldLocks) of
+  case elock_manager:lock(Request) of
     {ok, Manager} ->
       {ok, #{ Node => #node{manager = Manager} }};
     Error ->
@@ -313,24 +304,21 @@ run_request(
   end;
 % A worker per node sends its result tagged with Ref. A remote grant
 % keeps the worker as its holder, monitoring the client locally until
-% release. The client answers #queued{} meanwhile
+% release. Contended requests announce their manager for cancellation.
 run_request(
     Ref,
     #request{
       scope = Scope,
       term = Term,
       nodes = Nodes
-    } = Request,
-    HeldLocks
+    } = Request
 )->
   Client = self(),
   Pending =
     lists:foldl(
       fun(N, Acc)->
         Holder = spawn(fun()->
-          ?TRACE(w_start, Ref, N),
           Result = ecall_connection:call(N, elock_manager, lock, [Request]),
-          ?TRACE(w_done, Ref, N),
           Client ! {Ref, N, Result},
           case Result of
             {ok, {ok, Manager}} when N =/= node()->
@@ -344,12 +332,11 @@ run_request(
       #{},
       Nodes
     ),
-  ?TRACE(spawned, Ref, []),
+
   wait_verdict(Ref, #waiting{
     ref = Ref,
     scope = Scope,
     term = Term,
-    held = HeldLocks,
     pending = Pending,
     nodes = #{},
     queued = #{}
@@ -363,24 +350,17 @@ run_request(
 wait_verdict(
     Ref,
     #waiting{
-      scope = Scope,
-      term = Term,
-      held = Held0,
       pending = Pending0,
-      queued = Queued0,
-      nodes = Nodes0
+      nodes = Nodes0,
+      queued = Queued0
     } = Waiting0
 ) when map_size(Pending0) > 0->
   receive
     {Ref, Node, NodeResult}->
-      ?TRACE(node_result, Ref, Node),
       {Holder, Pending} = maps:take(Node, Pending0),
       case NodeResult of
         {ok, {ok,Manager}} ->
-          % The queued managers already have the rest
           Queued = maps:remove(Node, Queued0),
-          notify_queued(Queued, #{ {Scope, Term, Node} => Manager }, Ref),
-
           Nodes = Nodes0#{
             Node => #node{manager = Manager, holder = Holder}
           },
@@ -392,7 +372,7 @@ wait_verdict(
           wait_verdict(Ref, Waiting);
         Error ->
           release(Nodes0, Ref),
-          % Otherwise they block their queues and probe with the released locks
+          % Otherwise they block their queues after the attempt fails.
           unlock_nodes(Queued0, Ref),
           % A local worker is also its proxy and withdrawal may kill it
           % before it can reply. Remote workers report their proxy's exit.
@@ -411,26 +391,8 @@ wait_verdict(
           Error
       end;
     #queued{ref = Ref, manager = Manager, node = Node}->
-      ?TRACE(queued_fwd, Ref, Node),
-      % The locks of the client and the grants so far
-      Held =
-        maps:fold(
-          fun(N, #node{manager = M}, Acc)->
-            Acc#{
-              {Scope, Term, N} => M
-            }
-          end,
-          Held0,
-          Nodes0
-        ),
-      notify_queued(#{Node => Manager}, Held, Ref),
-      Queued = Queued0#{
-        Node => Manager
-      },
-      Waiting = Waiting0#waiting{
-        queued = Queued
-      },
-      wait_verdict(Ref, Waiting)
+      Queued = Queued0#{Node => Manager},
+      wait_verdict(Ref, Waiting0#waiting{queued = Queued})
   end;
 wait_verdict(
     _Ref,
@@ -465,16 +427,11 @@ wait_unlock(Ref, Pending0)
 wait_unlock(_Ref, _Pending)->
   ok.
 
--spec notify_queued(queued_managers(), held_locks(), reference()) -> ok.
-notify_queued(Queued, Held, Ref)
-  when map_size(Queued) > 0, map_size(Held) > 0->
-  Message = #add_held_locks{
-    ref = Ref,
-    held = Held
-  },
-  [ ecall:send(Manager, Message) || Manager <- maps:values(Queued) ],
+-spec unlock_nodes(queued_managers(), reference()) -> ok.
+unlock_nodes(Nodes, Ref) when map_size(Nodes) > 0->
+  [ ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes) ],
   ok;
-notify_queued(_Queued, _Held, _Ref)->
+unlock_nodes(_Nodes, _Ref)->
   ok.
 
 %%=================================================================
@@ -567,10 +524,3 @@ put_context(Context)->
 -spec erase_context() -> context().
 erase_context()->
   erase(?context).
-
--spec unlock_nodes(queued_managers(), reference()) -> ok.
-unlock_nodes(Nodes, Ref) when map_size(Nodes) > 0->
-  [ ecall:send(Manager, #unlock{ref = Ref}) || Manager <- maps:values(Nodes) ],
-  ok;
-unlock_nodes(_Locked, _Ref)->
-  ok.

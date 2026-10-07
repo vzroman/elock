@@ -40,11 +40,9 @@
 %%	API
 %%=================================================================
 -export([
-  lock/1, lock/2
+  lock/1
 ]).
 
--type lock_result() ::
-  {ok, pid()} | {error, timeout | {deadlock, lock_key()}}.
 -type holder() :: {boolean(), pid()}.
 -type holders() :: #{reference() => holder()}.
 -type client_requests() :: #{reference() => boolean()}.
@@ -83,49 +81,38 @@
 %%  The worker of elock_context:run_request/3, remote apply. It does
 %%  not have the held locks
 %%-----------------------------------------------------------------
--spec lock(#request{}) -> lock_result().
-lock(Request)->
-  ?TRACE(w_enter, Request#request.ref, []),
-  lock(Request, undefined).
 
 %%-----------------------------------------------------------------
 %%  HeldLocks is undefined for a worker
 %%-----------------------------------------------------------------
--spec lock(#request{}, held_locks() | undefined) -> lock_result().
 lock(
     #request{
       scope = Scope,
       term = Term
-    } = Request,
-    HeldLocks
+    } = Request
 )->
   case ets:update_counter(Scope, Term, {3,1}, {Term,0,0}) of
     1->
-      ?TRACE(ticket, Request#request.ref, 1),
       Manager = start_manager(Request),
       {ok, Manager};
 
-    RequestQueue->
-      ?TRACE(ticket, Request#request.ref, RequestQueue),
-      case get_manager(Scope, Term, RequestQueue) of
+    Ticket->
+      case get_manager(Scope, Term, Ticket) of
         Manager when is_pid(Manager) ->
           % A manager that exits takes the request with it and never
           % answers. The monitor ref is also the tag of the replies
           MonitorRef = erlang:monitor(process, Manager),
-          Manager ! Request#request{ queue = RequestQueue, proxy = self(), tag = MonitorRef },
-          ?TRACE(sent, Request#request.ref, Manager),
-          Verdict = wait_verdict(MonitorRef, Manager, Request, HeldLocks),
-          ?TRACE(verdict, Request#request.ref, Verdict),
+          Manager ! Request#request{ ticket = Ticket, proxy = self(), tag = MonitorRef },
+          Verdict = wait_verdict(MonitorRef, Manager, Request),
           erlang:demonitor(MonitorRef, [flush]),
           case Verdict of
             retry ->
-              lock(Request, HeldLocks);
+              lock(Request);
             _->
               Verdict
           end;
         _->
-          ?TRACE(no_manager, Request#request.ref, []),
-          lock(Request, HeldLocks)
+          lock(Request)
       end
   end.
 
@@ -133,38 +120,27 @@ lock(
 %%  Every clause matches MonitorRef, a plain argument from
 %%  erlang:monitor/2 in lock/2: the receive skips the older messages.
 %%  The request Ref can not do it: it is made in elock_context, maybe
-%%  on another node. A worker passes #queued{} on to the client, the
-%%  client answers it with HeldLocks
+%%  on another node. Only aggregate requests forward queued notices.
 %%-----------------------------------------------------------------
--spec wait_verdict(reference(), pid(), #request{}, held_locks() | undefined) ->
-  lock_result() | retry.
 wait_verdict(
     MonitorRef,
     Manager,
     #request{
-      ref = Ref,
       scope = Scope,
       term = Term,
       client = ClientPID
-    } = Request,
-    HeldLocks
+    } = Request
 )->
   receive
     ?reply(MonitorRef, #locked{})->
       {ok, Manager};
-    ?reply(MonitorRef, #queued{} = Queued)->
-      ?TRACE(queued_rcv, Ref, []),
-      case HeldLocks of
-        undefined ->
-          ecall:send(ClientPID, Queued);
-        _->
-          Manager ! #add_held_locks{ref = Ref, held = HeldLocks}
-      end,
-      wait_verdict(MonitorRef, Manager, Request, HeldLocks);
-    ?reply(MonitorRef, #deadlock{winner = Winner})->
-      {error, {deadlock, Winner}};
+    ?reply(MonitorRef, #abort{})->
+      {error, abort};
     ?reply(MonitorRef, #timeout{})->
       {error, timeout};
+    ?reply(MonitorRef, #queued{} = Queued)->
+      ecall:send(ClientPID, Queued),
+      wait_verdict(MonitorRef, Manager, Request);
     ?reply(MonitorRef, #retry{})->
       retry;
     {'DOWN', MonitorRef, process, Manager, _Reason}->
@@ -177,12 +153,12 @@ wait_verdict(
 %%  Client side utilities
 %%-----------------------------------------------------------------
 -spec get_manager(atom(), term(), pos_integer()) -> pid() | retry.
-get_manager(Scope, Term, MyQueue)->
+get_manager(Scope, Term, Ticket)->
   case ets:lookup(Scope, Term) of
     [ { _Lock, Manager, Queue } ] when is_pid(Manager)->
       % Queue < MyQueue: the entry has been recreated since the ticket
       if
-        Queue >= MyQueue ->
+        Queue >= Ticket ->
           Manager;
         true ->
           retry
@@ -192,7 +168,7 @@ get_manager(Scope, Term, MyQueue)->
     _->
       % The manager has not registered itself yet, wait
       erlang:yield(),
-      get_manager(Scope, Term, MyQueue)
+      get_manager(Scope, Term, Ticket)
   end.
 
 % Off heap mailbox: request bursts stay out of its garbage collection
@@ -223,20 +199,21 @@ start_manager(Request)->
   barging :: #request{} | undefined, % the pending upgrade, not in the queue
   last :: pos_integer(), % the last ticket taken in
   postponed :: ordsets:ordset(#request{}), % ahead of a missing ticket
-  postpone_timer :: reference() | undefined
+  postpone_timer :: reference() | undefined,
+  birth_queue
 }).
 
 -record(req,{
   client :: pid(),
   ref :: reference(),
-  queue :: pos_integer(), % the ticket
+  ticket :: pos_integer(), % the ticket
   proxy :: pid() | undefined, % undefined once the lock is held
   tag :: reference() | undefined, % undefined once the lock is held
   shared :: boolean(),
-  position :: integer(), % EnqueueTs - k x Age, system time in microseconds: the queue position (see queue_key/1)
+  birth :: integer(), % EnqueueTs - k x Age, system time in microseconds: the queue position (see queue_key/1)
   has_lock :: boolean(),
   timer :: reference() | undefined, % the timeout timer, while waiting
-  edges = false :: boolean() % the graph has the edges of this request
+  holds = 0 :: integer() % the graph has the edges of this request
 }).
 
 -record(client,{
@@ -261,11 +238,11 @@ init(#request{
   client = Client,
   proxy = Proxy,
   shared = Shared,
-  age = Age
+  birth = Birth,
+  holds = Holds
 })->
 
   ets:update_element(Scope, Term, {2,self()}),
-  ?TRACE(m_init, Ref, {Scope, Term}),
 
   Clients = add_client_request(
     Client,
@@ -276,23 +253,24 @@ init(#request{
       nodes = #{}
     }
   ),
+  Req = #req{
+    client = Client,
+    ref = Ref,
+    ticket = 1,
+    proxy = Proxy,
+    shared = Shared,
+    birth = Birth,
+    has_lock = true,
+    timer = undefined,
+    holds = Holds
+  },
+  BirthQueue = gb_sets:insert({Birth, Ref},gb_sets:empty()),
 
-  % Stamped as every request, though the first holder never waits
-  Position = erlang:system_time(microsecond) - ?AGE_FACTOR * Age,
   State = #state{
     holders = #{ Ref => {Shared, Client} },
     queue = gb_sets:empty(),
     requests = #{
-      Ref => #req{
-        client = Client,
-        ref = Ref,
-        queue = 1,
-        proxy = Proxy,
-        shared = Shared,
-        position = Position,
-        has_lock = true,
-        timer = undefined
-      }
+      Ref => Req
     },
     clients = Clients,
     scope = Scope,
@@ -301,7 +279,8 @@ init(#request{
     barging = undefined,
     last = 1,
     postponed = [],
-    postpone_timer = undefined
+    postpone_timer = undefined,
+    birth_queue =  BirthQueue
   },
 
   loop(State).
@@ -317,10 +296,6 @@ loop(State0)->
         handle_request(Request, State0);
       {timeout, _TimerRef, {timeout, Ref}}->
         handle_timeout(Ref, State0);
-      #deadlock{} = Deadlock->
-        handle_deadlock(Deadlock, State0);
-      #add_held_locks{} = Update->
-        handle_add_held_locks(Update, State0);
       {'DOWN', _Ref, process, ClientPID, _Reason}->
         handle_down(ClientPID, State0);
       {nodedown, Node}->
@@ -343,30 +318,28 @@ loop(State0)->
 -spec handle_request(#request{}, #state{}) -> #state{}.
 handle_request(
     #request{
-      queue = Queue
+      ticket = Ticket
     } = Request,
     #state{
       last = Last
     } = State0
-) when (Last+1) =:= Queue->
+) when (Last+1) =:= Ticket->
 
-  ?TRACE(m_request, Request#request.ref, Queue),
   State = add_request(Request, State0),
 
   handle_postponed(State#state{
-    last = Queue
+    last = Ticket
   });
 handle_request(
     #request{
-      queue = Queue
+      ticket = Ticket
     } = Request,
     #state{
       last = Last,
       postponed = Postponed
     } = State
-) when Queue > Last->
+) when Ticket > Last->
 
-  ?TRACE(m_postponed, Request#request.ref, {Queue, Last}),
   % Sorted by the ticket, the first field of #request{}
   arm_postpone_timer(State#state{
     postponed = ordsets:add_element(Request, Postponed)
@@ -390,27 +363,26 @@ handle_request(
 -spec handle_postponed(#state{}) -> #state{}.
 handle_postponed(#state{
   postponed = [#request{
-    queue = Queue
+    ticket = Ticket
   } = Request|Rest],
   last = Last
 } = State0)
-  when Last+1 =:= Queue->
+  when Last+1 =:= Ticket->
 
-  ?TRACE(m_request, Request#request.ref, Queue),
   State = add_request(Request, State0),
 
   handle_postponed(State#state{
     postponed = Rest,
-    last = Queue
+    last = Ticket
   });
 
 handle_postponed(#state{
   postponed = [#request{
-    queue = Queue
+    ticket = Ticket
   }|_],
   last = Last
 } = State)
-  when Queue > Last->
+  when Ticket > Last->
   arm_postpone_timer(State);
 
 % The ticket has been stepped over
@@ -421,7 +393,6 @@ handle_postponed(#state{
     tag = Tag
   }|Rest]
 } = State)->
-  ?TRACE(m_retry, Ref, []),
   Proxy ! ?reply(Tag, #retry{ref = Ref}),
   handle_postponed(State#state{
     postponed = Rest
@@ -445,14 +416,13 @@ handle_postpone_timeout(
     _TimerRef,
     #state{
       postponed = [#request{
-        queue = Queue
+        ticket = Ticket
       } = Request|Rest]
     } =State0)->
-  ?TRACE(m_postpone_fired, Request#request.ref, Queue),
   State = add_request(Request, postpone_timer_fired(State0)),
   handle_postponed(State#state{
     postponed = Rest,
-    last = Queue
+    last = Ticket
   });
 % The ticket try_unlock/1 has waited for
 handle_postpone_timeout(
@@ -527,7 +497,6 @@ handle_unlock(
     } = State0
 ) when map_size(Holders) =:= 1, is_map_key(Ref, Holders)->
 
-  ?TRACE(m_unlock, Ref, []),
   case gb_sets:is_empty(Queue) of
     true->
       State = try_unlock(State0),
@@ -572,7 +541,6 @@ handle_timeout(
 )->
   case Requests of
     #{Ref := #req{ has_lock = false, proxy = Proxy, tag = Tag } = Req}->
-      ?TRACE(m_timeout, Ref, []),
       Proxy ! ?reply(Tag, #timeout{ref = Ref}),
       % Cancelling a fired timer costs a round trip to another scheduler
       State = dequeue(Req#req{timer = undefined}, State0),
@@ -581,33 +549,6 @@ handle_timeout(
       State0
   end.
 
-%%-----------------------------------------------------------------
-%%  The verdict of the graph process: the request has lost a walk
-%%  of its own, or a walk of another request it closed a cycle for
-%%  (see elock_graph)
-%%-----------------------------------------------------------------
--spec handle_deadlock(#deadlock{}, #state{}) -> #state{}.
-handle_deadlock(
-    #deadlock{ref = Ref} = Deadlock,
-    #state{
-      requests = Requests
-    } = State0
-)->
-  case Requests of
-    #{Ref := Req = #req{
-      has_lock = false,
-      proxy = Proxy,
-      tag = Tag
-    }}->
-      ?TRACE(m_deadlock, Ref, delivered),
-      Proxy ! ?reply(Tag, Deadlock),
-      State = dequeue(Req, State0),
-      next(State);
-    _->
-      % Granted or left meanwhile
-      ?TRACE(m_deadlock, Ref, late),
-      State0
-  end.
 
 -spec handle_down(pid(), #state{}) -> #state{}.
 handle_down(
@@ -763,61 +704,72 @@ kill_proxy(#req{
 new_req(#request{
   client = ClientPID,
   ref = Ref,
-  queue = Ticket,
+  ticket = Ticket,
   proxy = Proxy,
   tag = Tag,
   shared = Shared,
-  age = Age
+  birth = Birth,
+  holds = Holds
 })->
   #req{
     client = ClientPID,
     ref = Ref,
-    queue = Ticket,
+    ticket = Ticket,
     proxy = Proxy,
     tag = Tag,
     shared = Shared,
-    position = erlang:system_time(microsecond) - ?AGE_FACTOR * Age,
-    has_lock = false
+    birth = Birth,
+    has_lock = false,
+    holds = Holds
   }.
 
 %%-----------------------------------------------------------------
 %%  The smallest position first, the oldest; the ticket among equals
 %%-----------------------------------------------------------------
--spec queue_key(#req{}) -> queue_key().
-queue_key(#req{
-  position = Position,
-  queue = Ticket,
-  ref = Ref
-})->
-  {Position, Ticket, Ref}.
 
 -spec enqueue(#request{}, #state{}) -> #state{}.
 enqueue(
     #request{
       client = ClientPID,
+      proxy = Proxy,
       ref = Ref,
-      shared = Shared
+      shared = Shared,
+      timeout = Timeout,
+      tag = Tag,
+      ticket = Ticket,
+      birth = Birth
     } = Request,
     #state{
       queue = Queue0,
       requests = Requests0,
-      clients = Clients0
+      clients = Clients0,
+      birth_queue = BirthQueue0
     } = State
 )->
+  {MinBirth,_Ref} = gb_sets:smallest(BirthQueue0),
 
-  ?TRACE(m_enqueue, Ref, {map_size(State#state.holders), gb_sets:size(Queue0)}),
-  Req = start_waiting(Request),
-  Requests = Requests0#{
-    Ref => Req
-  },
-  Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
-  Queue = gb_sets:insert(queue_key(Req), Queue0),
+  if
+    Birth < MinBirth ->
+      Req0 = new_req(Request),
+      Req = start_timer(Req0, Timeout),
+      Requests = Requests0#{
+        Ref => Req
+      },
+      Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
+      Queue = gb_sets:insert({Ticket, Ref}, Queue0),
+      BirthQueue = gb_sets:insert({Birth, Ref}, BirthQueue0),
 
-  State#state{
-    queue = Queue,
-    requests = Requests,
-    clients = Clients
-  }.
+      notify_queued(Request),
+      State#state{
+        queue = Queue,
+        requests = Requests,
+        clients = Clients,
+        birth_queue = BirthQueue
+      };
+    true ->
+      Proxy ! ?reply(Tag, #abort{}),
+      State
+  end.
 
 %%-----------------------------------------------------------------
 %%  The upgrade waits out of the queue until its client is the only
@@ -827,75 +779,107 @@ enqueue(
 enqueue_barging(
     #request{
       client = ClientPID,
-      ref = Ref
+      ref = Ref,
+      timeout = Timeout,
+      proxy = Proxy,
+      tag = Tag,
+      birth = Birth
     } = Request,
     #state{
+      holders = Holders,
       requests = Requests0,
-      clients = Clients0
+      clients = Clients0,
+      birth_queue = BirthQueue0
     } =State
 )->
-  ?TRACE(m_enqueue, Ref, barging),
-  Req = start_waiting(Request),
-  Requests = Requests0#{
-    Ref => Req
-  },
-  Clients = add_client_request(ClientPID, Ref, _Shared = false, Clients0),
+  case can_upgrade(ClientPID, Birth, maps:iterator(Holders), Requests0) of
+    true->
+      Req0 = new_req(Request),
+      Req = start_timer(Req0, Timeout),
+      Requests = Requests0#{
+        Ref => Req
+      },
+      Clients = add_client_request(ClientPID, Ref, _Shared = false, Clients0),
+      BirthQueue = gb_sets:insert({Birth, Ref}, BirthQueue0),
 
-  State#state{
-    requests = Requests,
-    clients = Clients,
-    barging = Request
-  }.
+      notify_queued(Request),
+      State#state{
+        requests = Requests,
+        clients = Clients,
+        barging = Request,
+        birth_queue = BirthQueue
+      };
+    false->
+      Proxy ! ?reply(Tag, #abort{}),
+      State
+  end.
+
+% A postponed request is not cancellable yet. Announce only after it
+% has been admitted, so a cancellation can never precede registration.
+-spec notify_queued(#request{}) -> ok.
+notify_queued(#request{ref = Ref, client = Client, proxy = Proxy, tag = Tag})
+  when Proxy =/= Client->
+  Proxy ! ?reply(Tag, #queued{ref = Ref, manager = self(), node = node()}),
+  ok;
+notify_queued(_Request)->
+  ok.
 
 %%-----------------------------------------------------------------
-%%  A waiting request leaves: timeout, deadlock or a dead client
+%%  A waiting request leaves: timeout, cancellation or a dead client
 %%-----------------------------------------------------------------
 -spec dequeue(#req{}, #state{}) -> #state{}.
 dequeue(
     #req{
       client = ClientPID,
-      ref = Ref
+      ref = Ref,
+      birth = Birth
     } = Req,
     #state{
       barging = #request{
         ref = Ref
       },
       requests = Requests0,
-      clients = Clients0
+      clients = Clients0,
+      birth_queue = BirthQueue0
     } = State
 )->
-  ?TRACE(m_dequeue, Ref, barging),
-  stop_waiting(Req, State),
+  stop_timer(Req),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
+  BirthQueue = gb_sets:delete_any({Birth, Ref}, BirthQueue0),
 
   State#state{
     requests = Requests,
     clients = Clients,
-    barging = undefined
+    barging = undefined,
+    birth_queue  = BirthQueue
   };
 
 dequeue(
     #req{
       client = ClientPID,
-      ref = Ref
+      ref = Ref,
+      ticket = Ticket,
+      birth = Birth
     } = Req,
     #state{
       requests = Requests0,
       clients = Clients0,
-      queue = Queue0
+      queue = Queue0,
+      birth_queue = BirthQueue0
     } = State
 )->
-  ?TRACE(m_dequeue, Ref, []),
-  Queue = gb_sets:delete_any(queue_key(Req), Queue0),
+  Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
-  stop_waiting(Req, State),
+  stop_timer(Req),
+  BirthQueue = gb_sets:delete_any({Birth, Ref}, BirthQueue0),
 
   State#state{
     queue = Queue,
     requests = Requests,
-    clients = Clients
+    clients = Clients,
+    birth_queue = BirthQueue
   }.
 
 %%-----------------------------------------------------------------
@@ -926,24 +910,25 @@ locked(
       ref = Ref,
       proxy = Proxy,
       tag = Tag,
-      shared = Shared
+      shared = Shared,
+      ticket = Ticket,
+      birth = Birth
     } = Req0,
     #state{
       holders = Holders0,
       queue = Queue0,
       requests = Requests0,
-      can_share = CanShare0
+      can_share = CanShare0,
+      birth_queue = BirthQueue0
     } = State)->
 
   Proxy ! ?reply(Tag, #locked{ref = Ref}),
-  ?TRACE(m_grant, Ref, []),
-  Req = stop_waiting(
+  Req = stop_timer(
     Req0#req{
       has_lock = true,
       proxy = undefined,
       tag = undefined
-    },
-    State
+    }
   ),
 
   Requests = Requests0#{
@@ -951,7 +936,9 @@ locked(
   },
   Holders = Holders0#{ Ref => {Shared, ClientPID} },
   % Not in the queue if granted by get_lock/2 or as barging by next/1
-  Queue = gb_sets:delete_any(queue_key(Req0), Queue0),
+  Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
+  % A queued request is already indexed; an immediate grant is not.
+  BirthQueue = gb_sets:add({Birth, Ref}, BirthQueue0),
 
   % A shared grant on an exclusive lock is a barging one: it stays exclusive
   CanShare = Shared andalso CanShare0,
@@ -960,7 +947,8 @@ locked(
     holders = Holders,
     queue = Queue,
     requests = Requests,
-    can_share = CanShare
+    can_share = CanShare,
+    birth_queue = BirthQueue
   }.
 
 -spec unlocked(#req{}, #state{}) -> #state{}.
@@ -968,18 +956,21 @@ unlocked(
     #req{
       client = ClientPID,
       ref = Ref,
-      shared = Shared
+      shared = Shared,
+      birth = Birth
     },
     #state{
       clients = Clients0,
       holders = Holders0,
       requests = Requests0,
-      can_share = CanShare0
+      can_share = CanShare0,
+      birth_queue = BirthQueue0
     } = State
 )->
   Clients = remove_client_request(ClientPID, Ref, Clients0),
   Holders = maps:remove(Ref, Holders0),
   Requests = maps:remove(Ref, Requests0),
+  BirthQueue = gb_sets:delete_any({Birth, Ref}, BirthQueue0),
 
   % Only the release of an exclusive hold can make the lock shared
   CanShare =
@@ -994,7 +985,8 @@ unlocked(
     holders = Holders,
     requests = Requests,
     clients = Clients,
-    can_share = CanShare
+    can_share = CanShare,
+    birth_queue = BirthQueue
   }.
 
 %%-----------------------------------------------------------------
@@ -1003,7 +995,6 @@ unlocked(
 -spec try_barging(#request{}, #state{}) -> #state{}.
 try_barging(
     #request{
-      ref = Ref,
       client = ClientPID,
       shared = Shared,
       proxy = Proxy,
@@ -1015,9 +1006,7 @@ try_barging(
       barging = BargingRequest,
       clients = #clients{
         clients = Clients
-      },
-      scope = Scope,
-      term = Term
+      }
     } = State
 )->
   if
@@ -1041,8 +1030,7 @@ try_barging(
       end;
     true->
       % A second upgrade: both wait for each other, the first one wins
-      ?TRACE(m_deadlock, Ref, upgrade),
-      Proxy ! ?reply(Tag, #deadlock{ref = Ref, winner = {Scope, Term, node()}}),
+      Proxy ! ?reply(Tag, #abort{}),
       State
   end.
 
@@ -1089,7 +1077,7 @@ next(#state{
     true->
       try_unlock(State0);
     false->
-      {_Position, _Ticket, Ref} = gb_sets:smallest(Queue),
+      {_Ticket, Ref} = gb_sets:smallest(Queue),
       Req = maps:get(Ref, Requests),
       State = locked(Req, State0),
       % A shared head may be joined by the next ones
@@ -1105,7 +1093,7 @@ next(#state{
     true->
       State0;
     false->
-      {_Position, _Ticket, Ref} = gb_sets:smallest(Queue),
+      {_Ticket, Ref} = gb_sets:smallest(Queue),
       case Requests of
         #{Ref := Req = #req{shared = true}} ->
           State = locked(Req, State0),
@@ -1135,7 +1123,6 @@ try_unlock(#state{
   case ets:lookup(Scope, Term) of
     [{_,Self,_}]->
       % A new ticket is taken, its request is on the way: a new round
-      ?TRACE(m_round, Self, LastQueue),
       arm_postpone_timer(State#state{
         holders = #{},
         queue = gb_sets:empty(),
@@ -1143,55 +1130,18 @@ try_unlock(#state{
         clients = Clients#clients{
           clients = #{}
         },
-        can_share = true
+        can_share = true,
+        birth_queue = gb_sets:empty()
       });
     _->
       exit(normal)
   end.
 
-%%=================================================================
-%%  The edges of the wait-for graph (see elock_graph)
-%%
-%%  A waiting request joins the graph of the node in
-%%  handle_add_held_locks/2, with every held map the client sends,
-%%  and leaves it in stop_waiting/2. The verdict comes back as
-%%  #deadlock{} (see handle_deadlock/2)
-%%=================================================================
--spec handle_add_held_locks(#add_held_locks{}, #state{}) -> #state{}.
-handle_add_held_locks(
-    #add_held_locks{
-      ref = Ref,
-      held = Held
-    },
-    #state{
-      requests = Requests,
-      scope = Scope,
-      term = Term
-    } = State
-)->
-  case Requests of
-    #{Ref := #req{
-      has_lock = false,
-      position = Position
-    } = Req}->
-      ?TRACE(m_held, Ref, map_size(Held)),
-      elock_graph:add_edges({Scope, Term, node()}, Ref, Position, Held),
-      State#state{
-        requests = Requests#{
-          Ref => Req#req{
-            edges = true
-          }
-        }
-      };
-    _->
-      % Granted or left meanwhile
-      ?TRACE(m_held_late, Ref, []),
-      State
-  end.
 
 %%=================================================================
 %%  Utilities
 %%=================================================================
+
 -spec add_client_request(pid(), reference(), boolean(), clients()) -> clients().
 add_client_request(
     ClientPID,
@@ -1325,56 +1275,22 @@ client_holds_lock(
 only_holder(ClientRequests, Holders, Waiting)->
   map_size(ClientRequests) - Waiting =:= map_size(Holders).
 
--spec start_waiting(#request{}) -> #req{}.
-start_waiting(#request{
-  timeout = Timeout
-} = Request)->
-  notify_queued(Request),
-  start_timer(new_req(Request), Timeout).
-
-%%-----------------------------------------------------------------
-%%  A waiter that was never asked for its held map, or was granted or
-%%  left before the answer came, has no edges: nothing to remove
-%%-----------------------------------------------------------------
--spec stop_waiting(#req{}, #state{}) -> #req{}.
-stop_waiting(
-    #req{
-      ref = Ref,
-      edges = true
-    } = Req,
-    #state{
-      scope = Scope,
-      term = Term
-    }
-)->
-  elock_graph:remove_edges({Scope, Term, node()}, Ref),
-  stop_timer(Req);
-stop_waiting(Req, _State)->
-  stop_timer(Req).
-
-%%-----------------------------------------------------------------
-%%  The held map is asked for only on a wait: most requests never
-%%  wait. A single node request of a client that holds nothing can
-%%  not be on a cycle
-%%-----------------------------------------------------------------
--spec notify_queued(#request{}) -> {reference(), #queued{}} | ignore.
-notify_queued(#request{
-  ref = Ref,
-  proxy = Proxy,
-  tag = Tag,
-  held_count = HeldCount,
-  nodes = Nodes
-})->
-  if
-    HeldCount > 0; length(Nodes) > 1->
-      Proxy ! ?reply(Tag, #queued{
-        ref = Ref,
-        manager = self(),
-        node = node()
-      });
-    true ->
-      ignore
+%% An upgrade waits only for other holders. Its own attempt's holds do
+%% not block it, and queued requests remain behind the barging upgrade.
+-spec can_upgrade(pid(), integer(), maps:iterator(reference(), holder()),
+                  requests()) -> boolean().
+can_upgrade(Client, Birth, Holders, Requests)->
+  case maps:next(Holders) of
+    none->
+      true;
+    {Ref, {_Shared, HolderClient}, Rest}->
+      #req{birth = HolderBirth} = maps:get(Ref, Requests),
+      SameAttempt = HolderClient =:= Client andalso HolderBirth =:= Birth,
+      (SameAttempt orelse Birth < HolderBirth) andalso
+        can_upgrade(Client, Birth, Rest, Requests)
   end.
+
+%%-----------------------------------------------------------------
 
 -spec start_timer(#req{}, pos_integer() | undefined) -> #req{}.
 start_timer(

@@ -36,12 +36,11 @@
 %%
 %%  The paths:
 %%  - elock: elock:lock/4 for one lock after another. A request
-%%    that loses a deadlock ({error, {deadlock, _}}) has the locks
+%%    refused by wait-die ({error, abort}) has the locks
 %%    taken in the attempt released and the transaction starts over
-%%    with the same locks in the same order: a restart. Even in the
-%%    sorted order elock can deadlock: two exclusive requests for
-%%    several nodes may be granted in the opposite order on two
-%%    nodes.
+%%    with the same locks in the same order and a fresh lock context:
+%%    a restart. Wait-die can refuse a request in either lock order.
+%%    The caller retries immediately, with no added backoff.
 %%  - mnesia: an imitation without writes. A transaction is
 %%    mnesia:transaction/1 of a fun that takes the locks with
 %%    mnesia:lock/2 on the records of a table with ram_copies on all
@@ -124,8 +123,10 @@
 %%  mnesia copies in test/performance/mnesia and of the clients below
 %%  (?TRACE, the steps of a transaction) write the events of every
 %%  node, the controller saves them next to performance_data and
-%%  writes the report of the point, where the time of its lock calls
-%%  has gone step by step. trace is true or the limit of the events
+%%  writes the report of the point. Lock-level details require the
+%%  production trace points; when these are absent, the report says
+%%  they are unavailable and the regular point metrics are retained.
+%%  trace is true or the limit of the events
 %%  a node keeps: at the limit the trace stops and the report covers
 %%  the point up to there (see performance_trace for the memory it
 %%  takes).
@@ -245,7 +246,7 @@ end_per_testcase(transactions_test, Config)->
   ok.
 
 %%-----------------------------------------------------------------
-%%  elock: the application on every node (the graph process), then
+%%  elock: the application on every node, then
 %%  the scope on every node, linked to a holder that lives for the
 %%  test case, ready on all the nodes.
 %%  mnesia: a ram schema on every node, joined to the first one,
@@ -545,8 +546,8 @@ transactions(Count, Client, Sums)->
 
 %%-----------------------------------------------------------------
 %%  A transaction of the path: its locks are built before the clock
-%%  starts. Every lock taken is followed by its read. elock: a lost
-%%  deadlock has the locks of the attempt released and starts the
+%%  starts. Every lock taken is followed by its read. elock: an
+%%  abort has the locks of the attempt released and starts the
 %%  transaction over. mnesia: every run of the fun counts, the result
 %%  is the reads and the write of the committed run
 %%-----------------------------------------------------------------
@@ -624,7 +625,7 @@ elock_lock([{Term, Nodes, Options} | Rest], Locks, Refs, ReadUs, Restarts, ReadC
   case elock:lock(?SCOPE, Term, Nodes, Options) of
     {ok, Ref}->
       elock_lock(Rest, Locks, [Ref | Refs], ReadUs + read(ReadCost), Restarts, ReadCost);
-    {error, {deadlock, _Lock}}->
+    {error, abort}->
       ?TRACE(tx_restart, self(), length(Refs)),
       lists:foreach(fun elock:unlock/1, Refs),
       ?TRACE(tx_released, self(), []),

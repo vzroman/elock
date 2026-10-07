@@ -16,7 +16,7 @@
 
 -record(request,{
   % The ticket must stay first: postponed requests are sorted by it.
-  queue :: pos_integer() | undefined,
+  ticket :: pos_integer() | undefined,
   ref :: reference(),
   scope :: atom(),
   term :: term(),
@@ -24,8 +24,8 @@
   proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
-  held_count :: non_neg_integer(), % held locks: a waiter that holds something may close a cycle
-  age :: non_neg_integer(), % the age of the client's lock context at the call, microseconds (see elock_context)
+  holds :: non_neg_integer(), % held locks: a waiter that holds something may close a cycle
+  birth :: non_neg_integer(), % the age of the client's lock context at the call, microseconds (see elock_context)
   nodes :: nonempty_list(node()),
   timeout :: pos_integer() | undefined
 }).
@@ -35,24 +35,15 @@
   ref :: reference()
 }).
 
-% Manager -> client: the request waits, send the held map
+% Only admitted waits announce themselves; immediate grants need no notice.
 -record(queued,{
   ref :: reference(),
   manager :: pid(),
   node :: node()
 }).
 
-% Client -> manager: the answer to #queued{} and every later grant
--record(add_held_locks,{
-  ref :: reference(),
-  held :: held_locks()
-}).
-
 % Graph -> manager, manager -> client: the request has lost
--record(deadlock,{
-  ref :: reference(),
-  winner :: lock_key() % the lock the winning request waits for
-}).
+-record(abort,{}).
 
 % Manager -> graph of its node: the new holds of a waiting request
 -record(add_edges,{

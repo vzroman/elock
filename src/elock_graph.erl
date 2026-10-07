@@ -6,7 +6,7 @@
 %%  elock_sup. It owns a private ETS bag of the waiting requests of
 %%  the node that hold something, keyed by the lock they wait for:
 %%
-%%      #waiter{ lock, ref, position, manager, held }
+%%      #waiter{ lock, ref, weight, manager, held }
 %%
 %%  The waiters at a key all belong to one manager, which runs on
 %%  the lock's node: the rows of the waiters at lock L are complete
@@ -21,10 +21,8 @@
 %%  nothing clean and never stops on its own.
 %%
 %%  A walk serves one launch: the origin request, waiting for Edge
-%%  at Manager with Weight: its queue position, the birth of its
-%%  context on the system time of its manager, compared as it is
-%%  with the positions of the closers: the older wins, the coin on
-%%  a tie (see beats/3). Every new hold of a waiting request is probed
+%%  at Manager with Weight (#request.held_count, fixed for the life
+%%  of the request). Every new hold of a waiting request is probed
 %%  once, when it appears, so the walk of the edge that closes a
 %%  cycle finds the rest of the cycle in place. The waiters of an
 %%  expanded lock depend on the origin: it holds the lock, or a
@@ -72,7 +70,7 @@
 -record(waiter,{
   lock :: lock_key(),           % the lock the request waits for, the key
   ref :: reference(),           % the request
-  position :: integer(),        % #req.position, fixed for the life of the request
+  weight :: non_neg_integer(),  % #request.held_count, fixed for the life of the request
   manager :: pid(),             % the manager of lock, the sender of the edges
   held :: held_locks()          % #{lock_key() => pid()}, as the client sent it
 }).
@@ -105,9 +103,9 @@ init()->
 %%  Held is never empty (see elock_context:notify_queued/3 and
 %%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
--spec add_edges(lock_key(), reference(), integer(), held_locks()) -> ok.
-add_edges(Lock, Ref, Position, Held)->
-  ?MODULE ! #add_edges{lock = Lock, ref = Ref, position = Position, manager = self(), held = Held},
+-spec add_edges(lock_key(), reference(), non_neg_integer(), held_locks()) -> ok.
+add_edges(Lock, Ref, Weight, Held)->
+  ?MODULE ! #add_edges{lock = Lock, ref = Ref, weight = Weight, manager = self(), held = Held},
   ok.
 
 -spec remove_edges(lock_key(), reference()) -> ok.
@@ -139,13 +137,13 @@ loop()->
 %%  No row: the first answer of the client to #queued{}. A row: a
 %%  later grant of a multi node request, or a key held at a manager
 %%  that died and was replaced. The new keys only are launched: every
-%%  edge is probed once, when it appears, weighed then (see launch/2)
+%%  edge is probed once, when it appears. The weight is the row's
 %%-----------------------------------------------------------------
 -spec handle_add_edges(#add_edges{}) -> ok.
 handle_add_edges(#add_edges{
   lock = Lock,
   ref = Ref,
-  position = Position,
+  weight = Weight,
   manager = Manager,
   held = Held
 })->
@@ -155,7 +153,7 @@ handle_add_edges(#add_edges{
       Row = #waiter{
         lock = Lock,
         ref = Ref,
-        position = Position,
+        weight = Weight,
         manager = Manager,
         held = Held
       },
@@ -218,7 +216,7 @@ launch(
     #waiter{
       lock = Edge,
       ref = Ref,
-      position = Position,
+      weight = Weight,
       manager = Manager
     },
     NewKeys
@@ -227,7 +225,7 @@ launch(
     ref = Ref,
     edge = Edge,
     manager = Manager,
-    weight = Position
+    weight = Weight
   },
   {Entry, Visited, Hops} = schedule(NewKeys, [], #{Edge => true}, #{}),
   Result = walk(Entry, Probe, Visited, [], Hops),
@@ -294,7 +292,7 @@ check_cycles(
 check_cycles(
     [#waiter{
       ref = Ref,
-      position = Position,
+      weight = Weight,
       manager = Manager,
       held = Held
     } | Rest],
@@ -307,7 +305,7 @@ check_cycles(
 )->
   case Held of
     #{Edge := OriginManager}->
-      case beats(Position, Ref, Probe) of
+      case beats(Weight, Ref, Probe) of
         true->
           origin;
         false->
@@ -320,23 +318,21 @@ check_cycles([], _Probe, Losers, Found)->
   {Losers, Found}.
 
 %%-----------------------------------------------------------------
-%%  The smaller position wins, the older context; the coin on a tie.
-%%  The positions are stamped on the system time of their managers,
-%%  so they compare across nodes as they are
+%%  Heavier wins, the coin on a tie
 %%-----------------------------------------------------------------
--spec beats(integer(), reference(), #deadlock_probe{}) -> boolean().
+-spec beats(non_neg_integer(), reference(), #deadlock_probe{}) -> boolean().
 beats(
-    CloserPosition,
+    CloserWeight,
     CloserRef,
     #deadlock_probe{
       ref = Ref,
-      weight = Position
+      weight = Weight
     }
 )->
   if
-    CloserPosition < Position ->
+    CloserWeight > Weight ->
       true;
-    CloserPosition > Position ->
+    CloserWeight < Weight ->
       false;
     true ->
       drop_coin(CloserRef, Ref) =:= CloserRef

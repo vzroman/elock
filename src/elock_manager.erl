@@ -14,14 +14,7 @@
 %%      waits for #locked{}, #deadlock{}, #timeout{} or #retry{}.
 %%
 %%  The requests may arrive out of order, the manager takes them in
-%%  by the ticket (see handle_request/2). A request that has to wait
-%%  is queued by its birth, the time it was taken in less k times the
-%%  age its client's context had at the call (#request.age, a
-%%  duration, stale by the way to this node only), the oldest first,
-%%  the ticket among equals (see queue_key/1). The position is also
-%%  the weight in a deadlock, compared as it is: the stamp is the
-%%  system time, one clock for every node; the coin on a tie (see
-%%  elock_graph).
+%%  by the ticket (see handle_request/2).
 %%
 %%  A waiting request that holds something is an edge of the wait-for
 %%  graph of the node (elock_graph): the manager casts its held map
@@ -208,13 +201,9 @@ start_manager(Request)->
 %% How long a missing ticket is waited for (see handle_postpone_timeout/2)
 -define(POSTPONE_TIMEOUT, 100).
 
-%% k: the weight of the age in the queue key. 1 is the oldest first,
-%% mnesia's order; 0 is the order of arrival
--define(AGE_FACTOR, 1000).
-
 -record(state,{
   holders :: holders(),
-  queue :: gb_sets:set(queue_key()), % the head is the smallest
+  queue :: gb_sets:set({pos_integer(), reference()}), % the head is the smallest
   requests :: requests(), % the holders and the waiters
   clients :: clients(),
   scope :: atom(),
@@ -233,7 +222,7 @@ start_manager(Request)->
   proxy :: pid() | undefined, % undefined once the lock is held
   tag :: reference() | undefined, % undefined once the lock is held
   shared :: boolean(),
-  position :: integer(), % EnqueueTs - k x Age, system time in microseconds: the queue position (see queue_key/1)
+  held_count :: non_neg_integer() | undefined, % unused for the first holder
   has_lock :: boolean(),
   timer :: reference() | undefined, % the timeout timer, while waiting
   edges = false :: boolean() % the graph has the edges of this request
@@ -260,8 +249,7 @@ init(#request{
   term = Term,
   client = Client,
   proxy = Proxy,
-  shared = Shared,
-  age = Age
+  shared = Shared
 })->
 
   ets:update_element(Scope, Term, {2,self()}),
@@ -277,8 +265,6 @@ init(#request{
     }
   ),
 
-  % Stamped as every request, though the first holder never waits
-  Position = erlang:system_time(microsecond) - ?AGE_FACTOR * Age,
   State = #state{
     holders = #{ Ref => {Shared, Client} },
     queue = gb_sets:empty(),
@@ -289,7 +275,6 @@ init(#request{
         queue = 1,
         proxy = Proxy,
         shared = Shared,
-        position = Position,
         has_lock = true,
         timer = undefined
       }
@@ -767,7 +752,7 @@ new_req(#request{
   proxy = Proxy,
   tag = Tag,
   shared = Shared,
-  age = Age
+  held_count = HeldCount
 })->
   #req{
     client = ClientPID,
@@ -776,26 +761,16 @@ new_req(#request{
     proxy = Proxy,
     tag = Tag,
     shared = Shared,
-    position = erlang:system_time(microsecond) - ?AGE_FACTOR * Age,
+    held_count = HeldCount,
     has_lock = false
   }.
-
-%%-----------------------------------------------------------------
-%%  The smallest position first, the oldest; the ticket among equals
-%%-----------------------------------------------------------------
--spec queue_key(#req{}) -> queue_key().
-queue_key(#req{
-  position = Position,
-  queue = Ticket,
-  ref = Ref
-})->
-  {Position, Ticket, Ref}.
 
 -spec enqueue(#request{}, #state{}) -> #state{}.
 enqueue(
     #request{
       client = ClientPID,
       ref = Ref,
+      queue = Ticket,
       shared = Shared
     } = Request,
     #state{
@@ -811,7 +786,7 @@ enqueue(
     Ref => Req
   },
   Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
-  Queue = gb_sets:insert(queue_key(Req), Queue0),
+  Queue = gb_sets:insert({Ticket, Ref}, Queue0),
 
   State#state{
     queue = Queue,
@@ -878,7 +853,8 @@ dequeue(
 dequeue(
     #req{
       client = ClientPID,
-      ref = Ref
+      ref = Ref,
+      queue = Ticket
     } = Req,
     #state{
       requests = Requests0,
@@ -887,7 +863,7 @@ dequeue(
     } = State
 )->
   ?TRACE(m_dequeue, Ref, []),
-  Queue = gb_sets:delete_any(queue_key(Req), Queue0),
+  Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
   stop_waiting(Req, State),
@@ -924,6 +900,7 @@ locked(
     #req{
       client = ClientPID,
       ref = Ref,
+      queue = Ticket,
       proxy = Proxy,
       tag = Tag,
       shared = Shared
@@ -951,7 +928,7 @@ locked(
   },
   Holders = Holders0#{ Ref => {Shared, ClientPID} },
   % Not in the queue if granted by get_lock/2 or as barging by next/1
-  Queue = gb_sets:delete_any(queue_key(Req0), Queue0),
+  Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
 
   % A shared grant on an exclusive lock is a barging one: it stays exclusive
   CanShare = Shared andalso CanShare0,
@@ -1089,7 +1066,7 @@ next(#state{
     true->
       try_unlock(State0);
     false->
-      {_Position, _Ticket, Ref} = gb_sets:smallest(Queue),
+      {_Ticket, Ref} = gb_sets:smallest(Queue),
       Req = maps:get(Ref, Requests),
       State = locked(Req, State0),
       % A shared head may be joined by the next ones
@@ -1105,7 +1082,7 @@ next(#state{
     true->
       State0;
     false->
-      {_Position, _Ticket, Ref} = gb_sets:smallest(Queue),
+      {_Ticket, Ref} = gb_sets:smallest(Queue),
       case Requests of
         #{Ref := Req = #req{shared = true}} ->
           State = locked(Req, State0),
@@ -1172,10 +1149,10 @@ handle_add_held_locks(
   case Requests of
     #{Ref := #req{
       has_lock = false,
-      position = Position
+      held_count = HeldCount
     } = Req}->
       ?TRACE(m_held, Ref, map_size(Held)),
-      elock_graph:add_edges({Scope, Term, node()}, Ref, Position, Held),
+      elock_graph:add_edges({Scope, Term, node()}, Ref, HeldCount, Held),
       State#state{
         requests = Requests#{
           Ref => Req#req{

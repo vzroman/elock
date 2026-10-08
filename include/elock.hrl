@@ -70,7 +70,6 @@
   edge :: lock_key(),           % the lock the origin waits for
   manager :: pid(),             % the origin manager
   birth :: non_neg_integer(),  % the held count of the origin
-  now,
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
   visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
 }).

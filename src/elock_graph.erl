@@ -224,8 +224,7 @@ launch(
     ref = Ref,
     edge = Edge,
     manager = Manager,
-    birth = Birth,
-    now = erlang:system_time(microsecond)
+    birth = Birth
   },
   {Entry, Visited, Hops} = schedule(NewKeys, [], #{Edge => true}, #{}),
   Result = walk(Entry, Probe, Visited, [], Hops),
@@ -298,28 +297,21 @@ check_cycles(
     } | Rest],
     #deadlock_probe{
       edge = Edge,
-      manager = OriginManager,
-      now = _Now,
-      birth = OriginBirth
+      manager = OriginManager
     } = Probe,
     Losers,
     Found
 )->
-  if
-    OriginBirth < CloserBirth ->
-      origin;
-    true->
-      case Held of
-        #{Edge := OriginManager}->
-          case beats(CloserBirth, Ref, Probe) of
-            true->
-              origin;
-            false->
-              check_cycles(Rest, Probe, [{Ref, Manager} | Losers], Found)
-          end;
-        _->
-          check_cycles(Rest, Probe, Losers, maps:keys(Held) ++ Found)
-      end
+  case Held of
+    #{Edge := OriginManager}->
+      case beats(CloserBirth, Ref, Probe) of
+        true->
+          origin;
+        false->
+          check_cycles(Rest, Probe, [{Ref, Manager} | Losers], Found)
+      end;
+    _->
+      check_cycles(Rest, Probe, Losers, maps:keys(Held) ++ Found)
   end;
 check_cycles([], _Probe, Losers, Found)->
   {Losers, Found}.

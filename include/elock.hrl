@@ -24,7 +24,7 @@
   proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
-  holds :: non_neg_integer(), % held locks: a waiter that holds something may close a cycle
+  has_locks :: non_neg_integer(), % held locks: a waiter that holds something may close a cycle
   birth :: non_neg_integer(), % the age of the client's lock context at the call, microseconds (see elock_context)
   nodes :: nonempty_list(node()),
   timeout :: pos_integer() | undefined

@@ -5,8 +5,10 @@
 %%  client side of a request.
 %%
 %%  The context is born at the first lock call of the process and
-%%  dies with its last release. Every request carries the age of the
-%%  context at the call, microseconds: a duration, so the clocks of
+%%  keeps its birth after its last release. An empty context restarts
+%%  on the next lock call when its birth is over five seconds old.
+%%  Every request carries the age of the context at the call,
+%%  microseconds: a duration, so the clocks of
 %%  the nodes never meet. The manager derives the birth on its own
 %%  clock, queues by it, and the younger request of a cycle loses
 %%  (see elock_manager).
@@ -36,6 +38,7 @@
 -type request_result() :: {ok, node_managers()} | {error, term()}.
 
 -define(context,'$elock_context$').
+-define(RESTART_TIMEOUT, 5000000). % microseconds
 
 -record(lock,{
   scope :: atom(),
@@ -74,16 +77,16 @@ lock(Scope, Term, Nodes, Options)->
 
   Now = erlang:system_time(microsecond),
   Ref = make_ref(),
-  Context = get_context(),
-  Birth = birth(Context, Now),
-  Holds = length(Nodes) - 1 + held_locks(Context),
+  Context = init_context(get_context(), Now),
+  Birth = Context#context.birth,
+  HasLocks = length(Nodes) > 1 orelse has_locks(Context),
 
   Request = #request{
     ref = Ref,
     scope = Scope,
     term = Term,
     nodes = lists:usort(Nodes),
-    holds = Holds,
+    has_locks = HasLocks,
     birth = Birth,
     client = self(),
     timeout = Timeout,
@@ -93,7 +96,7 @@ lock(Scope, Term, Nodes, Options)->
   % (see wait_verdict/2)
   case run_request(Ref, Request) of
     {ok, LockedNodes} ->
-      locked(Request, LockedNodes, Now, Context),
+      locked(Request, LockedNodes, Context),
       {ok, Ref};
     Error ->
       Error
@@ -120,8 +123,6 @@ lock(Scope, Term, IsShared, Timeout, Nodes)->
       Error
   end.
 
-%% Birth: the context's, or the time of the call that makes it
--spec locked(#request{}, node_managers(), integer(), context()) -> context().
 locked(
     #request{
       ref = Ref,
@@ -129,7 +130,6 @@ locked(
       term = Term
     },
     Nodes,
-    _Now,
     #context{
       ref2lock = Ref2Lock0,
       locked = Locked0,
@@ -152,15 +152,7 @@ locked(
     locked = Locked,
     counts = Counts
   },
-  put_context(Context);
-locked(Request, Nodes, Now, _NoContext)->
-  Context = #context{
-    ref2lock = #{},
-    locked = #{},
-    counts = #{},
-    birth = Now
-  },
-  locked(Request, Nodes, Now, Context).
+  put_context(Context).
 
 -spec unlock(reference()) -> ok.
 unlock(Ref)->
@@ -181,7 +173,11 @@ unlock(
   release(Nodes, Ref),
   if
     map_size(Ref2Lock) =:= 0 ->
-      no_locks_remain;
+      put_context(Context#context{
+        ref2lock = #{},
+        locked = #{},
+        counts = #{}
+      });
     true ->
       {Locked, Counts} = remove_lock(Lock, {Locked0, Counts0}),
       put_context(Context#context{
@@ -262,20 +258,48 @@ remove_lock(
   ).
 
 
-birth(
-    #context{ birth = Birth},
+-spec init_context(context(), integer()) -> #context{}.
+init_context(
+    #context{
+      ref2lock = Ref2Lock,
+      birth = Birth
+    },
+    Now
+) when
+  map_size(Ref2Lock) =:= 0,
+  Now - Birth > ?RESTART_TIMEOUT ->
+  init_context(undefined, Now);
+init_context(
+    #context{
+      birth = Birth,
+      ref2lock = Ref2Lock
+  } = Context,
     _Now
-)->
-  Birth;
-birth(_Context, Now)->
-  Now.
+) when map_size(Ref2Lock) =:= 0->
+  Context#context{
+    birth = Birth - 0 % emulate aging
+  };
+init_context(
+    #context{} = Context,
+    _Now
+) ->
+  Context;
+init_context(undefined, Now)->
+  Context = #context{
+    ref2lock = #{},
+    locked = #{},
+    counts = #{},
+    birth = Now
+  },
+  put_context(Context),
+  Context.
 
-held_locks(#context{
+has_locks(#context{
   locked = Locked
 })->
-  map_size(Locked);
-held_locks(_Context)->
-  0.
+  map_size(Locked) > 0;
+has_locks(_Context)->
+  false.
 
 %%=================================================================
 %%	REQUEST

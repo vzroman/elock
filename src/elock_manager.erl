@@ -213,7 +213,7 @@ start_manager(Request)->
   birth :: integer(), % EnqueueTs - k x Age, system time in microseconds: the queue position (see queue_key/1)
   has_lock :: boolean(),
   timer :: reference() | undefined, % the timeout timer, while waiting
-  holds = 0 :: integer() % the graph has the edges of this request
+  has_locks = false
 }).
 
 -record(client,{
@@ -239,7 +239,7 @@ init(#request{
   proxy = Proxy,
   shared = Shared,
   birth = Birth,
-  holds = Holds
+  has_locks = HasLocks
 })->
 
   ets:update_element(Scope, Term, {2,self()}),
@@ -262,9 +262,9 @@ init(#request{
     birth = Birth,
     has_lock = true,
     timer = undefined,
-    holds = Holds
+    has_locks = HasLocks
   },
-  BirthQueue = gb_sets:insert({Birth, Ref},gb_sets:empty()),
+  BirthQueue = add_birth_queue(granted, Req, gb_sets:empty()),
 
   State = #state{
     holders = #{ Ref => {Shared, Client} },
@@ -648,7 +648,8 @@ add_busy_request(
 %%-----------------------------------------------------------------
 add_busy_request(
     #request{
-      client = ClientPID
+      client = ClientPID,
+      birth = Birth
     } = Request,
     #state{
       clients = #clients{
@@ -659,7 +660,7 @@ add_busy_request(
 )->
   case Clients of
     #{ ClientPID := Client }->
-      case client_holds_lock(Client, Requests) of
+      case client_holds_lock(Client, Birth, Requests) of
         true ->
           try_barging(Request, State);
         _->
@@ -709,7 +710,7 @@ new_req(#request{
   tag = Tag,
   shared = Shared,
   birth = Birth,
-  holds = Holds
+  has_locks = HasLocks
 })->
   #req{
     client = ClientPID,
@@ -720,7 +721,7 @@ new_req(#request{
     shared = Shared,
     birth = Birth,
     has_lock = false,
-    holds = Holds
+    has_locks = HasLocks
   }.
 
 %%-----------------------------------------------------------------
@@ -736,8 +737,7 @@ enqueue(
       shared = Shared,
       timeout = Timeout,
       tag = Tag,
-      ticket = Ticket,
-      birth = Birth
+      ticket = Ticket
     } = Request,
     #state{
       queue = Queue0,
@@ -746,18 +746,18 @@ enqueue(
       birth_queue = BirthQueue0
     } = State
 )->
-  {MinBirth,_Ref} = gb_sets:smallest(BirthQueue0),
-
-  if
-    Birth < MinBirth ->
-      Req0 = new_req(Request),
+  Req0 = new_req(Request),
+  case add_birth_queue(queued, Req0, BirthQueue0) of
+    abort ->
+      Proxy ! ?reply(Tag, #abort{}),
+      State;
+    BirthQueue->
       Req = start_timer(Req0, Timeout),
       Requests = Requests0#{
         Ref => Req
       },
       Clients = add_client_request(ClientPID, Ref, Shared, Clients0),
       Queue = gb_sets:insert({Ticket, Ref}, Queue0),
-      BirthQueue = gb_sets:insert({Birth, Ref}, BirthQueue0),
 
       notify_queued(Request),
       State#state{
@@ -765,10 +765,7 @@ enqueue(
         requests = Requests,
         clients = Clients,
         birth_queue = BirthQueue
-      };
-    true ->
-      Proxy ! ?reply(Tag, #abort{}),
-      State
+      }
   end.
 
 %%-----------------------------------------------------------------
@@ -792,7 +789,7 @@ enqueue_barging(
       birth_queue = BirthQueue0
     } =State
 )->
-  case can_upgrade(ClientPID, Birth, maps:iterator(Holders), Requests0) of
+  case can_upgrade(ClientPID, {Birth, Ref}, maps:iterator(Holders), Requests0) of
     true->
       Req0 = new_req(Request),
       Req = start_timer(Req0, Timeout),
@@ -846,7 +843,7 @@ dequeue(
   stop_timer(Req),
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
-  BirthQueue = gb_sets:delete_any({Birth, Ref}, BirthQueue0),
+  BirthQueue = gb_sets:delete({Birth, Ref}, BirthQueue0),
 
   State#state{
     requests = Requests,
@@ -859,8 +856,7 @@ dequeue(
     #req{
       client = ClientPID,
       ref = Ref,
-      ticket = Ticket,
-      birth = Birth
+      ticket = Ticket
     } = Req,
     #state{
       requests = Requests0,
@@ -873,7 +869,7 @@ dequeue(
   Requests = maps:remove(Ref, Requests0),
   Clients = remove_client_request(ClientPID, Ref, Clients0),
   stop_timer(Req),
-  BirthQueue = gb_sets:delete_any({Birth, Ref}, BirthQueue0),
+  BirthQueue = remove_birth_queue(Req, BirthQueue0),
 
   State#state{
     queue = Queue,
@@ -881,6 +877,58 @@ dequeue(
     clients = Clients,
     birth_queue = BirthQueue
   }.
+
+
+add_birth_queue(
+    granted,
+    #req{
+      birth = Birth,
+      ref = Ref
+    },
+    Queue
+)->
+  gb_sets:add({Birth, Ref}, Queue);
+add_birth_queue(
+    queued,
+    #req{
+      has_locks = false,
+      birth = Birth,
+      ref = Ref
+    },
+    Queue
+)->
+  gb_sets:add({Birth, Ref}, Queue);
+add_birth_queue(
+    queued,
+    #req{
+      birth = Birth,
+      ref = Ref
+    },
+    Queue
+)->
+  Elem = {Birth, Ref},
+  case gb_sets:is_empty(Queue) of
+    true ->
+      gb_sets:add({Birth, Ref}, Queue);
+    _->
+      Oldest = gb_sets:smallest(Queue),
+      if
+        Elem < Oldest->
+          gb_sets:add({Birth, Ref}, Queue);
+        true ->
+          abort
+      end
+  end.
+
+remove_birth_queue(
+    #req{
+      birth = Birth,
+      ref = Ref
+    },
+    Queue
+)->
+  gb_sets:delete_any({Birth, Ref}, Queue).
+
 
 %%-----------------------------------------------------------------
 %%  Grants a request that has never waited
@@ -911,8 +959,7 @@ locked(
       proxy = Proxy,
       tag = Tag,
       shared = Shared,
-      ticket = Ticket,
-      birth = Birth
+      ticket = Ticket
     } = Req0,
     #state{
       holders = Holders0,
@@ -937,8 +984,9 @@ locked(
   Holders = Holders0#{ Ref => {Shared, ClientPID} },
   % Not in the queue if granted by get_lock/2 or as barging by next/1
   Queue = gb_sets:delete_any({Ticket, Ref}, Queue0),
+
   % A queued request is already indexed; an immediate grant is not.
-  BirthQueue = gb_sets:add({Birth, Ref}, BirthQueue0),
+  BirthQueue = add_birth_queue(granted, Req, BirthQueue0),
 
   % A shared grant on an exclusive lock is a barging one: it stays exclusive
   CanShare = Shared andalso CanShare0,
@@ -956,9 +1004,8 @@ unlocked(
     #req{
       client = ClientPID,
       ref = Ref,
-      shared = Shared,
-      birth = Birth
-    },
+      shared = Shared
+    } = Req,
     #state{
       clients = Clients0,
       holders = Holders0,
@@ -970,7 +1017,7 @@ unlocked(
   Clients = remove_client_request(ClientPID, Ref, Clients0),
   Holders = maps:remove(Ref, Holders0),
   Requests = maps:remove(Ref, Requests0),
-  BirthQueue = gb_sets:delete_any({Birth, Ref}, BirthQueue0),
+  BirthQueue = remove_birth_queue(Req, BirthQueue0),
 
   % Only the release of an exclusive hold can make the lock shared
   CanShare =
@@ -1249,17 +1296,17 @@ demonitor_client(#client{ monitor_ref = MonRef })
 demonitor_client(_Client)->
   ok.
 
--spec client_holds_lock(#client{}, requests()) -> boolean().
 client_holds_lock(
     #client{
       requests = ClientRequests
     },
+    Birth,
     Requests
 )->
   lists:any(
     fun(Ref)->
       case Requests of
-        #{ Ref := #req{has_lock = true} } -> true;
+        #{ Ref := #req{has_lock = true, birth = Birth} } -> true;
         _-> false
       end
     end,
@@ -1279,15 +1326,23 @@ only_holder(ClientRequests, Holders, Waiting)->
 %% not block it, and queued requests remain behind the barging upgrade.
 -spec can_upgrade(pid(), integer(), maps:iterator(reference(), holder()),
                   requests()) -> boolean().
-can_upgrade(Client, Birth, Holders, Requests)->
+can_upgrade(Client, BirthRef, Holders, Requests)->
   case maps:next(Holders) of
     none->
       true;
-    {Ref, {_Shared, HolderClient}, Rest}->
-      #req{birth = HolderBirth} = maps:get(Ref, Requests),
-      SameAttempt = HolderClient =:= Client andalso HolderBirth =:= Birth,
-      (SameAttempt orelse Birth < HolderBirth) andalso
-        can_upgrade(Client, Birth, Rest, Requests)
+    {HolderRef, {_Shared, HolderClient}, Rest}->
+      if
+        HolderClient =:= Client ->
+          can_upgrade(Client, BirthRef, Rest, Requests);
+        true->
+          #req{birth = HolderBirth} = maps:get(HolderRef, Requests),
+          if
+            BirthRef < {HolderBirth, HolderRef} ->
+              can_upgrade(Client, BirthRef, Rest, Requests);
+            true->
+              false
+          end
+      end
   end.
 
 %%-----------------------------------------------------------------

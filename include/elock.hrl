@@ -10,7 +10,7 @@
 
 -record(request,{
   % The ticket must stay first: postponed requests are sorted by it.
-  queue :: pos_integer() | undefined,
+  ticket :: pos_integer() | undefined,
   ref :: reference(),
   scope :: atom(),
   term :: term(),
@@ -18,22 +18,15 @@
   proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
-  held_count :: non_neg_integer(), % held locks, the weight in a deadlock
-  birth,
-  nodes :: nonempty_list(node()),
   timeout :: pos_integer() | undefined
 }).
 
 -record(unlock,{
-  manager :: pid() | undefined,
   ref :: reference()
 }).
 
-% Manager -> client: the request waits, send the held map
--record(queued,{
-  ref :: reference(),
-  manager :: pid(),
-  node :: node()
+-record(cancel,{
+  ref :: reference()
 }).
 
 % Client -> manager: the answer to #queued{} and every later grant
@@ -53,8 +46,8 @@
   lock :: lock_key(),           % the manager's lock
   ref :: reference(),
   birth :: non_neg_integer(),  % #request.held_count
-  manager :: pid(),
-  held :: held_locks()          % #add_held_locks.held as it came
+  client :: pid(),
+  holds :: held_locks()          % #add_held_locks.held as it came
 }).
 
 % Manager -> graph of its node: the request has stopped waiting
@@ -68,7 +61,7 @@
 -record(deadlock_probe,{
   ref :: reference(),           % the origin request
   edge :: lock_key(),           % the lock the origin waits for
-  manager :: pid(),             % the origin manager
+  client :: pid(),             % the origin manager
   birth :: non_neg_integer(),  % the held count of the origin
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
   visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled

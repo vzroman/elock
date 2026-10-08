@@ -56,13 +56,6 @@
   init/0 % spawned by proc_lib:start_link/3
 ]).
 
-%%=================================================================
-%%	API
-%%=================================================================
--export([
-  add_edges/4,
-  remove_edges/2
-]).
 
 %%=================================================================
 %%  Manager -> graph protocol is in elock.hrl
@@ -71,8 +64,8 @@
   lock :: lock_key(),           % the lock the request waits for, the key
   ref :: reference(),           % the request
   birth :: non_neg_integer(),  % #request.held_count, fixed for the life of the request
-  manager :: pid(),             % the manager of lock, the sender of the edges
-  held :: held_locks()          % #{lock_key() => pid()}, as the client sent it
+  client :: pid(),             % the manager of lock, the sender of the edges
+  holds :: held_locks()          % #{lock_key() => pid()}, as the client sent it
 }).
 
 -type visited() :: #{lock_key() => true}.
@@ -90,6 +83,7 @@ start_link()->
 -spec init() -> no_return().
 init()->
   process_flag(message_queue_data, off_heap),
+  process_flag(priority, high),
   ets:new(?MODULE, [named_table, bag, private, {keypos, #waiter.lock}]),
   register(?MODULE, self()),
   proc_lib:init_ack({ok, self()}),
@@ -103,15 +97,6 @@ init()->
 %%  Held is never empty (see elock_context:notify_queued/3 and
 %%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
--spec add_edges(lock_key(), reference(), non_neg_integer(), held_locks()) -> ok.
-add_edges(Lock, Ref, Birth, Held)->
-  ?MODULE ! #add_edges{lock = Lock, ref = Ref, birth = Birth, manager = self(), held = Held},
-  ok.
-
--spec remove_edges(lock_key(), reference()) -> ok.
-remove_edges(Lock, Ref)->
-  ?MODULE ! #remove_edges{lock = Lock, ref = Ref},
-  ok.
 
 %%=================================================================
 %%  The process
@@ -144,8 +129,8 @@ handle_add_edges(#add_edges{
   lock = Lock,
   ref = Ref,
   birth = Birth,
-  manager = Manager,
-  held = Held
+  client = Client,
+  holds = Holds
 })->
   case ets:match_object(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}) of
     []->
@@ -153,19 +138,19 @@ handle_add_edges(#add_edges{
         lock = Lock,
         ref = Ref,
         birth = Birth,
-        manager = Manager,
-        held = Held
+        client = Client,
+        holds = Holds
       },
       ets:insert(?MODULE, Row),
-      launch(Row, maps:keys(Held));
-    [#waiter{held = Held0} = Row0]->
-      case new_held_locks(Held, Held0) of
+      launch(Row, maps:keys(Holds));
+    [#waiter{holds = Holds0} = Row0]->
+      case new_held_locks(Holds, Holds0) of
         New when map_size(New) =:= 0->
           % The grant repeats a key of the context the client has sent already
           ok;
         New->
           Row = Row0#waiter{
-            held = maps:merge(Held0, New)
+            holds = maps:merge(Holds0, New)
           },
           ets:delete_object(?MODULE, Row0),
           ets:insert(?MODULE, Row),
@@ -216,19 +201,18 @@ launch(
       lock = Edge,
       ref = Ref,
       birth = Birth,
-      manager = Manager
+      client = Client
     },
     NewKeys
 )->
   Probe = #deadlock_probe{
     ref = Ref,
     edge = Edge,
-    manager = Manager,
+    client = Client,
     birth = Birth
   },
   {Entry, Visited, Hops} = schedule(NewKeys, [], #{Edge => true}, #{}),
   Result = walk(Entry, Probe, Visited, [], Hops),
-  ?TRACE(g_walk, Ref, elock_trace:walk(Result)),
   verdict(Result, Probe).
 
 %%-----------------------------------------------------------------
@@ -292,26 +276,25 @@ check_cycles(
     [#waiter{
       ref = Ref,
       birth = CloserBirth,
-      manager = Manager,
-      held = Held
+      client = Client,
+      holds = Holds
     } | Rest],
     #deadlock_probe{
-      edge = Edge,
-      manager = OriginManager
+      edge = Edge
     } = Probe,
     Losers,
     Found
 )->
-  case Held of
-    #{Edge := OriginManager}->
+  case Holds of
+    #{Edge := _}->
       case beats(CloserBirth, Ref, Probe) of
         true->
           origin;
         false->
-          check_cycles(Rest, Probe, [{Ref, Manager} | Losers], Found)
+          check_cycles(Rest, Probe, [{Ref, Client} | Losers], Found)
       end;
     _->
-      check_cycles(Rest, Probe, Losers, maps:keys(Held) ++ Found)
+      check_cycles(Rest, Probe, Losers, maps:keys(Holds) ++ Found)
   end;
 check_cycles([], _Probe, Losers, Found)->
   {Losers, Found}.
@@ -381,11 +364,10 @@ verdict(
     {origin, Winner},
     #deadlock_probe{
       ref = Ref,
-      manager = Manager
+      client = Client
     }
 )->
-  ?TRACE(g_verdict, Ref, origin),
-  ecall:send(Manager, #deadlock{ref = Ref, winner = Winner}),
+  ecall:send(Client, #deadlock{ref = Ref, winner = Winner}),
   ok;
 verdict(
     {Losers, Visited, Hops},
@@ -394,12 +376,10 @@ verdict(
     } = Probe
 )->
   [ begin
-      ?TRACE(g_verdict, Ref, {closer, Probe#deadlock_probe.ref}),
-      ecall:send(Manager, #deadlock{ref = Ref, winner = Edge})
-    end || {Ref, Manager} <- Losers ],
+      ecall:send(Client, #deadlock{ref = Ref, winner = Edge})
+    end || {Ref, Client} <- Losers ],
   maps:foreach(
     fun(Node, Locks)->
-      ?TRACE(g_hop, Probe#deadlock_probe.ref, {Node, length(Locks), map_size(Visited)}),
       ecall:send({?MODULE, Node}, Probe#deadlock_probe{expand = Locks, visited = Visited})
     end,
     Hops

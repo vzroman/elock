@@ -51,7 +51,8 @@
   % Sent to managers as is. The same Term in two scopes is two locks.
   locked :: held_locks(),
   counts :: lock_counts(), % N >= 2: the re-entered keys only
-  birth :: integer() % monotonic time in microseconds of the first lock call
+  birth :: integer(), % monotonic time in microseconds of the first lock call
+  restarts
 }).
 
 -type context() :: #context{} | undefined.
@@ -272,12 +273,15 @@ init_context(
 init_context(
     #context{
       birth = Birth,
-      ref2lock = Ref2Lock
+      ref2lock = Ref2Lock,
+      restarts = Restarts
   } = Context,
     _Now
 ) when map_size(Ref2Lock) =:= 0->
+  Sleep = emulate_sleep(Restarts),
   Context#context{
-    birth = Birth - 0 % emulate aging
+    birth = Birth - Sleep, % emulate aging
+    restarts = Restarts + 1
   };
 init_context(
     #context{} = Context,
@@ -289,7 +293,8 @@ init_context(undefined, Now)->
     ref2lock = #{},
     locked = #{},
     counts = #{},
-    birth = Now
+    birth = Now,
+    restarts = 0
   },
   put_context(Context),
   Context.
@@ -300,6 +305,11 @@ has_locks(#context{
   map_size(Locked) > 0;
 has_locks(_Context)->
   false.
+
+emulate_sleep(Restarts)->
+  R = erlang:phash2(make_ref(),8) + 2,
+  Factor = math:pow(10, Restarts),
+  R * Factor * 1000.
 
 %%=================================================================
 %%	REQUEST

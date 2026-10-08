@@ -21,42 +21,46 @@
 %%  The steps of a lock call, in the order a request passes them.
 %%  The client (elock_context):
 %%    call          lock/4 has made the request. {Scope, Term, Nodes, IsShared}
-%%    spawned       the workers of a request for several nodes are spawned
+%%    request_context  {Birth, HasLocks, HeldReferenceCount}
+%%    spawned       the workers of an aggregate request are spawned
 %%    w_start       a worker runs. Node
 %%    w_done        the call of the worker to its node has returned. Node
 %%    node_result   the client has the result of a node. Node
-%%    queued_fwd    the client has #queued{} of a node and sends its held map. Node
+%%    queued_fwd    the client records #queued{} of a node. Node
+%%    queued_cancel a queued manager is withdrawn during cleanup. Manager
+%%    cleanup_begin an aggregate request failed. {Error, Grants, Queued, Pending}
+%%    cleanup_done  all pending worker results have been drained
 %%    done          lock/4 returns. ok | {error, Reason}
 %%    unlock        unlock/1 is called
 %%  The proxy, the client or the worker on the node (elock_manager):
 %%    w_enter       lock/1 runs on the node of the worker
 %%    ticket        the ticket is taken. Ticket, 1: the lock was free
+%%    created       the holder of ticket 1 has spawned its manager. Manager
 %%    no_manager    the entry has been recreated since the ticket, a new one is taken
 %%    sent          the request is sent to the manager. Manager
 %%    queued_rcv    the proxy has #queued{}
 %%    verdict       the proxy has the verdict. {ok, Manager} | {error, Reason} | retry
 %%  The manager (elock_manager), PID is the manager:
 %%    m_init        started by the holder of ticket 1. {Scope, Term}
+%%    m_recv        a request enters the receive clause. {Ticket, MailboxLength}
 %%    m_request     a request is taken in by its ticket. Ticket
 %%    m_postponed   a request is ahead of a missing ticket. {Ticket, Last}
 %%    m_postpone_fired  the postpone timer has stepped over the missing tickets
 %%    m_retry       the ticket of a request has been stepped over
 %%    m_enqueue     the request waits. {Holders, QueueLength} | barging
-%%    m_held        the held map of a waiting request goes to the graph. Size
-%%    m_held_late   the held map of a request that waits no more
+%%    m_wait_die    the admission inputs. {Birth, HasLocks, Oldest}
+%%                  Oldest is undefined or {Birth, Ref, Client, IsHolder};
+%%                  the event Id is the candidate Ref. The oldest index
+%%                  includes admitted waiters as well as current holders.
+%%    m_upgrade     the upgrade admission inputs. {Birth, HolderCount}
+%%    m_abort       admission refused. wait_die | upgrade | second_upgrade
 %%    m_grant       the request holds the lock
-%%    m_deadlock    the verdict of the graph. delivered | late | upgrade
 %%    m_timeout     the timeout of a waiting request
 %%    m_dequeue     a waiting request leaves
 %%    m_unlock      #unlock{} is received
 %%    m_round       try_unlock/1 has found a new ticket
-%%  The graph process (elock_graph), Id is the origin request:
-%%    g_add         #add_edges{} is handled. {HeldSize, MailboxLength}
-%%    g_probe       a hop is handled. {Locks, VisitedSize, MessageBytes, MailboxLength}
-%%    g_walk        the walk has ended. origin | {Losers, VisitedSize, HopNodes}
-%%    g_verdict     #deadlock{} goes to the manager of Id. origin | {closer, OriginRef}
-%%    g_hop         a hop goes out. {Node, Locks, VisitedSize}
-%%    g_remove      #remove_edges{} is handled
+%%    m_exit        try_unlock/1 removed its ETS entry. {Scope, Term}
+%%                  m_round and m_exit use the manager PID as their Id.
 %%
 %%  The reader is test/performance/util/performance_trace_report.erl
 %%=================================================================

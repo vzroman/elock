@@ -512,7 +512,6 @@ handle_unlock(
       leave_lock(Ref, State0)
   end;
 handle_unlock(Ref, State)->
-  ?TRACE(m_unlock, Ref, []),
   leave_lock(Ref, State).
 
 -spec leave_lock(reference(), #state{}) -> #state{}.

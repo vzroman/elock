@@ -40,7 +40,7 @@
 %%    taken in the attempt released and the transaction starts over
 %%    with the same locks in the same order and its retained context:
 %%    a restart. Wait-die can refuse a request in either lock order.
-%%    The caller sleeps 2 ms after releasing the locks before retrying.
+%%    The caller sleeps 10 ms after releasing the locks before retrying.
 %%  - mnesia: an imitation without writes. A transaction is
 %%    mnesia:transaction/1 of a fun that takes the locks with
 %%    mnesia:lock/2 on the records of a table with ram_copies on all
@@ -629,7 +629,7 @@ elock_lock([{Term, Nodes, Options} | Rest], Locks, Refs, ReadUs, Restarts, ReadC
       ?TRACE(tx_restart, self(), length(Refs)),
       lists:foreach(fun elock:unlock/1, Refs),
       ?TRACE(tx_released, self(), []),
-      timer:sleep(10),
+      %timer:sleep(10),
       % The reads of the attempt are lost with it
       elock_lock(Locks, Locks, [], 0, Restarts + 1, ReadCost)
   end;

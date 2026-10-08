@@ -19,6 +19,7 @@
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
   held_count :: non_neg_integer(), % held locks, the weight in a deadlock
+  birth,
   nodes :: nonempty_list(node()),
   timeout :: pos_integer() | undefined
 }).
@@ -51,7 +52,7 @@
 -record(add_edges,{
   lock :: lock_key(),           % the manager's lock
   ref :: reference(),
-  weight :: non_neg_integer(),  % #request.held_count
+  birth :: non_neg_integer(),  % #request.held_count
   manager :: pid(),
   held :: held_locks()          % #add_held_locks.held as it came
 }).
@@ -68,7 +69,8 @@
   ref :: reference(),           % the origin request
   edge :: lock_key(),           % the lock the origin waits for
   manager :: pid(),             % the origin manager
-  weight :: non_neg_integer(),  % the held count of the origin
+  birth :: non_neg_integer(),  % the held count of the origin
+  now,
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
   visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
 }).

@@ -29,6 +29,7 @@
 -type request_result() :: {ok, node_managers()} | {error, term()}.
 
 -define(context,'$elock_context$').
+-define(RESTART_TIMEOUT, 5000). % microseconds
 
 -record(lock,{
   scope :: atom(),
@@ -40,7 +41,9 @@
   ref2lock :: #{reference() => #lock{}},
   % Sent to managers as is. The same Term in two scopes is two locks.
   locked :: held_locks(),
-  counts :: lock_counts() % N >= 2: the re-entered keys only
+  counts :: lock_counts(), % N >= 2: the re-entered keys only
+  birth :: integer(), % monotonic time in microseconds of the first lock call
+  restarts
 }).
 
 -type context() :: #context{} | undefined.
@@ -63,9 +66,11 @@ lock(Scope, Term, Nodes, Options)->
     timeout := Timeout,
     is_shared := IsShared
   } = validate_options(Options),
+
+  Now = erlang:system_time(microsecond),
   Ref = make_ref(),
-  ?TRACE(call, Ref, {Scope, Term, Nodes, IsShared}),
-  Context = get_context(),
+  Context = init_context(get_context(), Now),
+  Birth = Context#context.birth,
   HeldLocks = held_locks(Context),
   Request = #request{
     ref = Ref,
@@ -73,6 +78,7 @@ lock(Scope, Term, Nodes, Options)->
     term = Term,
     nodes = lists:usort(Nodes),
     held_count = held_count(Context),
+    birth = Birth,
     client = self(),
     timeout = Timeout,
     shared = IsShared
@@ -82,10 +88,8 @@ lock(Scope, Term, Nodes, Options)->
   case run_request(Ref, Request, HeldLocks) of
     {ok, LockedNodes} ->
       locked(Request, LockedNodes, Context),
-      ?TRACE(done, Ref, ok),
       {ok, Ref};
     Error ->
-      ?TRACE(done, Ref, Error),
       Error
   end.
 
@@ -140,18 +144,10 @@ locked(
     locked = Locked,
     counts = Counts
   },
-  put_context(Context);
-locked(Request, Nodes, _NoContext)->
-  Context = #context{
-    ref2lock = #{},
-    locked = #{},
-    counts = #{}
-  },
-  locked(Request, Nodes, Context).
+  put_context(Context).
 
 -spec unlock(reference()) -> ok.
 unlock(Ref)->
-  ?TRACE(unlock, Ref, []),
   unlock(Ref, erase_context()).
 -spec unlock(reference(), context()) -> ok.
 unlock(
@@ -169,7 +165,11 @@ unlock(
   release(Nodes, Ref),
   if
     map_size(Ref2Lock) =:= 0 ->
-      no_locks_remain;
+      put_context(Context#context{
+        ref2lock = #{},
+        locked = #{},
+        counts = #{}
+      });
     true ->
       {Locked, Counts} = remove_lock(Lock, {Locked0, Counts0}),
       put_context(Context#context{
@@ -249,6 +249,45 @@ remove_lock(
     Nodes
   ).
 
+init_context(
+    #context{
+      ref2lock = Ref2Lock,
+      birth = Birth
+    },
+    Now
+) when
+  map_size(Ref2Lock) =:= 0,
+  Now - Birth > ?RESTART_TIMEOUT ->
+  init_context(undefined, Now);
+init_context(
+    #context{
+      birth = Birth,
+      ref2lock = Ref2Lock,
+      restarts = Restarts
+  } = Context,
+    _Now
+) when map_size(Ref2Lock) =:= 0->
+  Sleep = emulate_sleep(Restarts),
+  Context#context{
+    birth = Birth - Sleep, % emulate aging
+    restarts = Restarts + 1
+  };
+init_context(
+    #context{} = Context,
+    _Now
+) ->
+  Context;
+init_context(undefined, Now)->
+  Context = #context{
+    ref2lock = #{},
+    locked = #{},
+    counts = #{},
+    birth = Now,
+    restarts = 0
+  },
+  put_context(Context),
+  Context.
+
 -spec held_locks(context()) -> held_locks().
 held_locks(#context{locked = Locked})->
   Locked;
@@ -258,6 +297,11 @@ held_locks(_NoContext)->
 -spec held_count(context()) -> non_neg_integer().
 held_count(Context)->
   map_size(held_locks(Context)).
+
+emulate_sleep(Restarts)->
+  R = erlang:phash2(make_ref(),8) + 2,
+  Factor = math:pow(10, Restarts),
+  R * Factor * 1000.
 
 %%=================================================================
 %%	REQUEST
@@ -304,9 +348,7 @@ run_request(
     lists:foldl(
       fun(N, Acc)->
         Holder = spawn(fun()->
-          ?TRACE(w_start, Ref, N),
           Result = ecall_connection:call(N, elock_manager, lock, [Request]),
-          ?TRACE(w_done, Ref, N),
           Client ! {Ref, N, Result},
           case Result of
             {ok, {ok, Manager}} when N =/= node()->
@@ -320,7 +362,7 @@ run_request(
       #{},
       Nodes
     ),
-  ?TRACE(spawned, Ref, []),
+
   wait_verdict(Ref, #waiting{
     ref = Ref,
     scope = Scope,

@@ -225,7 +225,8 @@ start_manager(Request)->
   held_count :: non_neg_integer() | undefined, % unused for the first holder
   has_lock :: boolean(),
   timer :: reference() | undefined, % the timeout timer, while waiting
-  edges = false :: boolean() % the graph has the edges of this request
+  edges = false :: boolean(), % the graph has the edges of this request
+  birth
 }).
 
 -record(client,{
@@ -249,7 +250,8 @@ init(#request{
   term = Term,
   client = Client,
   proxy = Proxy,
-  shared = Shared
+  shared = Shared,
+  birth = Birth
 })->
 
   ets:update_element(Scope, Term, {2,self()}),
@@ -276,7 +278,8 @@ init(#request{
         proxy = Proxy,
         shared = Shared,
         has_lock = true,
-        timer = undefined
+        timer = undefined,
+        birth = Birth
       }
     },
     clients = Clients,
@@ -335,7 +338,6 @@ handle_request(
     } = State0
 ) when (Last+1) =:= Queue->
 
-  ?TRACE(m_request, Request#request.ref, Queue),
   State = add_request(Request, State0),
 
   handle_postponed(State#state{
@@ -752,7 +754,8 @@ new_req(#request{
   proxy = Proxy,
   tag = Tag,
   shared = Shared,
-  held_count = HeldCount
+  held_count = HeldCount,
+  birth = Birth
 })->
   #req{
     client = ClientPID,
@@ -762,6 +765,7 @@ new_req(#request{
     tag = Tag,
     shared = Shared,
     held_count = HeldCount,
+    birth = Birth,
     has_lock = false
   }.
 
@@ -780,7 +784,6 @@ enqueue(
     } = State
 )->
 
-  ?TRACE(m_enqueue, Ref, {map_size(State#state.holders), gb_sets:size(Queue0)}),
   Req = start_waiting(Request),
   Requests = Requests0#{
     Ref => Req
@@ -809,7 +812,6 @@ enqueue_barging(
       clients = Clients0
     } =State
 )->
-  ?TRACE(m_enqueue, Ref, barging),
   Req = start_waiting(Request),
   Requests = Requests0#{
     Ref => Req
@@ -1149,10 +1151,9 @@ handle_add_held_locks(
   case Requests of
     #{Ref := #req{
       has_lock = false,
-      held_count = HeldCount
+      birth = Birth
     } = Req}->
-      ?TRACE(m_held, Ref, map_size(Held)),
-      elock_graph:add_edges({Scope, Term, node()}, Ref, HeldCount, Held),
+      elock_graph:add_edges({Scope, Term, node()}, Ref, Birth, Held),
       State#state{
         requests = Requests#{
           Ref => Req#req{
@@ -1162,7 +1163,6 @@ handle_add_held_locks(
       };
     _->
       % Granted or left meanwhile
-      ?TRACE(m_held_late, Ref, []),
       State
   end.
 

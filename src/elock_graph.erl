@@ -70,7 +70,7 @@
 -record(waiter,{
   lock :: lock_key(),           % the lock the request waits for, the key
   ref :: reference(),           % the request
-  weight :: non_neg_integer(),  % #request.held_count, fixed for the life of the request
+  birth :: non_neg_integer(),  % #request.held_count, fixed for the life of the request
   manager :: pid(),             % the manager of lock, the sender of the edges
   held :: held_locks()          % #{lock_key() => pid()}, as the client sent it
 }).
@@ -104,8 +104,8 @@ init()->
 %%  elock_manager:wait_verdict/4)
 %%-----------------------------------------------------------------
 -spec add_edges(lock_key(), reference(), non_neg_integer(), held_locks()) -> ok.
-add_edges(Lock, Ref, Weight, Held)->
-  ?MODULE ! #add_edges{lock = Lock, ref = Ref, weight = Weight, manager = self(), held = Held},
+add_edges(Lock, Ref, Birth, Held)->
+  ?MODULE ! #add_edges{lock = Lock, ref = Ref, birth = Birth, manager = self(), held = Held},
   ok.
 
 -spec remove_edges(lock_key(), reference()) -> ok.
@@ -143,17 +143,16 @@ loop()->
 handle_add_edges(#add_edges{
   lock = Lock,
   ref = Ref,
-  weight = Weight,
+  birth = Birth,
   manager = Manager,
   held = Held
 })->
-  ?TRACE(g_add, Ref, {map_size(Held), elock_trace:mailbox()}),
   case ets:match_object(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}) of
     []->
       Row = #waiter{
         lock = Lock,
         ref = Ref,
-        weight = Weight,
+        birth = Birth,
         manager = Manager,
         held = Held
       },
@@ -216,7 +215,7 @@ launch(
     #waiter{
       lock = Edge,
       ref = Ref,
-      weight = Weight,
+      birth = Birth,
       manager = Manager
     },
     NewKeys
@@ -225,7 +224,8 @@ launch(
     ref = Ref,
     edge = Edge,
     manager = Manager,
-    weight = Weight
+    birth = Birth,
+    now = erlang:system_time(microsecond)
   },
   {Entry, Visited, Hops} = schedule(NewKeys, [], #{Edge => true}, #{}),
   Result = walk(Entry, Probe, Visited, [], Hops),
@@ -292,27 +292,34 @@ check_cycles(
 check_cycles(
     [#waiter{
       ref = Ref,
-      weight = Weight,
+      birth = CloserBirth,
       manager = Manager,
       held = Held
     } | Rest],
     #deadlock_probe{
       edge = Edge,
-      manager = OriginManager
+      manager = OriginManager,
+      now = _Now,
+      birth = OriginBirth
     } = Probe,
     Losers,
     Found
 )->
-  case Held of
-    #{Edge := OriginManager}->
-      case beats(Weight, Ref, Probe) of
-        true->
-          origin;
-        false->
-          check_cycles(Rest, Probe, [{Ref, Manager} | Losers], Found)
-      end;
-    _->
-      check_cycles(Rest, Probe, Losers, maps:keys(Held) ++ Found)
+  if
+    OriginBirth < CloserBirth ->
+      origin;
+    true->
+      case Held of
+        #{Edge := OriginManager}->
+          case beats(CloserBirth, Ref, Probe) of
+            true->
+              origin;
+            false->
+              check_cycles(Rest, Probe, [{Ref, Manager} | Losers], Found)
+          end;
+        _->
+          check_cycles(Rest, Probe, Losers, maps:keys(Held) ++ Found)
+      end
   end;
 check_cycles([], _Probe, Losers, Found)->
   {Losers, Found}.
@@ -322,18 +329,18 @@ check_cycles([], _Probe, Losers, Found)->
 %%-----------------------------------------------------------------
 -spec beats(non_neg_integer(), reference(), #deadlock_probe{}) -> boolean().
 beats(
-    CloserWeight,
+    CloserBirth,
     CloserRef,
     #deadlock_probe{
       ref = Ref,
-      weight = Weight
+      birth = Birth
     }
 )->
   if
-    CloserWeight > Weight ->
-      true;
-    CloserWeight < Weight ->
+    CloserBirth > Birth ->
       false;
+    CloserBirth < Birth ->
+      true;
     true ->
       drop_coin(CloserRef, Ref) =:= CloserRef
   end.

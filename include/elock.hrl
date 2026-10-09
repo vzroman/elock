@@ -38,34 +38,34 @@
   held :: held_locks()
 }).
 
-% Graph -> manager, manager -> client: the request has lost
+% Walker -> request client; manager -> proxy: the request has lost
 -record(deadlock,{
   ref :: reference(),
   winner :: lock_key() % the lock the winning request waits for
 }).
 
-% Manager -> graph of its node: the new holds of a waiting request
+% Client graph worker -> update call on the waiting node: new holds
 -record(add_edges,{
   lock :: lock_key(),           % the manager's lock
   ref :: reference(),
-  birth :: non_neg_integer(),  % #request.held_count
-  client :: pid(),
-  holds :: held_locks()          % #add_held_locks.held as it came
+  birth :: non_neg_integer(),   % priority fixed for the life of the context
+  client :: pid(),              % the request client receiving verdicts
+  holds :: held_locks()         % the context's holds or a later grant
 }).
 
-% Manager -> graph of its node: the request has stopped waiting
+% Client graph worker -> removal cast on the waiting node: stopped waiting
 -record(remove_edges,{
   lock :: lock_key(),
   ref :: reference()
 }).
 
-% Graph -> graph of another node: expand these locks there. expand and
-% visited are set for the hop, a launch walks without them
+% Walker -> probe cast on another node: expand these locks there.
+% expand and visited are set for the hop, a launch walks without them
 -record(deadlock_probe,{
   ref :: reference(),           % the origin request
   edge :: lock_key(),           % the lock the origin waits for
-  client :: pid(),             % the origin manager
-  birth :: non_neg_integer(),  % the held count of the origin
+  client :: pid(),              % the origin client receiving verdicts
+  birth :: non_neg_integer(),   % the origin context's fixed priority
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
   visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
 }).

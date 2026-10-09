@@ -42,7 +42,7 @@
   % Sent to managers as is. The same Term in two scopes is two locks.
   locked :: held_locks(),
   counts :: lock_counts(), % N >= 2: the re-entered keys only
-  birth :: integer() % monotonic time in microseconds of the first lock call
+  birth :: integer() % system time in microseconds, fixed for this context
 }).
 
 -type context() :: #context{} | undefined.
@@ -285,7 +285,7 @@ held_locks(_NoContext)->
   term :: term(),
   nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
   holds :: held_locks(),          % the context and the grants so far
-  birth :: integer(),
+  birth :: integer(),             % priority fixed for the life of the context
   ref :: reference()
 }).
 
@@ -523,12 +523,14 @@ kill_holder(Holder)-> exit(Holder, kill).
 %%=================================================================
 %%  Graph worker
 %%=================================================================
+-spec init_graph(#graph{}) -> ok | #deadlock{}.
 init_graph(#graph{
   client = Client
 } = Graph)->
   erlang:monitor(process, Client),
   graph_loop(Graph).
 
+-spec graph_loop(#graph{}) -> ok | #deadlock{}.
 graph_loop(#graph{
   ref = Ref,
   client = Client,
@@ -561,7 +563,11 @@ graph_loop(#graph{
       remove_edges(Nodes0, Graph)
   end.
 
-% A new waiter gets all the holds; the existing waiters get each later grant.
+%%-----------------------------------------------------------------
+%%  A new waiter gets all the holds; existing waiters get each later grant.
+%%  Sequential calls finish publication before the next update or removal.
+%%  Unreachable nodes are reported through the lock request path
+%%-----------------------------------------------------------------
 -spec add_edges([node()], held_locks(), #graph{}) -> ok.
 add_edges(
     Nodes,
@@ -582,13 +588,18 @@ add_edges(
   },
   lists:foreach(
     fun(Node)->
-      ecall:send({elock_graph, Node}, AddEdges#add_edges{ lock = {Scope, Term, Node} })
+      ecall:call(Node, elock_graph, handle_add_edges, [
+        AddEdges#add_edges{ lock = {Scope, Term, Node} }
+      ])
     end,
     Nodes
   );
 add_edges(_Nodes, _Holds, _Graph)->
   ok.
 
+%%-----------------------------------------------------------------
+%%  Terminal removal follows completed additions for each waiting copy
+%%-----------------------------------------------------------------
 -spec remove_edges([node()], #graph{}) -> ok.
 remove_edges(Nodes, #graph{
   scope = Scope,
@@ -598,7 +609,9 @@ remove_edges(Nodes, #graph{
   RemoveEdges = #remove_edges{ref = Ref},
   lists:foreach(
     fun(Node)->
-      ecall:send({elock_graph, Node}, RemoveEdges#remove_edges{ lock = {Scope, Term, Node} })
+      ecall:cast(Node, elock_graph, handle_remove_edges, [
+        RemoveEdges#remove_edges{ lock = {Scope, Term, Node} }
+      ])
     end,
     Nodes
   ).

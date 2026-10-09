@@ -221,7 +221,6 @@ init(#request{
 })->
 
   ets:update_element(Scope, Term, {2,self()}),
-  ?TRACE(m_init, Ref, {Scope, Term}),
 
   Clients = add_client_request(
     Client,

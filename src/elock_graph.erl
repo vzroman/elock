@@ -180,7 +180,6 @@ handle_remove_edges(#remove_edges{
   lock = Lock,
   ref = Ref
 })->
-  ?TRACE(g_remove, Ref, []),
   ets:match_delete(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}),
   ok.
 
@@ -220,9 +219,7 @@ handle_probe(#deadlock_probe{
   expand = Entry,
   visited = Visited
 } = Probe)->
-  ?TRACE(g_probe, Probe#deadlock_probe.ref, {length(Entry), map_size(Visited), erlang:external_size(Probe), elock_trace:mailbox()}),
   Result = walk(Entry, Probe, Visited, [], #{}),
-  ?TRACE(g_walk, Probe#deadlock_probe.ref, elock_trace:walk(Result)),
   verdict(Result, Probe).
 
 %%-----------------------------------------------------------------

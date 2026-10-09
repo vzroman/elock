@@ -226,6 +226,10 @@ result(#{transaction := Transaction} = Point, ElapsedUs, Transactions, #sums{
 %%  The point runner on a node
 %%=================================================================
 runner(Controller, RunRef, Count, #{nodes := Nodes} = Client)->
+  %% Load before creating clients, outside the measured interval, so their
+  %% first calls do not contend on code_server for the same unloaded modules.
+  [ {module, Module} = code:ensure_loaded(Module)
+    || Module <- [performance_workload, elock, elock_context, elock_manager] ],
   Runner = self(),
   Clients = [start_client(Runner, RunRef, Client#{client_index => I}) || I <- lists:seq(1, Count)],
   ok = await_clients_ready(Count, RunRef),

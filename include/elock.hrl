@@ -25,8 +25,11 @@
   ref :: reference()
 }).
 
--record(cancel,{
-  ref :: reference()
+% Manager -> proxy -> client: the request has joined the wait queue
+-record(queued,{
+  ref :: reference(),
+  manager :: pid(),
+  node :: node()
 }).
 
 % Client -> manager: the answer to #queued{} and every later grant

@@ -16,11 +16,9 @@
 %%  The requests may arrive out of order, the manager takes them in
 %%  by the ticket (see handle_request/2).
 %%
-%%  A waiting request that holds something is an edge of the wait-for
-%%  graph of the node (elock_graph): the manager casts its held map
-%%  to the graph process when the client sends it, and casts the
-%%  remove when the waiter leaves. The graph process walks the graph
-%%  and sends #deadlock{} to the manager of a request that has lost.
+%%  An admitted waiter sends #queued{} through its proxy to the client.
+%%  The client uses the manager PID for cancellation and updates its
+%%  graph worker. Immediate grants do not send a queue notification.
 %%
 %%  The manager exits once it has removed the entry from ETS.
 %%=================================================================
@@ -33,8 +31,7 @@
 %%	API
 %%=================================================================
 -export([
-  lock/1,
-  cancel/3
+  lock/1
 ]).
 
 -type holder() :: {boolean(), pid()}.
@@ -69,15 +66,10 @@
 %%  Client side
 %%
 %%  The proxy takes the ticket and waits for the verdict: the client
-%%  itself (lock/2) or a worker on its behalf (lock/1)
+%%  itself or a worker on its behalf
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The worker of elock_context:run_request/3, remote apply. It does
-%%  not have the held locks
-%%-----------------------------------------------------------------
-
-%%-----------------------------------------------------------------
-%%  HeldLocks is undefined for a worker
+%%  The worker of elock_context:run_request/5, remote apply
 %%-----------------------------------------------------------------
 lock(
     #request{
@@ -110,34 +102,28 @@ lock(
       end
   end.
 
-cancel(Scope, Term, Ref)->
-  case ets:lookup(Scope, Term) of
-    [{ _Lock, Manager, _Queue }]->
-      Manager ! #cancel{ref = Ref};
-    _->
-      erlang:yield(),
-      cancel(Scope, Term, Ref)
-  end.
-
-
 %%-----------------------------------------------------------------
 %%  Every clause matches MonitorRef, a plain argument from
-%%  erlang:monitor/2 in lock/2: the receive skips the older messages.
+%%  erlang:monitor/2 in lock/1: the receive skips the older messages.
 %%  The request Ref can not do it: it is made in elock_context, maybe
-%%  on another node. A worker passes #queued{} on to the client, the
-%%  client answers it with HeldLocks
+%%  on another node. A worker passes #queued{} on to the client.
 %%-----------------------------------------------------------------
 wait_verdict(
     MonitorRef,
     Manager,
     #request{
+      ref = Ref,
       scope = Scope,
-      term = Term
-    }
+      term = Term,
+      client = ClientPID
+    } = Request
 )->
   receive
     ?reply(MonitorRef, #locked{})->
       {ok, Manager};
+    ?reply(MonitorRef, #queued{ref = Ref} = Queued)->
+      ecall:send(ClientPID, Queued),
+      wait_verdict(MonitorRef, Manager, Request);
     ?reply(MonitorRef, #deadlock{winner = Winner})->
       {error, {deadlock, Winner}};
     ?reply(MonitorRef, #timeout{})->
@@ -196,8 +182,7 @@ start_manager(Request)->
   barging :: #request{} | undefined, % the pending upgrade, not in the queue
   last :: pos_integer(), % the last ticket taken in
   postponed :: ordsets:ordset(#request{}), % ahead of a missing ticket
-  postpone_timer :: reference() | undefined,
-  cancelled
+  postpone_timer :: reference() | undefined
 }).
 
 -record(req,{
@@ -269,8 +254,7 @@ init(#request{
     barging = undefined,
     last = 1,
     postponed = [],
-    postpone_timer = undefined,
-    cancelled = #{}
+    postpone_timer = undefined
   },
 
   loop(State).
@@ -284,8 +268,6 @@ loop(State0)->
         handle_unlock(Ref, State0);
       #request{} = Request->
         handle_request(Request, State0);
-      #cancel{ref = Ref}->
-        handle_cancel(Ref, State0);
       {timeout, _TimerRef, {timeout, Ref}}->
         handle_timeout(Ref, State0);
       {'DOWN', _Ref, process, ClientPID, _Reason}->
@@ -307,27 +289,7 @@ loop(State0)->
 %%  postponed for at most POSTPONE_TIMEOUT: the missing client may be
 %%  descheduled or dead
 %%=================================================================
-handle_request(
-    #request{
-      ref = Ref,
-      client = ClientPID,
-      proxy = Proxy
-    },
-    #state{
-      cancelled = Cancelled0
-    } = State
-) when is_map_key(Ref, Cancelled0)->
-  Cancelled = maps:remove(Ref, Cancelled0),
-  if
-  % A worker (see lock/1)
-    is_pid(Proxy), Proxy =/= ClientPID ->
-      exit(Proxy, kill);
-    true ->
-      ignore
-  end,
-  State#state{
-    cancelled = Cancelled
-  };
+-spec handle_request(#request{}, #state{}) -> #state{}.
 handle_request(
     #request{
       ticket = Ticket
@@ -372,30 +334,6 @@ handle_request(
   State.
 
 -spec handle_postponed(#state{}) -> #state{}.
-handle_postponed(#state{
-  postponed = [#request{
-    ref = Ref,
-    ticket = Ticket,
-    client = ClientPID,
-    proxy = Proxy
-  }|Rest],
-  cancelled = Cancelled0
-} = State)
-  when is_map_key(Ref, Cancelled0)->
-  Cancelled = maps:remove(Ref, Cancelled0),
-  if
-    is_pid(Proxy), Proxy =/= ClientPID ->
-      exit(Proxy, kill);
-    true ->
-      ignore
-  end,
-
-  handle_postponed(State#state{
-    postponed = Rest,
-    last = Ticket,
-    cancelled = Cancelled
-  });
-
 handle_postponed(#state{
   postponed = [#request{
     ticket = Ticket
@@ -562,27 +500,6 @@ leave_lock(
       State
   end.
 
-handle_cancel(
-    Ref,
-    #state{
-      requests = Requests
-    } = State
-) when is_map_key(Ref, Requests)->
-  handle_unlock(Ref, State);
-handle_cancel(
-    Ref,
-    #state{
-      cancelled = Cancelled0
-    } = State
-)->
-  Cancelled = Cancelled0#{
-    Ref => true
-  },
-  State#state{
-    cancelled = Cancelled
-  }.
-
-
 %%-----------------------------------------------------------------
 %%  A timer cancelled on the grant may have fired already: ignored
 %%-----------------------------------------------------------------
@@ -602,12 +519,6 @@ handle_timeout(
     _->
       State0
   end.
-
-%%-----------------------------------------------------------------
-%%  The verdict of the graph process: the request has lost a walk
-%%  of its own, or a walk of another request it closed a cycle for
-%%  (see elock_graph)
-%%-----------------------------------------------------------------
 
 -spec handle_down(pid(), #state{}) -> #state{}.
 handle_down(
@@ -672,28 +583,6 @@ handle_nodedown(
 %%  not overtake a queued or barging exclusive request
 %%-----------------------------------------------------------------
 -spec add_request(#request{}, #state{}) -> #state{}.
-add_request(
-    #request{
-      ref = Ref,
-      client = ClientPID,
-      proxy = Proxy
-    },
-    #state{
-      cancelled = Cancelled0
-    } = State
-) when is_map_key(Ref, Cancelled0)->
-  Cancelled = maps:remove(Ref, Cancelled0),
-  if
-  % A worker (see lock/1)
-    is_pid(Proxy), Proxy =/= ClientPID ->
-      exit(Proxy, kill);
-    true ->
-      ignore
-  end,
-  State#state{
-    cancelled = Cancelled
-  };
-
 add_request(
     #request{
       shared = true
@@ -1156,16 +1045,6 @@ try_unlock(#state{
   end.
 
 %%=================================================================
-%%  The edges of the wait-for graph (see elock_graph)
-%%
-%%  A waiting request joins the graph of the node in
-%%  handle_add_held_locks/2, with every held map the client sends,
-%%  and leaves it in stop_waiting/2. The verdict comes back as
-%%  #deadlock{} (see handle_deadlock/2)
-%%=================================================================
-
-
-%%=================================================================
 %%  Utilities
 %%=================================================================
 -spec add_client_request(pid(), reference(), boolean(), clients()) -> clients().
@@ -1305,21 +1184,37 @@ only_holder(ClientRequests, Holders, Waiting)->
 start_waiting(#request{
   timeout = Timeout
 } = Request)->
+  notify_queued(Request),
   start_timer(new_req(Request), Timeout).
 
 %%-----------------------------------------------------------------
-%%  A waiter that was never asked for its held map, or was granted or
-%%  left before the answer came, has no edges: nothing to remove
+%%  A request stops its timer when it is granted or leaves the queue
 %%-----------------------------------------------------------------
 -spec stop_waiting(#req{}, #state{}) -> #req{}.
 stop_waiting(Req, _State)->
   stop_timer(Req).
 
 %%-----------------------------------------------------------------
-%%  The held map is asked for only on a wait: most requests never
-%%  wait. A single node request of a client that holds nothing can
-%%  not be on a cycle
+%%  Notify only admitted worker requests. The direct local caller
+%%  has no other node to cancel and does not need a notification.
 %%-----------------------------------------------------------------
+-spec notify_queued(#request{}) -> {reference(), #queued{}} | ignore.
+notify_queued(#request{
+  ref = Ref,
+  client = ClientPID,
+  proxy = Proxy,
+  tag = Tag
+})->
+  if
+    is_pid(Proxy), Proxy =/= ClientPID ->
+      Proxy ! ?reply(Tag, #queued{
+        ref = Ref,
+        manager = self(),
+        node = node()
+      });
+    true ->
+      ignore
+  end.
 
 -spec start_timer(#req{}, pos_integer() | undefined) -> #req{}.
 start_timer(

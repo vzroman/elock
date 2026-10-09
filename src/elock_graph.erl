@@ -6,42 +6,40 @@
 %%  elock_sup. It owns a private ETS bag of the waiting requests of
 %%  the node that hold something, keyed by the lock they wait for:
 %%
-%%      #waiter{ lock, ref, weight, manager, held }
+%%      #waiter{ lock, ref, birth, client, holds }
 %%
 %%  The waiters at a key all belong to one manager, which runs on
 %%  the lock's node: the rows of the waiters at lock L are complete
 %%  on node(L) and nowhere else. A walk expands a lock on its node,
 %%  and hops to the other nodes for the locks it has there.
 %%
-%%  The rows leave with their requests. A manager casts #add_edges{}
-%%  when a waiting request sends its held map and #remove_edges{}
-%%  when the waiter leaves, by a grant, a timeout, a verdict, a
-%%  withdrawal, a dead client or a dead node. A manager stops only
-%%  with the node or with no row in the graph, so the process keeps
-%%  nothing clean and never stops on its own.
+%%  The graph worker of elock_context sends #add_edges{} after a
+%%  manager reports #queued{}, and adds each later grant to the
+%%  waiting nodes. It sends #remove_edges{} when a node grants or
+%%  the request finishes, and when its client dies.
 %%
 %%  A walk serves one launch: the origin request, waiting for Edge
-%%  at Manager with Weight (#request.held_count, fixed for the life
-%%  of the request). Every new hold of a waiting request is probed
+%%  with Birth, fixed for the life of the context. Every new hold
+%%  of a waiting request is probed
 %%  once, when it appears, so the walk of the edge that closes a
 %%  cycle finds the rest of the cycle in place. The waiters of an
 %%  expanded lock depend on the origin: it holds the lock, or a
 %%  waiter expanded before does.
 %%    * a waiter holding Edge at Manager closes a cycle: compared,
 %%      never expanded. A closer that beats the origin ends the walk,
-%%      #deadlock{} goes to the origin manager and nothing else is
+%%      #deadlock{} goes to the origin client and nothing else is
 %%      sent. The losing closers are collected.
 %%    * the other waiters are expanded through the locks they hold.
 %%      A lock is visited from the moment it is scheduled, so no lock
 %%      is expanded twice in a branch and the walk ends.
 %%  When the list is empty every collected closer gets #deadlock{}
-%%  at its manager, then the remote locks go out as one
+%%  at its client, then the remote locks go out as one
 %%  #deadlock_probe{} per node, with the visited set of the whole
 %%  walk: two branches of one launch never expand the same lock.
 %%  The receiving graph walks on from them.
 %%
 %%  The verdicts leave as messages, the table changes only when the
-%%  managers' removes come back: a walk reads a snapshot.
+%%  graph workers' removes come back: a walk reads a snapshot.
 %%=================================================================
 -module(elock_graph).
 -moduledoc false.
@@ -94,8 +92,7 @@ init()->
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  The new holds of a waiting request. Lock is the manager's lock,
-%%  Held is never empty (see elock_context:notify_queued/3 and
-%%  elock_manager:wait_verdict/4)
+%%  Holds is never empty (see elock_context:add_edges/3)
 %%-----------------------------------------------------------------
 
 %%=================================================================
@@ -122,7 +119,7 @@ loop()->
 %%  No row: the first answer of the client to #queued{}. A row: a
 %%  later grant of a multi node request, or a key held at a manager
 %%  that died and was replaced. The new keys only are launched: every
-%%  edge is probed once, when it appears. The weight is the row's
+%%  edge is probed once, when it appears. Birth stays with the row
 %%-----------------------------------------------------------------
 -spec handle_add_edges(#add_edges{}) -> ok.
 handle_add_edges(#add_edges{

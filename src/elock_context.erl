@@ -25,6 +25,7 @@
 -type node_managers() :: #{node() => #node{}}.
 -type lock_counts() :: #{lock_key() => pos_integer()}.
 -type pending_workers() :: #{node() => pid()}.
+-type queued_managers() :: #{pid() => node()}.
 -type request_result() :: {ok, node_managers()} | {error, term()}.
 
 -define(context,'$elock_context$').
@@ -274,17 +275,18 @@ held_locks(_NoContext)->
   term :: term(),
   pending :: pending_workers(), % the workers that have not returned yet
   nodes :: node_managers(),     % the grants so far
-  graph
+  queued :: queued_managers(),  % every manager reported before a node returns
+  graph :: pid()
 }).
 
 -record(graph,{
-  client,
-  scope,
-  term,
-  nodes,
-  holds,
-  birth,
-  ref
+  client :: pid(),
+  scope :: atom(),
+  term :: term(),
+  nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
+  holds :: held_locks(),          % the context and the grants so far
+  birth :: integer(),
+  ref :: reference()
 }).
 
 % The local node alone: the client is the proxy itself
@@ -303,7 +305,7 @@ run_request(
   end;
 % A worker per node sends its result tagged with Ref. A remote grant
 % keeps the worker as its holder, monitoring the client locally until
-% release. The client answers #queued{} meanwhile
+% release. The client forwards #queued{} to the graph worker meanwhile
 run_request(
     Ref,
     Birth,
@@ -333,24 +335,17 @@ run_request(
       #{},
       Nodes
     ),
-  Client, Scope, Term, Nodes, Holds, Birth, Ref,
-  Graph =
-    if
-      map_size(Holds)>0;length(Nodes)> 0->
-        spawn(fun()->
-          init_graph(#graph{
-            client = Client,
-            scope = Scope,
-            term = Term,
-            nodes = Nodes,
-            holds = Holds,
-            birth = Birth,
-            ref = Ref
-          })
-        end);
-      true->
-        undefined
-    end,
+  Graph = spawn(fun()->
+    init_graph(#graph{
+      client = Client,
+      scope = Scope,
+      term = Term,
+      nodes = [],
+      holds = Holds,
+      birth = Birth,
+      ref = Ref
+    })
+  end),
 
   wait_verdict(Ref, #waiting{
     ref = Ref,
@@ -358,83 +353,9 @@ run_request(
     term = Term,
     pending = Pending,
     nodes = #{},
+    queued = #{},
     graph = Graph
   }).
-
-init_graph(#graph{
-  client = Client,
-  scope = Scope,
-  term = Term,
-  nodes = Nodes,
-  holds = Holds,
-  birth = Birth,
-  ref = Ref
-} = Graph)->
-  erlang:monitor(process, Client),
-  AddEdges = #add_edges{
-    ref = Ref,
-    birth = Birth,
-    client = Client,
-    holds = Holds
-  },
-  lists:foreach(
-    fun(Node)->
-      ecall:send({elock_graph, Node}, AddEdges#add_edges{ lock = {Scope, Term, Node} })
-    end,
-    Nodes
-  ),
-  graph_loop(Graph).
-
-graph_loop(#graph{
-  ref = Ref,
-  client = Client,
-  scope = Scope,
-  term = Term,
-  nodes = Nodes,
-  birth = Birth
-} = Graph)->
-  receive
-    #deadlock{ ref = Ref } = DeadLock->
-      RemoveEdges = #remove_edges{ref = Ref},
-      lists:foreach(
-        fun(Node)->
-          ecall:send({elock_graph, Node}, RemoveEdges#remove_edges{ lock = {Scope, Term, Node} })
-        end,
-        Nodes
-      ),
-      Client ! DeadLock;
-    {remove, Ref}->
-      RemoveEdges = #remove_edges{ref = Ref},
-      lists:foreach(
-        fun(Node)->
-          ecall:send({elock_graph, Node}, RemoveEdges#remove_edges{ lock = {Scope, Term, Node} })
-        end,
-        Nodes
-      );
-    {add, Ref, Node, Manager}->
-      ecall:send({elock_graph, Node}, #remove_edges{ lock = {Scope, Term, Node}, ref = Ref }),
-      AddEdges = #add_edges{
-        ref = Ref,
-        birth = Birth,
-        client = Client,
-        holds = #{ {Scope, Term, Node} => Manager }
-      },
-      lists:foreach(
-        fun(N)->
-          ecall:send({elock_graph, N}, AddEdges#add_edges{ lock = {Scope, Term, N} })
-        end,
-        Nodes -- [Node]
-      ),
-      graph_loop(Graph);
-    {'DOWN', _MonRef, process, Client, _Reason}->
-      RemoveEdges = #remove_edges{ref = Ref},
-      lists:foreach(
-        fun(Node)->
-          ecall:send({elock_graph, Node}, RemoveEdges#remove_edges{ lock = {Scope, Term, Node} })
-        end,
-        Nodes
-      )
-  end.
 
 
 % Workers reply with their node and result; remote grants keep a holder.
@@ -446,6 +367,7 @@ wait_verdict(
     Ref,
     #waiting{
       pending = Pending0,
+      queued = Queued0,
       nodes = Nodes0,
       graph = Graph
     } = Waiting0
@@ -456,18 +378,35 @@ wait_verdict(
       case NodeResult of
         {ok, {ok,Manager}} ->
           Graph ! {add, Ref, Node, Manager},
-          % The queued managers already have the rest
+          Queued = maps:filter(
+            fun(_Manager, N)->
+              N =/= Node
+            end,
+            Queued0
+          ),
           Nodes = Nodes0#{
             Node => #node{manager = Manager, holder = Holder}
           },
           Waiting = Waiting0#waiting{
             pending = Pending,
+            queued = Queued,
             nodes = Nodes
           },
           wait_verdict(Ref, Waiting);
         Error ->
           cancel(Waiting0#waiting{pending = Pending}),
           Error
+      end;
+    #queued{ref = Ref, manager = Manager, node = Node} = QueuedMessage->
+      % A result may overtake the notification on its way from a remote proxy.
+      case is_map_key(Node, Pending0) of
+        true->
+          Graph ! QueuedMessage,
+          wait_verdict(Ref, Waiting0#waiting{
+            queued = Queued0#{ Manager => Node }
+          });
+        false->
+          wait_verdict(Ref, Waiting0)
       end;
     #deadlock{ref = Ref, winner = Winner}->
       cancel(Waiting0),
@@ -486,20 +425,14 @@ wait_verdict(
   {ok, Nodes}.
 
 cancel(#waiting{
-  scope = Scope,
-  term = Term,
   ref = Ref,
   nodes = Nodes0,
   pending = Pending,
+  queued = Queued,
   graph = Graph
 })->
   release(Nodes0, Ref),
-  maps:foreach(
-    fun(N,_)->
-      ecall:cast(N, elock_manager, cancel, [Scope, Term, Ref])
-    end,
-    Pending
-  ),
+  unlock_queued(Queued, Ref),
 
   Graph ! {remove, Ref},
 
@@ -530,17 +463,30 @@ wait_unlock(Ref, Pending0)
     {Ref, Node, NodeResult}->
       {Holder, Pending} = maps:take(Node, Pending0),
       case NodeResult of
-        {ok, {ok, _Manager}} ->
+        {ok, {ok, Manager}} ->
+          ecall:send(Manager, #unlock{ref = Ref}),
           kill_holder(Holder);
         _->
           ignore
       end,
       wait_unlock(Ref, Pending);
+    #queued{ref = Ref, manager = Manager}->
+      ecall:send(Manager, #unlock{ref = Ref}),
+      wait_unlock(Ref, Pending0);
     {{local, Ref}, _MonRef, process, _Worker, _Reason}->
       wait_unlock(Ref, maps:remove(node(), Pending0))
   end;
 wait_unlock(_Ref, _Pending)->
   ok.
+
+-spec unlock_queued(queued_managers(), reference()) -> ok.
+unlock_queued(Queued, Ref)->
+  maps:foreach(
+    fun(Manager, _Node)->
+      ecall:send(Manager, #unlock{ref = Ref})
+    end,
+    Queued
+  ).
 
 %%=================================================================
 %%  Remote holders
@@ -573,6 +519,89 @@ release(Nodes, Ref)->
 -spec kill_holder(pid() | undefined) -> ok | true.
 kill_holder(undefined)-> ok;
 kill_holder(Holder)-> exit(Holder, kill).
+
+%%=================================================================
+%%  Graph worker
+%%=================================================================
+init_graph(#graph{
+  client = Client
+} = Graph)->
+  erlang:monitor(process, Client),
+  graph_loop(Graph).
+
+graph_loop(#graph{
+  ref = Ref,
+  client = Client,
+  scope = Scope,
+  term = Term,
+  nodes = Nodes0,
+  holds = Holds0
+} = Graph)->
+  receive
+    #queued{ref = Ref, node = Node}->
+      add_edges([Node], Holds0, Graph),
+      graph_loop(Graph#graph{
+        nodes = ordsets:add_element(Node, Nodes0)
+      });
+    #deadlock{ ref = Ref } = DeadLock->
+      remove_edges(Nodes0, Graph),
+      Client ! DeadLock;
+    {remove, Ref}->
+      remove_edges(Nodes0, Graph);
+    {add, Ref, Node, Manager}->
+      remove_edges([Node], Graph),
+      Nodes = ordsets:del_element(Node, Nodes0),
+      Holds = #{ {Scope, Term, Node} => Manager },
+      add_edges(Nodes, Holds, Graph),
+      graph_loop(Graph#graph{
+        nodes = Nodes,
+        holds = maps:merge(Holds0, Holds)
+      });
+    {'DOWN', _MonRef, process, Client, _Reason}->
+      remove_edges(Nodes0, Graph)
+  end.
+
+% A new waiter gets all the holds; the existing waiters get each later grant.
+-spec add_edges([node()], held_locks(), #graph{}) -> ok.
+add_edges(
+    Nodes,
+    Holds,
+    #graph{
+      client = Client,
+      scope = Scope,
+      term = Term,
+      birth = Birth,
+      ref = Ref
+    }
+) when map_size(Holds) > 0->
+  AddEdges = #add_edges{
+    ref = Ref,
+    birth = Birth,
+    client = Client,
+    holds = Holds
+  },
+  lists:foreach(
+    fun(Node)->
+      ecall:send({elock_graph, Node}, AddEdges#add_edges{ lock = {Scope, Term, Node} })
+    end,
+    Nodes
+  );
+add_edges(_Nodes, _Holds, _Graph)->
+  ok.
+
+-spec remove_edges([node()], #graph{}) -> ok.
+remove_edges(Nodes, #graph{
+  scope = Scope,
+  term = Term,
+  ref = Ref
+})->
+  RemoveEdges = #remove_edges{ref = Ref},
+  lists:foreach(
+    fun(Node)->
+      ecall:send({elock_graph, Node}, RemoveEdges#remove_edges{ lock = {Scope, Term, Node} })
+    end,
+    Nodes
+  ).
 
 %%=================================================================
 %%	UTILITIES
@@ -632,4 +661,3 @@ put_context(Context)->
 -spec erase_context() -> context().
 erase_context()->
   erase(?context).
-

@@ -20,6 +20,7 @@
   elock_test_utils_SUITE,
   elock_SUITE,
   elock_graph_SUITE,
+  elock_probe_limit_SUITE,
   elock_manager_SUITE,
   elock_locking_SUITE,
   elock_deadlock_SUITE,

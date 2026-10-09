@@ -39,6 +39,10 @@
 %%  #deadlock_probe{} cast per node, with this branch's visited set.
 %%  Separate branches can discover the same previously unseen lock.
 %%  Each cast execution walks on from its entry locks.
+%%  Each launch has a fixed visited limit, based on its origin's holds
+%%  and context age at lock entry. Exceeding it aborts the origin with
+%%  probe_limit. Launches and hops on the origin's node stop silently
+%%  when that exact waiting request is no longer in the table.
 %%
 %%  Walkers read the table while updates run. Replacement inserts
 %%  before deleting the old object, so a walk may read either or both.
@@ -80,6 +84,10 @@
 -type visited() :: #{lock_key() => true}.
 -type hops() :: #{node() => [lock_key()]}.
 -type loser() :: {reference(), pid()}.
+
+-define(BASE_FACTOR, 10).
+-define(MIN_VISITED, 100).
+-define(MAX_VISITED, 10000).
 
 %%=================================================================
 %%	OTP API
@@ -140,6 +148,7 @@ handle_add_edges(#add_edges{
   lock = Lock,
   ref = Ref,
   birth = Birth,
+  age = Age,
   client = Client,
   holds = Holds
 })->
@@ -153,7 +162,7 @@ handle_add_edges(#add_edges{
         holds = Holds
       },
       ets:insert(?MODULE, Row),
-      spawn(fun()-> launch(Row, maps:keys(Holds)) end),
+      spawn(fun()-> launch(Row, maps:keys(Holds), Age) end),
       ok;
     [#waiter{holds = Holds0} = Row0]->
       case new_held_locks(Holds, Holds0) of
@@ -166,7 +175,7 @@ handle_add_edges(#add_edges{
           },
           ets:insert(?MODULE, Row),
           ets:delete_object(?MODULE, Row0),
-          spawn(fun()-> launch(Row, maps:keys(New)) end),
+          spawn(fun()-> launch(Row, maps:keys(New), Age) end),
           ok
       end
   end.
@@ -207,25 +216,39 @@ handle_remove_edges(#remove_edges{
 %%  own lock is never expanded: its waiters depend on its holders,
 %%  not on the origin. A barging request holds it, dropped there
 %%-----------------------------------------------------------------
--spec launch(#waiter{}, [lock_key()]) -> ok.
+-spec launch(#waiter{}, [lock_key()], non_neg_integer()) -> ok.
 launch(
     #waiter{
       lock = Edge,
       ref = Ref,
       birth = Birth,
-      client = Client
+      client = Client,
+      holds = Holds
     },
-    NewKeys
+    NewKeys,
+    Age
 )->
+  Limit = min(?MAX_VISITED, max(?MIN_VISITED,
+    (?BASE_FACTOR + Age) * map_size(Holds))),
   Probe = #deadlock_probe{
     ref = Ref,
     edge = Edge,
     client = Client,
-    birth = Birth
+    birth = Birth,
+    limit = Limit
   },
-  {Entry, Visited, Hops} = schedule(NewKeys, [], #{Edge => true}, #{}),
-  Result = walk(Entry, Probe, Visited, [], Hops),
-  verdict(Result, Probe).
+  case origin_waiting(Probe) of
+    true->
+      Result = case schedule(NewKeys, [], #{Edge => true}, #{}, Limit) of
+        probe_limit->
+          {origin, probe_limit};
+        {Entry, Visited, Hops}->
+          walk(Entry, Probe, Visited, [], Hops)
+      end,
+      verdict(Result, Probe);
+    false->
+      ok
+  end.
 
 %%-----------------------------------------------------------------
 %%  A hop: the sender has scheduled the entry locks in visited.
@@ -236,22 +259,42 @@ handle_probe(#deadlock_probe{
   expand = Entry,
   visited = Visited
 } = Probe)->
-  Result = walk(Entry, Probe, Visited, [], #{}),
-  verdict(Result, Probe).
+  case origin_waiting(Probe) of
+    true->
+      Result = walk(Entry, Probe, Visited, [], #{}),
+      verdict(Result, Probe);
+    false->
+      ok
+  end.
+
+%%-----------------------------------------------------------------
+%%  Only the origin's node has its row. A removed origin or an old
+%%  reference at a reused key no longer needs this launch. Read only
+%%  the references, including both versions of a replacing waiter
+%%-----------------------------------------------------------------
+-spec origin_waiting(#deadlock_probe{}) -> boolean().
+origin_waiting(#deadlock_probe{edge = {_Scope, _Term, Node}}) when Node =/= node()->
+  true;
+origin_waiting(#deadlock_probe{edge = Edge, ref = Ref})->
+  lists:member(Ref, ets:lookup_element(?MODULE, Edge, #waiter.ref, [])).
 
 %%-----------------------------------------------------------------
 %%  Expands the scheduled locks until none is left. Returns the
 %%  origin's verdict, or the losers, the visited set and the hops
 %%-----------------------------------------------------------------
 -spec walk([lock_key()], #deadlock_probe{}, visited(), [loser()], hops()) ->
-  {origin, lock_key()} | {[loser()], visited(), hops()}.
-walk([Lock | Rest], Probe, Visited0, Losers0, Hops0)->
+  {origin, lock_key() | probe_limit} | {[loser()], visited(), hops()}.
+walk([Lock | Rest], #deadlock_probe{limit = Limit} = Probe, Visited0, Losers0, Hops0)->
   case check_cycles(ets:lookup(?MODULE, Lock), Probe, Losers0, []) of
     origin->
       {origin, Lock};
     {Losers, Found}->
-      {Next, Visited, Hops} = schedule(Found, Rest, Visited0, Hops0),
-      walk(Next, Probe, Visited, Losers, Hops)
+      case schedule(Found, Rest, Visited0, Hops0, Limit) of
+        probe_limit->
+          {origin, probe_limit};
+        {Next, Visited, Hops}->
+          walk(Next, Probe, Visited, Losers, Hops)
+      end
   end;
 walk([], _Probe, Visited, Losers, Hops)->
   {Losers, Visited, Hops}.
@@ -348,19 +391,22 @@ drop_coin(Ref1, Ref2)->
 %%-----------------------------------------------------------------
 %%  A lock not yet visited is scheduled once per branch: local ones
 %%  ahead of the locks to expand here, remote ones under their node
-%%  for a hop
+%%  for a hop. The origin counts towards the limit. Already scheduled
+%%  keys cost nothing; another unseen key at the limit aborts the origin
 %%-----------------------------------------------------------------
--spec schedule([lock_key()], [lock_key()], visited(), hops()) ->
-  {[lock_key()], visited(), hops()}.
-schedule([Lock | Rest], Local, Visited, Hops) when is_map_key(Lock, Visited)->
-  schedule(Rest, Local, Visited, Hops);
-schedule([{_Scope, _Term, Node} = Lock | Rest], Local, Visited, Hops) when Node =:= node()->
-  schedule(Rest, [Lock | Local], Visited#{Lock => true}, Hops);
-schedule([{_Scope, _Term, Node} = Lock | Rest], Local, Visited, Hops)->
+-spec schedule([lock_key()], [lock_key()], visited(), hops(), pos_integer()) ->
+  {[lock_key()], visited(), hops()} | probe_limit.
+schedule([Lock | Rest], Local, Visited, Hops, Limit) when is_map_key(Lock, Visited)->
+  schedule(Rest, Local, Visited, Hops, Limit);
+schedule([_Lock | _Rest], _Local, Visited, _Hops, Limit) when map_size(Visited) >= Limit->
+  probe_limit;
+schedule([{_Scope, _Term, Node} = Lock | Rest], Local, Visited, Hops, Limit) when Node =:= node()->
+  schedule(Rest, [Lock | Local], Visited#{Lock => true}, Hops, Limit);
+schedule([{_Scope, _Term, Node} = Lock | Rest], Local, Visited, Hops, Limit)->
   % The first lock of the node starts its list
   Locks = maps:get(Node, Hops, []),
-  schedule(Rest, Local, Visited#{Lock => true}, Hops#{Node => [Lock | Locks]});
-schedule([], Local, Visited, Hops)->
+  schedule(Rest, Local, Visited#{Lock => true}, Hops#{Node => [Lock | Locks]}, Limit);
+schedule([], Local, Visited, Hops, _Limit)->
   {Local, Visited, Hops}.
 
 %%-----------------------------------------------------------------
@@ -369,7 +415,7 @@ schedule([], Local, Visited, Hops)->
 %%  losing closers receive verdicts at their clients and the remote
 %%  locks go out, one probe cast per node with this branch's visited set
 %%-----------------------------------------------------------------
--spec verdict({origin, lock_key()} | {[loser()], visited(), hops()}, #deadlock_probe{}) -> ok.
+-spec verdict({origin, lock_key() | probe_limit} | {[loser()], visited(), hops()}, #deadlock_probe{}) -> ok.
 verdict(
     {origin, Winner},
     #deadlock_probe{

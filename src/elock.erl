@@ -102,9 +102,16 @@ a scope, across scopes and across nodes. At least one request of the cycle
 fails with `{error, {deadlock, {Scope, Term, Node}}}`, which names the lock
 the winning request waits for.
 
-- A request of a process that holds fewer locks loses to a request of a
-  process that holds more, a lock on several nodes counting once per node.
-  Equal numbers are settled by a coin.
+- A request of a younger context loses to a request of an older context.
+  Equal birth times are settled by a coin. The context starts with its
+  first acquisition and is erased when its last lock is released.
+- A walk that would exceed its visited-key budget rejects its origin with
+  `{error, {deadlock, probe_limit}}`, even without a cycle. The budget is
+  `min(10000, max(100, (10 + AgeMs) * Holds))`: context age is fixed at the
+  start of the acquisition; holds count distinct node-qualified keys at
+  launch. The origin key counts as visited. Each remote branch keeps the
+  same budget. Handle this error by releasing earlier locks and retrying,
+  as after a cycle verdict.
 - The loser keeps the locks it holds, and the others keep waiting for them.
   To let them through, release those locks and then repeat the request.
 - Two processes that lock the same term on the same several nodes at the
@@ -114,8 +121,7 @@ the winning request waits for.
   issued at the same moment, several of them can get the deadlock error,
   more often as the cycle gets longer. This is a performance trade-off: the
   verdicts are made independently of each other, without the coordination
-  it takes to agree on a single loser. Issued one after another, the
-  requests of a cycle yield exactly one loser.
+  it takes to agree on a single loser.
 - A request can also lose while its cycle has just dissolved: the verdict is
   made on the edges as the graph process has them, which lag the managers
   by its backlog. The loser keeps its locks and the caller repeats the
@@ -215,6 +221,8 @@ are ignored.
 - `{error, {deadlock, {Scope, Term, Node}}}`: the request has lost a
   deadlock to a request that waits for the named lock. See the deadlocks in
   the module documentation.
+- `{error, {deadlock, probe_limit}}`: a deadlock walk reached its search
+  limit. The caller must release its earlier locks before retrying.
 - `{error, {badrpc, Reason}}`: a node of `Nodes` can not be reached.
 - `{error, {exit, badarg}}`: the scope is not started on a node of `Nodes`.
   If `Nodes` is the local node alone, the call raises `badarg` instead.

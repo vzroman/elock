@@ -41,7 +41,7 @@
 % Walker -> request client; manager -> proxy: the request has lost
 -record(deadlock,{
   ref :: reference(),
-  winner :: lock_key() % the lock the winning request waits for
+  winner :: lock_key() | probe_limit % the winning wait lock, or the walk limit
 }).
 
 % Client graph worker -> update call on the waiting node: new holds
@@ -49,6 +49,7 @@
   lock :: lock_key(),           % the manager's lock
   ref :: reference(),
   birth :: non_neg_integer(),   % priority fixed for the life of the context
+  age :: non_neg_integer(),     % context age in ms, fixed at lock entry
   client :: pid(),              % the request client receiving verdicts
   holds :: held_locks()         % the context's holds or a later grant
 }).
@@ -66,6 +67,7 @@
   edge :: lock_key(),           % the lock the origin waits for
   client :: pid(),              % the origin client receiving verdicts
   birth :: non_neg_integer(),   % the origin context's fixed priority
+  limit :: pos_integer(),       % maximum visited keys, fixed for this launch
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
   visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
 }).

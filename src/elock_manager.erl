@@ -69,7 +69,7 @@
 %%  itself or a worker on its behalf
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The worker of elock_context:run_request/5, remote apply
+%%  The worker of elock_context:run_request/6, remote apply
 %%-----------------------------------------------------------------
 lock(
     #request{

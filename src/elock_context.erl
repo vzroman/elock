@@ -29,7 +29,6 @@
 -type request_result() :: {ok, node_managers()} | {error, term()}.
 
 -define(context,'$elock_context$').
--define(RESTART_TIMEOUT, 5000). % microseconds
 
 -record(lock,{
   scope :: atom(),
@@ -66,9 +65,12 @@ lock(Scope, Term, Nodes, Options)->
     is_shared := IsShared
   } = validate_options(Options),
 
+  Now = erlang:system_time(microsecond),
   Ref = make_ref(),
-  Context = init_context(),
+  Context = init_context(Now),
   Birth = Context#context.birth,
+  % System time can move backwards; age is fixed for this acquisition.
+  Age = max(1, (Now - Birth) div 1000),
   Holds = held_locks(Context),
   Request = #request{
     ref = Ref,
@@ -81,7 +83,7 @@ lock(Scope, Term, Nodes, Options)->
   RequestNodes = lists:usort(Nodes),
   % Ref is passed as a plain argument for the receive marker optimization
   % (see wait_verdict/2)
-  case run_request(Ref, Birth, Holds, RequestNodes, Request) of
+  case run_request(Ref, Birth, Age, Holds, RequestNodes, Request) of
     {ok, LockedNodes} ->
       locked(Request, LockedNodes, Context),
       {ok, Ref};
@@ -161,11 +163,7 @@ unlock(
   release(Nodes, Ref),
   if
     map_size(Ref2Lock) =:= 0 ->
-      put_context(Context#context{
-        ref2lock = #{},
-        locked = #{},
-        counts = #{}
-      });
+      ok;
     true ->
       {Locked, Counts} = remove_lock(Lock, {Locked0, Counts0}),
       put_context(Context#context{
@@ -245,15 +243,15 @@ remove_lock(
     Nodes
   ).
 
-% erlang:system_time(microsecond)
-init_context()->
+-spec init_context(integer()) -> #context{}.
+init_context(Now)->
   case get_context() of
     undefined ->
       #context{
         ref2lock = #{},
         locked = #{},
         counts = #{},
-        birth = erlang:system_time(microsecond)
+        birth = Now
       };
     Context ->
       Context
@@ -286,13 +284,17 @@ held_locks(_NoContext)->
   nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
   holds :: held_locks(),          % the context and the grants so far
   birth :: integer(),             % priority fixed for the life of the context
+  age :: non_neg_integer(),       % context age in ms, fixed at lock entry
   ref :: reference()
 }).
 
 % The local node alone: the client is the proxy itself
+-spec run_request(reference(), integer(), non_neg_integer(), held_locks(),
+  nonempty_list(node()), #request{}) -> request_result().
 run_request(
     _Ref,
     _Birth,
+    _Age,
     Holds,
     [Node],
     Request
@@ -309,6 +311,7 @@ run_request(
 run_request(
     Ref,
     Birth,
+    Age,
     Holds,
     Nodes,
     #request{
@@ -343,6 +346,7 @@ run_request(
       nodes = [],
       holds = Holds,
       birth = Birth,
+      age = Age,
       ref = Ref
     })
   end),
@@ -577,12 +581,14 @@ add_edges(
       scope = Scope,
       term = Term,
       birth = Birth,
+      age = Age,
       ref = Ref
     }
 ) when map_size(Holds) > 0->
   AddEdges = #add_edges{
     ref = Ref,
     birth = Birth,
+    age = Age,
     client = Client,
     holds = Holds
   },

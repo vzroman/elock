@@ -286,9 +286,15 @@ client(Runner, RunRef, #{transactions_per_client := Count, seed := Seed,
 
 transactions(0, _Client, _State, Sums)->
   Sums;
-transactions(Count, Client, State0, Sums)->
+transactions(Count, #{think_ms := ThinkMs} = Client, State0, Sums)->
   {Plan, State1} = performance_workload:plan(Client, State0),
   Measured = transaction(Client, Plan),
+  %% The transaction has completed and released its locks. Pause only when
+  %% another plan follows, outside transaction measurements but inside the run.
+  case Count > 1 of
+    true-> delay(ThinkMs);
+    false-> ok
+  end,
   transactions(Count - 1, Client, State1, add(Sums, Measured)).
 
 %% The clock and accumulators cover all attempts of the same generated plan.

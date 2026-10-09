@@ -33,6 +33,7 @@ function validPoint(overrides = {}) {
     read_ms: 0,
     timeout: 'undefined',
     restart_ms: 0,
+    think_ms: 0,
     seed: 12345,
     deadlocks: false,
     write_ms: 10,
@@ -85,7 +86,7 @@ async function writeMarker(root, run, content) {
 
 function validMarker(pid) {
   const {path: pointPath, nodes, clients_per_node, transactions_per_client,
-    transaction, objects_pool_size, read_ms, timeout, restart_ms, seed, deadlocks,
+    transaction, objects_pool_size, read_ms, timeout, restart_ms, think_ms, seed, deadlocks,
     write_ms} = validPoint();
   return {
     path: pointPath,
@@ -97,6 +98,7 @@ function validMarker(pid) {
     read_ms,
     timeout,
     restart_ms,
+    think_ms,
     seed,
     deadlocks,
     write_ms,
@@ -379,6 +381,21 @@ test('keeps a run with only a live marker, leaves out one with a dead marker', a
 test('returns no runs when the Common Test log root does not exist', async () => {
   const result = await scanRuns('/no/such/elock/performance/logs');
   assert.deepEqual(result.runs, []);
+});
+
+test('requires a nonnegative scalar think time and retains positive values', async () => {
+  await withRoot('think', async root => {
+    await writeRun(root, 'ct_run.think', {
+      'positive.json': validPoint({think_ms: 25}),
+      'missing.json': validPoint({think_ms: undefined}),
+      'negative.json': validPoint({think_ms: -1}),
+      'list.json': validPoint({think_ms: [0, 25]})
+    });
+    const {runs: [run]} = await scanRuns(root);
+    assert.equal(run.points.length, 1);
+    assert.equal(run.points[0].think_ms, 25);
+    assert.deepEqual(errorFields(run), Array(3).fill('invalid performance point field: think_ms'));
+  });
 });
 
  test('accepts zero costs and counts, undefined timeout, and integer seeds', async () => {

@@ -249,12 +249,14 @@ function RunConstants({config, dateTime}) {
         <div><dt>Write cost / operation</dt><dd>{config.write_ms} ms</dd></div>
         <div><dt>Timeout (elock/global)</dt><dd>{config.timeout === 'undefined' ? 'No limit' : `${config.timeout} ms`}</dd></div>
         <div><dt>Restart delay (elock/global)</dt><dd>{config.restart_ms} ms</dd></div>
+        <div><dt>Think time between transactions</dt><dd>{config.think_ms} ms</dd></div>
         <div><dt>Seed</dt><dd>{config.seed}</dd></div>
         <div><dt>Deadlocks</dt><dd>{config.deadlocks ? 'true (random order)' : 'false (sorted order)'}</dd></div>
         <div><dt>Date/time</dt><dd>{dateTime}</dd></div>
       </dl>
       <p className="table-note">Mnesia uses its native retries and backoff; configured timeout and restart delay do not apply.
-        Lock time is measured directly across all attempts and excludes read, commit, unlock and restart work.</p>
+        Lock time is measured directly across all attempts and excludes read, commit, unlock and restart work.
+        Think time is outside both transaction and lock measurements.</p>
       {config.skipped_paths?.length > 0 && <p className="table-note">
         Skipped: {config.skipped_paths.join(', ')}. Global requires zero reads, sorted order, and the configured lock capacity limit.
       </p>}

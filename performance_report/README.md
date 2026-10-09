@@ -50,6 +50,12 @@ locks, sleep `restart_ms` once, and retry the full plan without a cap. Mnesia
 uses native transactions, retries and backoff; **configured timeout and restart
 delay do not apply to Mnesia**, including retries after a returned abort.
 
+`think_ms` is the required delay between completed logical transactions on
+every path, including Mnesia. It starts after commit and lock release, before
+generating the next plan. A client completing `N` transactions pauses `N - 1`
+times; there is no pause before its first transaction, after its last, or after
+an aborted attempt. Set `think_ms => 0` for no deliberate pause.
+
 Global runs only for zero reads, sorted order (`deadlocks => false`), and when
 `node_count * clients_per_node * (R + U + W) <= global_max_locks`. Skips appear
 in the Common Test log and in executed paths' report data.
@@ -57,13 +63,15 @@ in the Common Test log and in executed paths' report data.
 Each executed path writes `performance_data/<path>.json` in the suite's
 `log_private` directory. The running marker carries the same fixed workload.
 The report compares paths directly and displays operation counts, pool, costs,
-timeout, restart delay, seed and order. Historical result formats are not
+timeout, restart delay, think time, seed and order. Historical result formats are not
 converted or supported.
 
 Lock time share is `100 * sum(acquisition durations) / sum(transaction durations)`.
 Acquisition time includes failed calls and every attempt. Transaction time starts
 after plan generation and includes reads, commit delay, release, and retry work.
-Throughput retains the overall run window, which includes plan generation.
+Think time is outside both transaction and lock measurements. Throughput and
+resource measurements retain the overall run window, which includes plan
+generation and think time.
 
 Report checks:
 

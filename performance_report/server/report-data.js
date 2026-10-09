@@ -9,7 +9,7 @@ const positiveIntegerFields = [
   'transactions',
   'locks'
 ];
-const costFields = ['read_ms', 'write_ms', 'restart_ms'];
+const costFields = ['read_ms', 'write_ms', 'restart_ms', 'think_ms'];
 const rateFields = [
   'transactions_per_second',
   'locks_per_second',

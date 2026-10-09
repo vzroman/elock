@@ -29,24 +29,24 @@
 %%  origin: it holds the lock, or a waiter expanded before does.
 %%    * a waiter holding Edge closes a cycle: compared,
 %%      never expanded. A closer that beats the origin ends the walk,
-%%      #deadlock{} goes to the origin client and nothing else is
+%%      #deadlock{} goes to the origin helper and nothing else is
 %%      sent. The losing closers are collected.
 %%    * the other waiters are expanded through the locks they hold.
 %%      A lock is visited from the moment it is scheduled, so no lock
 %%      is expanded twice in a branch and the walk ends.
 %%  When the list is empty every collected closer gets #deadlock{}
-%%  at its client, then the remote locks go out as one
+%%  at its helper, then the remote locks go out as one
 %%  #deadlock_probe{} cast per node, with this branch's visited set.
 %%  Separate branches can discover the same previously unseen lock.
 %%  Each cast execution walks on from its entry locks.
 %%  Each launch has a fixed visited limit, based on its origin's holds
 %%  and context age at lock entry. Exceeding it aborts the origin with
-%%  probe_limit. Launches and hops on the origin's node stop silently
-%%  when that exact waiting request is no longer in the table.
+%%  probe_limit. Launches and hops continue with their captured origin
+%%  even after its waiting row has been removed.
 %%
 %%  Walkers read the table while updates run. Replacement inserts
 %%  before deleting the old object, so a walk may read either or both.
-%%  Verdicts go to request clients and never change the table.
+%%  Verdicts go to graph helpers and never change the table directly.
 %%=================================================================
 -module(elock_graph).
 -moduledoc false.
@@ -77,7 +77,7 @@
   lock :: lock_key(),           % the lock the request waits for, the key
   ref :: reference(),           % the request
   birth :: non_neg_integer(),   % priority fixed for the life of the context
-  client :: pid(),              % the request client receiving verdicts
+  client :: pid(),              % the graph helper receiving verdicts
   holds :: held_locks()         % #{lock_key() => pid()}, as the client sent it
 }).
 
@@ -88,6 +88,7 @@
 -define(BASE_FACTOR, 10).
 -define(MIN_VISITED, 100).
 -define(MAX_VISITED, 10000).
+-define(AGE_STEP, 100). % milliseconds
 
 %%=================================================================
 %%	OTP API
@@ -229,7 +230,7 @@ launch(
     Age
 )->
   Limit = min(?MAX_VISITED, max(?MIN_VISITED,
-    (?BASE_FACTOR + Age) * map_size(Holds))),
+    (?BASE_FACTOR + Age div ?AGE_STEP) * map_size(Holds))),
   Probe = #deadlock_probe{
     ref = Ref,
     edge = Edge,
@@ -237,18 +238,13 @@ launch(
     birth = Birth,
     limit = Limit
   },
-  case origin_waiting(Probe) of
-    true->
-      Result = case schedule(NewKeys, [], #{Edge => true}, #{}, Limit) of
-        probe_limit->
-          {origin, probe_limit};
-        {Entry, Visited, Hops}->
-          walk(Entry, Probe, Visited, [], Hops)
-      end,
-      verdict(Result, Probe);
-    false->
-      ok
-  end.
+  Result = case schedule(NewKeys, [], #{Edge => true}, #{}, Limit) of
+    probe_limit->
+      {origin, probe_limit};
+    {Entry, Visited, Hops}->
+      walk(Entry, Probe, Visited, [], Hops)
+  end,
+  verdict(Result, Probe).
 
 %%-----------------------------------------------------------------
 %%  A hop: the sender has scheduled the entry locks in visited.
@@ -259,24 +255,8 @@ handle_probe(#deadlock_probe{
   expand = Entry,
   visited = Visited
 } = Probe)->
-  case origin_waiting(Probe) of
-    true->
-      Result = walk(Entry, Probe, Visited, [], #{}),
-      verdict(Result, Probe);
-    false->
-      ok
-  end.
-
-%%-----------------------------------------------------------------
-%%  Only the origin's node has its row. A removed origin or an old
-%%  reference at a reused key no longer needs this launch. Read only
-%%  the references, including both versions of a replacing waiter
-%%-----------------------------------------------------------------
--spec origin_waiting(#deadlock_probe{}) -> boolean().
-origin_waiting(#deadlock_probe{edge = {_Scope, _Term, Node}}) when Node =/= node()->
-  true;
-origin_waiting(#deadlock_probe{edge = Edge, ref = Ref})->
-  lists:member(Ref, ets:lookup_element(?MODULE, Edge, #waiter.ref, [])).
+  Result = walk(Entry, Probe, Visited, [], #{}),
+  verdict(Result, Probe).
 
 %%-----------------------------------------------------------------
 %%  Expands the scheduled locks until none is left. Returns the
@@ -412,7 +392,7 @@ schedule([], Local, Visited, Hops, _Limit)->
 %%-----------------------------------------------------------------
 %%  The origin lost: its abort breaks every cycle through it, the
 %%  closers collected before stay and no hop goes out. Otherwise the
-%%  losing closers receive verdicts at their clients and the remote
+%%  losing closers receive verdicts at their helpers and the remote
 %%  locks go out, one probe cast per node with this branch's visited set
 %%-----------------------------------------------------------------
 -spec verdict({origin, lock_key() | probe_limit} | {[loser()], visited(), hops()}, #deadlock_probe{}) -> ok.

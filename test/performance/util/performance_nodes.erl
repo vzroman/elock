@@ -7,10 +7,12 @@
 %%  Every node is a peer node in a docker container of the image
 %%  ?IMAGE: a local node in a container on this host, a remote node
 %%  in a container on its host, started over ssh (sshpass with the
-%%  password of the config). The image is built from the project
-%%  directory with test/performance/Dockerfile, so it holds the
-%%  beams of the current build. Dockerfile.dockerignore next to it
-%%  keeps out of the build context what the nodes never read: the
+%%  password of the config). A node map with local => true uses
+%%  local docker and keeps its configured node name. The image is
+%%  built from the project directory with test/performance/Dockerfile,
+%%  so it holds the beams of the current build. The ignore file
+%%  Dockerfile.dockerignore next to it keeps out of the build
+%%  context what the nodes never read: the
 %%  node_modules and dist of performance_report, _build/test/logs
 %%  and .git. With ?PREBUILT_IMAGE_ENV=true the image found in the
 %%  local docker store is used as it is. A remote host gets the
@@ -100,10 +102,12 @@ wait_until(Predicate, Deadline)->
 %%  Startup
 %%=================================================================
 start_node(Name, local, DistPort, Cookie, EnvSettings)->
+  Node = atom_to_list(Name) ++ "@" ++ ?LOCAL_NODE_HOST,
+  start_node(Name, #{local => true, node => Node}, DistPort, Cookie, EnvSettings);
+start_node(Name, #{local := true, node := Node}, DistPort, Cookie, EnvSettings)->
   Container = unique_name(atom_to_list(Name)),
-  Node = list_to_atom(atom_to_list(Name) ++ "@" ++ ?LOCAL_NODE_HOST),
   Exec = {os:find_executable("docker"), docker_run_args(Container)},
-  start_peer(Node, Exec, Container, local, DistPort, Cookie, EnvSettings);
+  start_peer(list_to_atom(Node), Exec, Container, local, DistPort, Cookie, EnvSettings);
 start_node(Name, #{node := Node} = Location, DistPort, Cookie, EnvSettings)->
   ensure_remote_image(Location),
   Container = unique_name(atom_to_list(Name)),
@@ -376,7 +380,7 @@ controller_name(Configs)->
   list_to_atom("elock_performance_controller_" ++ os:getpid() ++ "@" ++ controller_host(Configs)).
 
 controller_host(Configs)->
-  case [ Location || Location <- maps:values(Configs), Location =/= local ] of
+  case [ Location || Location <- maps:values(Configs), Location =/= local, not maps:get(local, Location, false) ] of
     []->
       ?LOCAL_NODE_HOST;
     [Location | _Rest]->

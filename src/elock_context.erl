@@ -274,11 +274,12 @@ held_locks(_NoContext)->
   pending :: pending_workers(), % the workers that have not returned yet
   nodes :: node_managers(),     % the grants so far
   queued :: queued_managers(),  % every manager reported before a node returns
-  graph :: pid()
+  graph :: pid(),
+  graph_monitor :: reference()
 }).
 
 -record(graph,{
-  client :: pid(),
+  client :: pid(),                % application client monitored by this helper
   scope :: atom(),
   term :: term(),
   nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
@@ -338,7 +339,7 @@ run_request(
       #{},
       Nodes
     ),
-  Graph = spawn(fun()->
+  {Graph, GraphMon} = spawn_monitor(fun()->
     init_graph(#graph{
       client = Client,
       scope = Scope,
@@ -358,7 +359,8 @@ run_request(
     pending = Pending,
     nodes = #{},
     queued = #{},
-    graph = Graph
+    graph = Graph,
+    graph_monitor = GraphMon
   }).
 
 
@@ -373,7 +375,8 @@ wait_verdict(
       pending = Pending0,
       queued = Queued0,
       nodes = Nodes0,
-      graph = Graph
+      graph = Graph,
+      graph_monitor = GraphMon
     } = Waiting0
 ) when map_size(Pending0) > 0->
   receive
@@ -412,7 +415,7 @@ wait_verdict(
         false->
           wait_verdict(Ref, Waiting0)
       end;
-    #deadlock{ref = Ref, winner = Winner}->
+    {'DOWN', GraphMon, process, Graph, #deadlock{ref = Ref, winner = Winner}}->
       cancel(Waiting0),
       {error, {deadlock, Winner}}
 
@@ -422,23 +425,28 @@ wait_verdict(
     #waiting{
       ref = Ref,
       nodes = Nodes,
-      graph = Graph
+      graph = Graph,
+      graph_monitor = GraphMon
     }
 )->
   Graph ! {remove, Ref},
+  erlang:demonitor(GraphMon, [flush]),
   {ok, Nodes}.
 
+-spec cancel(#waiting{}) -> ok | true.
 cancel(#waiting{
   ref = Ref,
   nodes = Nodes0,
   pending = Pending,
   queued = Queued,
-  graph = Graph
+  graph = Graph,
+  graph_monitor = GraphMon
 })->
   release(Nodes0, Ref),
   unlock_queued(Queued, Ref),
 
   Graph ! {remove, Ref},
+  erlang:demonitor(GraphMon, [flush]),
 
   % A local worker is also its proxy and withdrawal may kill it
   % before it can reply. Remote workers report their proxy's exit.
@@ -527,14 +535,14 @@ kill_holder(Holder)-> exit(Holder, kill).
 %%=================================================================
 %%  Graph worker
 %%=================================================================
--spec init_graph(#graph{}) -> ok | #deadlock{}.
+-spec init_graph(#graph{}) -> ok.
 init_graph(#graph{
   client = Client
 } = Graph)->
   erlang:monitor(process, Client),
   graph_loop(Graph).
 
--spec graph_loop(#graph{}) -> ok | #deadlock{}.
+-spec graph_loop(#graph{}) -> ok.
 graph_loop(#graph{
   ref = Ref,
   client = Client,
@@ -551,7 +559,7 @@ graph_loop(#graph{
       });
     #deadlock{ ref = Ref } = DeadLock->
       remove_edges(Nodes0, Graph),
-      Client ! DeadLock;
+      exit(DeadLock);
     {remove, Ref}->
       remove_edges(Nodes0, Graph);
     {add, Ref, Node, Manager}->
@@ -577,7 +585,6 @@ add_edges(
     Nodes,
     Holds,
     #graph{
-      client = Client,
       scope = Scope,
       term = Term,
       birth = Birth,
@@ -589,7 +596,7 @@ add_edges(
     ref = Ref,
     birth = Birth,
     age = Age,
-    client = Client,
+    client = self(),
     holds = Holds
   },
   lists:foreach(

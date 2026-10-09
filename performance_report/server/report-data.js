@@ -5,12 +5,11 @@ const paths = new Set(['elock', 'mnesia', 'global']);
 const positiveIntegerFields = [
   'clients_per_node',
   'transactions_per_client',
-  'locks_per_transaction',
-  'write_ms',
+  'objects_pool_size',
   'transactions',
   'locks'
 ];
-const percentFields = ['exclusive_percent', 'intersect_percent'];
+const costFields = ['read_ms', 'write_ms', 'restart_ms'];
 const rateFields = [
   'transactions_per_second',
   'locks_per_second',
@@ -39,28 +38,24 @@ function isPositiveInteger(value) {
   return Number.isInteger(value) && value > 0;
 }
 
-function isPercent(value) {
-  return Number.isInteger(value) && value >= 0 && value <= 100;
-}
-
 function validatePoint(point) {
   requireValue(isObject(point), 'root');
   requireValue(paths.has(point.path), 'path');
   positiveIntegerFields.forEach(field =>
     requireValue(isPositiveInteger(point[field]), field));
-  percentFields.forEach(field =>
-    requireValue(isPercent(point[field]), field));
+  costFields.forEach(field =>
+    requireValue(isNonNegativeInteger(point[field]), field));
+  requireValue(Number.isInteger(point.seed), 'seed');
+  requireValue(point.timeout === 'undefined' || isPositiveInteger(point.timeout), 'timeout');
+  requireValue(isObject(point.transaction), 'transaction');
+  ['read', 'update', 'write'].forEach(operation =>
+    requireValue(isNonNegativeInteger(point.transaction[operation]), `transaction.${operation}`));
   requireValue(typeof point.deadlocks === 'boolean', 'deadlocks');
   validateNodes(point.nodes);
   requireValue(isNonNegativeInteger(point.elapsed_ms), 'elapsed_ms');
   rateFields.forEach(field =>
     requireValue(isNonNegativeNumber(point[field]), field));
-  // global retries internally: its points carry no restarts
-  requireValue(
-    point.path === 'global'
-      ? point.restarts === undefined
-      : isNonNegativeInteger(point.restarts),
-    'restarts');
+  requireValue(isNonNegativeInteger(point.restarts), 'restarts');
   validateMetrics(point.metrics, Object.keys(point.nodes));
   return point;
 }

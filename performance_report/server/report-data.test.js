@@ -28,9 +28,12 @@ function validPoint(overrides = {}) {
     nodes: {node1: 'local', node2: 'runner@node2.example.net'},
     clients_per_node: 2,
     transactions_per_client: 3,
-    locks_per_transaction: 1,
-    exclusive_percent: 100,
-    intersect_percent: 0,
+    transaction: {read: 0, update: 1, write: 0},
+    objects_pool_size: 100,
+    read_ms: 0,
+    timeout: 'undefined',
+    restart_ms: 0,
+    seed: 12345,
     deadlocks: false,
     write_ms: 10,
     elapsed_ms: 36,
@@ -47,7 +50,6 @@ function validPoint(overrides = {}) {
 
 function globalPoint(overrides = {}) {
   const point = validPoint({path: 'global', ...overrides});
-  delete point.restarts;
   return point;
 }
 
@@ -83,16 +85,19 @@ async function writeMarker(root, run, content) {
 
 function validMarker(pid) {
   const {path: pointPath, nodes, clients_per_node, transactions_per_client,
-    locks_per_transaction, exclusive_percent, intersect_percent, deadlocks,
+    transaction, objects_pool_size, read_ms, timeout, restart_ms, seed, deadlocks,
     write_ms} = validPoint();
   return {
     path: pointPath,
     nodes,
     clients_per_node,
     transactions_per_client,
-    locks_per_transaction,
-    exclusive_percent,
-    intersect_percent,
+    transaction,
+    objects_pool_size,
+    read_ms,
+    timeout,
+    restart_ms,
+    seed,
     deadlocks,
     write_ms,
     index: 7,
@@ -149,7 +154,7 @@ test('reports malformed and invalid point files as run errors', async () => {
       'unfinished.json': '{unfinished',
       'empty.json': {},
       'path.json': validPoint({path: 'native'}),
-      'exclusive.json': validPoint({exclusive_percent: 101}),
+      'transaction.json': validPoint({transaction: {read: 1, update: -1, write: 0}}),
       'clients.json': validPoint({clients_per_node: 0}),
       'rate.json': validPoint({locks_per_second: -1}),
       'nodes.json': validPoint({nodes: {}}),
@@ -176,7 +181,7 @@ test('reports malformed and invalid point files as run errors', async () => {
         message => message.startsWith('invalid performance point field:')),
       [
         'clients_per_node',
-        'exclusive_percent',
+        'transaction.update',
         'locks_per_second',
         'metrics.node2.schedulers.maximum_run_queue_length',
         'nodes',
@@ -229,10 +234,10 @@ test('rejects a point without a boolean deadlocks', async () => {
   });
 });
 
-test('rejects a global point with restarts', async () => {
+test('requires transaction restarts for global', async () => {
   await withRoot('global', async (root) => {
     await writeRun(root, 'ct_run.global', {
-      'global.2.1.100.0.json': validPoint({path: 'global', restarts: 0})
+      'global.2.1.100.0.json': validPoint({path: 'global', restarts: undefined})
     });
 
     const result = await scanRuns(root);
@@ -374,4 +379,16 @@ test('keeps a run with only a live marker, leaves out one with a dead marker', a
 test('returns no runs when the Common Test log root does not exist', async () => {
   const result = await scanRuns('/no/such/elock/performance/logs');
   assert.deepEqual(result.runs, []);
+});
+
+ test('accepts zero costs and counts, undefined timeout, and integer seeds', async () => {
+  await withRoot('zero', async root => {
+    await writeRun(root, 'ct_run.zero', {
+      'elock.json': validPoint({transaction: {read: 1, update: 0, write: 0}, write_ms: 0, seed: -12}),
+      'global.json': globalPoint({timeout: 25, restarts: 2})
+    });
+    const {runs: [run]} = await scanRuns(root);
+    assert.equal(run.points.length, 2);
+    assert.deepEqual(run.errors, []);
+  });
 });

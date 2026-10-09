@@ -1,21 +1,19 @@
-import {memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {memo, useEffect, useRef, useState} from 'react';
 import {
   CategoryScale,
   Chart as ChartJS,
   Legend,
   LinearScale,
-  LineElement,
-  PointElement,
+  BarElement,
   Tooltip
 } from 'chart.js';
-import {Line} from 'react-chartjs-2';
+import {Bar} from 'react-chartjs-2';
 
 ChartJS.register(
   CategoryScale,
   Legend,
   LinearScale,
-  LineElement,
-  PointElement,
+  BarElement,
   Tooltip
 );
 
@@ -24,19 +22,6 @@ const DARK_SCHEME = '(prefers-color-scheme: dark)';
 
 // The series, always in this order; each has its color in styles.css
 const paths = ['elock', 'mnesia', 'global'];
-
-const dimensions = [
-  {id: 'clients_per_node', label: 'Clients / node'},
-  {id: 'locks_per_transaction', label: 'Locks / transaction'},
-  {id: 'intersect_percent', label: 'Intersect %'},
-  {id: 'exclusive_percent', label: 'Exclusive %'}
-];
-const clientsDimension = dimensions[0];
-
-const views = [
-  {id: 'slice', label: 'Slice'},
-  {id: 'groups', label: 'Groups'}
-];
 
 function nodeMetrics(point) {
   return Object.values(point.metrics);
@@ -88,45 +73,19 @@ function runDateTime(run) {
 // The configuration every point of a run shares; the marker of the
 // running point carries it as well
 function runConfig(run) {
-  const point = run.points[0] ?? run.running ?? undefined;
-  if (point === undefined) {
-    return {
-      nodes: 'Unavailable',
-      transactionsPerClient: 'Unavailable',
-      writeMs: 'Unavailable',
-      deadlocks: 'Unavailable'
-    };
-  }
-  return {
-    nodes: Object.entries(point.nodes)
-      .map(([role, location]) => `${role}: ${location}`)
-      .join(', '),
-    transactionsPerClient: point.transactions_per_client.toLocaleString(),
-    writeMs: point.write_ms.toLocaleString(),
-    // The order of the locks of a transaction
-    deadlocks: point.deadlocks ? 'true (random)' : 'false (sorted)'
-  };
+  return run.points[0] ?? run.running;
+}
+
+function transactionLabel(transaction) {
+  return `${transaction.read} read / ${transaction.update} update / ${transaction.write} write`;
 }
 
 function pathsPresent(points) {
   return paths.filter(path => points.some(point => point.path === path));
 }
 
-// The values of a dimension present in the points, ascending
-function dimensionValues(points, dimension) {
-  return [...new Set(points.map(point => point[dimension]))]
-    .sort((left, right) => left - right);
-}
-
-function valueAt(points, path, xDimension, xValue, metric) {
-  const point = points.find(candidate =>
-    candidate.path === path && candidate[xDimension] === xValue);
-  const value = point === undefined ? undefined : metric.value(point);
-  return Number.isFinite(value) ? value : null;
-}
-
 function formatValue(value, unit) {
-  if (value === null) return 'N/A';
+  if (!Number.isFinite(value)) return 'N/A';
   const maximumFractionDigits = unit === 'GB' ? 3 : 2;
   const formatted = new Intl.NumberFormat(
     undefined,
@@ -169,92 +128,31 @@ function RunRow({run}) {
         <a href={`#${runAnchor(run)}`}>{runDateTime(run)}</a>
         {run.running && <span className="tag">running</span>}
       </th>
-      <td>{config.nodes}</td>
-      <td>{config.transactionsPerClient}</td>
-      <td>{config.writeMs}</td>
-      <td>{config.deadlocks}</td>
+      <td>{config ? Object.keys(config.nodes).join(', ') : 'Unavailable'}</td>
+      <td>{config ? transactionLabel(config.transaction) : 'Unavailable'}</td>
+      <td>{config?.clients_per_node.toLocaleString() ?? 'Unavailable'}</td>
       <td>{present.length === 0 ? 'None' : present.join(', ')}</td>
     </tr>
   );
 }
 
-function MetricGrid({points, xDimension, xValues}) {
+function MetricGrid({points}) {
   return (
     <div className="table-scroll">
       <table>
-        <thead>
-          <tr>
-            <th rowSpan={2}>Metric</th>
-            <th rowSpan={2} className="path-name">Path</th>
-            <th colSpan={xValues.length} className="dimension-name">{xDimension.label}</th>
+        <thead><tr><th>Metric</th>{points.map(point => (
+          <th key={point.path}><span className={`path-marker ${point.path}`} />{point.path}</th>
+        ))}</tr></thead>
+        <tbody>{metrics.map(metric => (
+          <tr key={metric.id}>
+            <th>{metric.label}</th>
+            {points.map(point => <td key={point.path}>{formatValue(metric.value(point), metric.unit)}</td>)}
           </tr>
-          <tr>
-            {xValues.map(value => <th key={value}>{value.toLocaleString()}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {metrics.flatMap(metric => paths.map((path, pathIndex) => (
-            <tr
-              className={pathIndex === paths.length - 1 ? 'metric-row-end' : undefined}
-              key={`${metric.id}.${path}`}
-            >
-              {pathIndex === 0 && (
-                <th className="metric-name" rowSpan={paths.length}>
-                  {metric.label}
-                </th>
-              )}
-              <th className="path-name">
-                <span className={`path-marker ${path}`} />{path}
-              </th>
-              {xValues.map(value => (
-                <td key={value}>
-                  {formatValue(valueAt(points, path, xDimension.id, value, metric), metric.unit)}
-                </td>
-              ))}
-            </tr>
-          )))}
-        </tbody>
+        ))}</tbody>
       </table>
     </div>
   );
 }
-
-//--------------------------------------------------------------------
-// The name of every visible series just right of its last point, in
-// the muted text color. Labels closer than LABEL_GAP px are pushed
-// down, the chart keeps LABEL_PADDING px on the right for them
-//--------------------------------------------------------------------
-const LABEL_GAP = 12;
-const LABEL_OFFSET = 8;
-const LABEL_PADDING = 56;
-
-const directLabels = {
-  id: 'directLabels',
-  afterDatasetsDraw(chart, _arguments, options) {
-    const labels = chart.data.datasets
-      .flatMap((dataset, index) => {
-        const last = dataset.data.findLastIndex(value => value !== null);
-        if (last === -1 || !chart.isDatasetVisible(index)) return [];
-        const {x, y} = chart.getDatasetMeta(index).data[last];
-        return [{text: dataset.label, x, y}];
-      })
-      .sort((left, right) => left.y - right.y);
-    labels.forEach((label, index) => {
-      const above = labels[index - 1];
-      if (above !== undefined && label.y - above.y < LABEL_GAP) {
-        label.y = above.y + LABEL_GAP;
-      }
-    });
-    const {ctx} = chart;
-    ctx.save();
-    ctx.font = `${options.size}px ${ChartJS.defaults.font.family}`;
-    ctx.fillStyle = options.color;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    labels.forEach(({text, x, y}) => ctx.fillText(text, x + LABEL_OFFSET, y));
-    ctx.restore();
-  }
-};
 
 //--------------------------------------------------------------------
 // A chart is mounted only while its card is within a screen of the
@@ -283,66 +181,41 @@ function MetricChart(props) {
   );
 }
 
-function ChartCanvas({points, xDimension, xValues, metric, theme}) {
+function ChartCanvas({points, metric, theme}) {
   const data = {
-    labels: xValues.map(value => value.toLocaleString()),
-    datasets: paths.map(path => ({
-      label: path,
-      data: xValues.map(value => valueAt(points, path, xDimension.id, value, metric)),
-      borderColor: theme.series[path],
-      backgroundColor: theme.series[path],
-      borderWidth: 2,
-      pointRadius: 4,
-      pointHoverRadius: 5,
-      spanGaps: false
-    }))
+    labels: points.map(point => point.path),
+    datasets: [{
+      label: metric.label,
+      data: points.map(point => metric.value(point)),
+      backgroundColor: points.map(point => theme.series[point.path])
+    }]
   };
   const axis = {
-    grid: {color: theme.grid, lineWidth: 1},
+    grid: {color: theme.grid},
     border: {color: theme.grid},
     ticks: {color: theme.ticks}
   };
   const options = {
     animation: false,
     maintainAspectRatio: false,
-    layout: {padding: {right: LABEL_PADDING}},
-    interaction: {mode: 'index', intersect: false},
     plugins: {
-      directLabels: {color: theme.ticks, size: 11},
-      legend: {position: 'bottom', labels: {color: theme.ticks}},
-      tooltip: {
-        callbacks: {
-          label: context =>
-            `${context.dataset.label}: ${formatValue(context.parsed.y, metric.unit)}`
-        }
-      }
+      legend: {display: false},
+      tooltip: {callbacks: {label: context => formatValue(context.parsed.y, metric.unit)}}
     },
     scales: {
-      x: {
-        ...axis,
-        type: 'category',
-        title: {display: true, text: xDimension.label, color: theme.ticks}
-      },
-      y: {
-        ...axis,
-        // A count has integer ticks
+      x: axis,
+      y: {...axis, beginAtZero: true,
         ticks: metric.count ? {...axis.ticks, precision: 0} : axis.ticks,
-        title: {display: true, text: metric.count ? 'count' : metric.unit, color: theme.ticks},
-        beginAtZero: false
-      }
+        title: {display: true, text: metric.count ? 'count' : metric.unit, color: theme.ticks}}
     }
   };
-  return <Line data={data} options={options} plugins={[directLabels]} />;
+  return <Bar data={data} options={options} />;
 }
 
-//--------------------------------------------------------------------
-// The pieces of both views: the table and a chart per metric of the
-// points over the x dimension
-//--------------------------------------------------------------------
-function PointsView({points, xDimension, xValues, theme}) {
+function PointsView({points, theme}) {
   return (
     <>
-      <MetricGrid points={points} xDimension={xDimension} xValues={xValues} />
+      <MetricGrid points={points} />
       <p className="table-note">
         Over the nodes: memory growth is the largest growth of a node, scheduler
         utilization the mean, max run queue the largest, network the sum of the
@@ -353,8 +226,6 @@ function PointsView({points, xDimension, xValues, theme}) {
           <MetricChart
             key={metric.id}
             points={points}
-            xDimension={xDimension}
-            xValues={xValues}
             metric={metric}
             theme={theme}
           />
@@ -365,139 +236,29 @@ function PointsView({points, xDimension, xValues, theme}) {
 }
 
 function RunConstants({config, dateTime}) {
+  if (!config) return null;
   return (
-    <dl className="config">
-      <div><dt>Transactions / client</dt><dd>{config.transactionsPerClient}</dd></div>
-      <div><dt>Write</dt><dd>{config.writeMs} ms</dd></div>
-      <div><dt>Deadlocks</dt><dd>{config.deadlocks}</dd></div>
-      <div><dt>Date/time</dt><dd>{dateTime}</dd></div>
-    </dl>
-  );
-}
-
-//--------------------------------------------------------------------
-// Groups: a block per (locks, intersect, exclusive), x = clients,
-// from the block that got a point last to the oldest
-//--------------------------------------------------------------------
-function groupPoints(points) {
-  const groups = new Map();
-  points.forEach(point => {
-    const key = [
-      point.locks_per_transaction,
-      point.intersect_percent,
-      point.exclusive_percent
-    ].join('|');
-    if (!groups.has(key)) {
-      groups.set(key, {
-        key,
-        locks: point.locks_per_transaction,
-        intersect: point.intersect_percent,
-        exclusive: point.exclusive_percent,
-        finishedAt: point.finished_at,
-        points: []
-      });
-    }
-    const group = groups.get(key);
-    group.finishedAt = Math.max(group.finishedAt, point.finished_at);
-    group.points.push(point);
-  });
-  // The block with the newest point first
-  return [...groups.values()].sort((left, right) =>
-    right.finishedAt - left.finishedAt ||
-    left.locks - right.locks ||
-    left.intersect - right.intersect ||
-    left.exclusive - right.exclusive);
-}
-
-function GroupsView({run, config, dateTime, theme}) {
-  const groups = useMemo(() => groupPoints(run.points), [run.points]);
-  return groups.map(group => (
-    <section className="point-group" key={group.key}>
-      <header>
-        <div>
-          <span className="eyebrow">Group</span>
-          <h3>
-            {`${group.locks.toLocaleString()} lock(s) / transaction, `}
-            {`${group.intersect}% intersect, ${group.exclusive}% exclusive`}
-          </h3>
-        </div>
-        <RunConstants config={config} dateTime={dateTime} />
-      </header>
-      <PointsView
-        points={group.points}
-        xDimension={clientsDimension}
-        xValues={dimensionValues(group.points, clientsDimension.id)}
-        theme={theme}
-      />
-    </section>
-  ));
-}
-
-//--------------------------------------------------------------------
-// Slice: an x dimension, the other three fixed. A fixed dimension
-// defaults to its largest value
-//--------------------------------------------------------------------
-function defaultSlice(values) {
-  return {
-    x: clientsDimension.id,
-    fixed: Object.fromEntries(dimensions
-      .filter(({id}) => id !== clientsDimension.id)
-      .map(({id}) => [id, values[id].at(-1)]))
-  };
-}
-
-// The dimension the new x replaces becomes fixed at its default
-function changeX(slice, values, x) {
-  const {[x]: _replaced, ...fixed} = slice.fixed;
-  return {x, fixed: {...fixed, [slice.x]: values[slice.x].at(-1)}};
-}
-
-function SliceView({run, config, dateTime, slice, onSlice, theme}) {
-  const values = useMemo(() => Object.fromEntries(dimensions.map(({id}) =>
-    [id, dimensionValues(run.points, id)])), [run.points]);
-  const current = slice ?? defaultSlice(values);
-  const xDimension = dimensions.find(({id}) => id === current.x);
-  const points = run.points.filter(point =>
-    Object.entries(current.fixed).every(([id, value]) => point[id] === value));
-  return (
-    <section className="point-group">
-      <header>
-        <div className="filters">
-          <label>
-            X axis
-            <select
-              value={current.x}
-              onChange={event => onSlice(changeX(current, values, event.target.value))}
-            >
-              {dimensions.map(({id, label}) => <option key={id} value={id}>{label}</option>)}
-            </select>
-          </label>
-          {dimensions.filter(({id}) => id !== current.x).map(({id, label}) => (
-            <label key={id}>
-              {label}
-              <select
-                value={current.fixed[id]}
-                onChange={event => onSlice({
-                  ...current,
-                  fixed: {...current.fixed, [id]: Number(event.target.value)}
-                })}
-              >
-                {values[id].map(value => (
-                  <option key={value} value={value}>{value.toLocaleString()}</option>
-                ))}
-              </select>
-            </label>
-          ))}
-        </div>
-        <RunConstants config={config} dateTime={dateTime} />
-      </header>
-      <PointsView
-        points={points}
-        xDimension={xDimension}
-        xValues={values[current.x]}
-        theme={theme}
-      />
-    </section>
+    <>
+      <dl className="config">
+        <div><dt>Nodes</dt><dd>{Object.entries(config.nodes).map(([role, location]) => `${role}: ${location}`).join(', ')}</dd></div>
+        <div><dt>Clients / node</dt><dd>{config.clients_per_node.toLocaleString()}</dd></div>
+        <div><dt>Transactions / client</dt><dd>{config.transactions_per_client.toLocaleString()}</dd></div>
+        <div><dt>Transaction</dt><dd>{transactionLabel(config.transaction)}</dd></div>
+        <div><dt>Object pool</dt><dd>{config.objects_pool_size.toLocaleString()}</dd></div>
+        <div><dt>Read cost</dt><dd>{config.read_ms} ms</dd></div>
+        <div><dt>Write cost / operation</dt><dd>{config.write_ms} ms</dd></div>
+        <div><dt>Timeout (elock/global)</dt><dd>{config.timeout === 'undefined' ? 'No limit' : `${config.timeout} ms`}</dd></div>
+        <div><dt>Restart delay (elock/global)</dt><dd>{config.restart_ms} ms</dd></div>
+        <div><dt>Seed</dt><dd>{config.seed}</dd></div>
+        <div><dt>Deadlocks</dt><dd>{config.deadlocks ? 'true (random order)' : 'false (sorted order)'}</dd></div>
+        <div><dt>Date/time</dt><dd>{dateTime}</dd></div>
+      </dl>
+      <p className="table-note">Mnesia uses its native retries and backoff; configured timeout and restart delay do not apply.
+        Lock time is measured directly across all attempts and excludes read, commit, unlock and restart work.</p>
+      {config.skipped_paths?.length > 0 && <p className="table-note">
+        Skipped: {config.skipped_paths.join(', ')}. Global requires zero reads, sorted order, and the configured lock capacity limit.
+      </p>}
+    </>
   );
 }
 
@@ -533,16 +294,16 @@ function RunningBanner({running}) {
   const point = [
     running.path,
     `${plural(running.clients_per_node, 'client')} / node`,
-    plural(running.locks_per_transaction, 'lock'),
-    `${running.intersect_percent}% intersect`,
-    `${running.exclusive_percent}% exclusive`
+    transactionLabel(running.transaction),
+    `${running.objects_pool_size.toLocaleString()} objects`,
+    `seed ${running.seed}`
   ].join(' · ');
   return (
     <div className="running">
       <span className="eyebrow">Running now</span>
       <p className="running-point">{point}</p>
       <p className="running-progress">
-        point {running.index.toLocaleString()} of {running.total.toLocaleString()}
+        path {running.index.toLocaleString()} of {running.total.toLocaleString()}
         {' · '}started {new Date(running.started_at).toLocaleTimeString()}
         {' · '}<Elapsed since={running.started_at} />
       </p>
@@ -564,30 +325,8 @@ function RunErrors({errors}) {
   );
 }
 
-//--------------------------------------------------------------------
-// Memoized: a refresh that leaves the run, the view, its slice and the
-// theme as they were renders nothing of it again
-//--------------------------------------------------------------------
-const RunSection = memo(function RunSection({run, anchor, view, slice, onSlice, theme}) {
+const RunSection = memo(function RunSection({run, anchor, theme}) {
   const config = runConfig(run);
-  const dateTime = runDateTime(run);
-  let content;
-  if (run.points.length === 0) {
-    content = <div className="empty"><h3>No completed points in this run</h3></div>;
-  } else if (view === 'slice') {
-    content = (
-      <SliceView
-        run={run}
-        config={config}
-        dateTime={dateTime}
-        slice={slice}
-        onSlice={next => onSlice(run.id, next)}
-        theme={theme}
-      />
-    );
-  } else {
-    content = <GroupsView run={run} config={config} dateTime={dateTime} theme={theme} />;
-  }
   return (
     <section className="run-section" id={anchor}>
       <header className="run-header">
@@ -596,7 +335,10 @@ const RunSection = memo(function RunSection({run, anchor, view, slice, onSlice, 
       </header>
       {run.running && <RunningBanner running={run.running} />}
       <RunErrors errors={run.errors} />
-      {content}
+      <RunConstants config={config} dateTime={runDateTime(run)} />
+      {run.points.length === 0
+        ? <div className="empty"><h3>No completed paths in this run</h3></div>
+        : <PointsView points={[...run.points].sort((a, b) => paths.indexOf(a.path) - paths.indexOf(b.path))} theme={theme} />}
     </section>
   );
 });
@@ -614,12 +356,6 @@ export default function App() {
   const [report, setReport] = useState({runs: []});
   const [loadError, setLoadError] = useState(null);
   const [updatedAt, setUpdatedAt] = useState(null);
-  const [view, setView] = useState('slice');
-  // The slice of every run the user has changed, by run id
-  const [slices, setSlices] = useState({});
-  const changeSlice = useCallback(
-    (runId, slice) => setSlices(current => ({...current, [runId]: slice})),
-    []);
   const theme = useChartTheme();
   // The last response: an identical one keeps the report as it is
   const lastText = useRef(null);
@@ -655,18 +391,6 @@ export default function App() {
           <p>elock, mnesia and global compared on imitated database transactions.</p>
         </div>
         <div className="toolbar">
-          <div className="segmented" role="group" aria-label="View">
-            {views.map(({id, label}) => (
-              <button
-                type="button"
-                key={id}
-                aria-pressed={view === id}
-                onClick={() => setView(id)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
           <button type="button" onClick={refresh}>Refresh</button>
         </div>
       </header>
@@ -689,9 +413,8 @@ export default function App() {
                   <tr>
                     <th>Date/time</th>
                     <th>Nodes</th>
-                    <th>Transactions / client</th>
-                    <th>Write (ms)</th>
-                    <th>Deadlocks</th>
+                    <th>Transaction</th>
+                    <th>Clients / node</th>
                     <th>Paths present</th>
                   </tr>
                 </thead>
@@ -708,9 +431,6 @@ export default function App() {
               key={run.id}
               run={run}
               anchor={runAnchor(run)}
-              view={view}
-              slice={slices[run.id]}
-              onSlice={changeSlice}
               theme={theme}
             />
           ))}

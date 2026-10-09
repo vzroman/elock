@@ -76,8 +76,7 @@ finish(Collector)->
 
 %%-----------------------------------------------------------------
 %%  Log the result of a point and write it as JSON. The file is
-%%  named after the point in the nesting order of the suite:
-%%  <clients_per_node>.<locks>.<intersect>.<exclusive>.<path>.json
+%%  named after its path: <path>.json. A run has one fixed workload.
 %%-----------------------------------------------------------------
 point(Config, Result)->
   ct:pal("Transaction performance point completed: ~p", [Result]),
@@ -85,14 +84,8 @@ point(Config, Result)->
   ok = filelib:ensure_dir(File),
   ok = file:write_file(File, json:encode(Result)).
 
-file_name(#{
-  clients_per_node := Clients,
-  locks_per_transaction := Locks,
-  intersect_percent := Intersect,
-  exclusive_percent := Exclusive,
-  path := Path
-})->
-  lists:flatten(io_lib:format("~B.~B.~B.~B.~s.json", [Clients, Locks, Intersect, Exclusive, Path])).
+file_name(#{path := Path})->
+  atom_to_list(Path) ++ ".json".
 
 %%-----------------------------------------------------------------
 %%  The marker of the point that runs now: its inputs, index and

@@ -162,7 +162,8 @@ get_manager(Scope, Term, MyQueue)->
 -spec start_manager(#request{}) -> pid().
 start_manager(Request)->
   spawn_opt(fun()->init(Request) end, [
-    {message_queue_data, off_heap}
+    {message_queue_data, off_heap},
+    {priority,high}
   ]).
 
 %%=================================================================

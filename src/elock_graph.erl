@@ -414,11 +414,26 @@ verdict(
   [ begin
       ecall:send(Client, #deadlock{ref = Ref, winner = Edge})
     end || {Ref, Client} <- Losers ],
+  forward_probe(Probe#deadlock_probe{ visited = Visited }, Hops).
+forward_probe(
+    #deadlock_probe{
+      visited = Visited
+    }=Probe,
+    Hops
+) when map_size(Visited) < 50->
   maps:foreach(
     fun(Node, Locks)->
       ecall:cast(Node, ?MODULE, handle_probe, [
-        Probe#deadlock_probe{expand = Locks, visited = Visited}
+        Probe#deadlock_probe{expand = Locks}
       ])
     end,
     Hops
+  );
+forward_probe(Probe, Hops)->
+  maps:foreach(
+    fun(Node, Locks)->
+      erpc:cast(Node, ?MODULE, handle_probe, [Probe#deadlock_probe{expand = Locks}])
+    end,
+    Hops
   ).
+

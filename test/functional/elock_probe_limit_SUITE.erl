@@ -7,34 +7,29 @@
 -module(elock_probe_limit_SUITE).
 
 -include("elock.hrl").
--include_lib("stdlib/include/assert.hrl").
+-include("elock_test.hrl").
 
+%% Common Test callbacks
+-export([all/0, init_per_suite/1, end_per_suite/1]).
+
+%% Test cases
 -export([
-  all/0,
-  init_per_suite/1,
-  end_per_suite/1,
   context_lifetime_test/1,
   acyclic_budget_test/1,
   age_budget_test/1,
   initial_frontier_budget_test/1,
   merged_holds_budget_test/1,
   ordinary_cycle_test/1,
-  obsolete_origin_test/1,
+  captured_origin_test/1,
   replacement_origin_test/1,
   remote_budget_test/1,
   probe_limit_cancellation_test/1,
-  fixed_request_age_test/1,
-  start_scope/0,
-  client_loop/0
+  fixed_request_age_test/1
 ]).
 
--record(waiter,{
-  lock :: lock_key(),
-  ref :: reference(),
-  birth :: non_neg_integer(),
-  client :: pid(),
-  holds :: held_locks()
-}).
+%% Remote fixture process
+-export([client_loop/0]).
+
 
 -define(SCOPE, elock_probe_limit_scope).
 -define(CONTEXT, '$elock_context$').
@@ -51,7 +46,7 @@ all()->
     initial_frontier_budget_test,
     merged_holds_budget_test,
     ordinary_cycle_test,
-    obsolete_origin_test,
+    captured_origin_test,
     replacement_origin_test,
     remote_budget_test,
     probe_limit_cancellation_test,
@@ -60,31 +55,17 @@ all()->
 
 -spec init_per_suite(list()) -> list().
 init_per_suite(Config)->
-  start_distribution(),
   {ok, _} = application:ensure_all_started(elock),
-  Scope = start_scope(),
-  Paths = lists:usort([
-    filename:dirname(code:which(?MODULE)),
-    filename:dirname(code:which(elock)),
-    filename:dirname(code:which(ecall))
-  ]),
-  {ok, Peer, Node} = peer:start_link(#{
-    name => list_to_atom("elock_probe_peer_" ++ os:getpid()),
-    connection => standard_io,
-    args => ["+S", "2", "-setcookie", atom_to_list(erlang:get_cookie()), "-pa" | Paths]
-  }),
-  unlink(Peer),
-  {ok, _} = erpc:call(Node, application, ensure_all_started, [elock]),
-  _RemoteScope = erpc:call(Node, ?MODULE, start_scope, []),
-  [{scope, Scope}, {peer, Peer}, {node, Node} | Config].
+  [Node] = distributed_tests_utils:start_nodes([#{name => probe_peer}], [?MODULE]),
+  Scope = elock_test_utils:start_scope(?SCOPE),
+  RemoteScope = elock_test_utils:start_scope(Node, ?SCOPE),
+  [{scope, Scope}, {remote_scope, RemoteScope}, {node, Node} | Config].
 
 -spec end_per_suite(list()) -> ok.
 end_per_suite(Config)->
-  peer:stop(proplists:get_value(peer, Config)),
-  exit(proplists:get_value(scope, Config), shutdown),
-  application:stop(elock),
-  application:stop(ecall),
-  ok.
+  ok = elock_test_utils:finish_scope(proplists:get_value(scope, Config)),
+  ok = elock_test_utils:finish_scope(proplists:get_value(remote_scope, Config)),
+  distributed_tests_utils:stop_nodes([proplists:get_value(node, Config)]).
 
 %%=================================================================
 %%  Context lifetime: reentry and unknown unlock keep the context;
@@ -154,15 +135,17 @@ acyclic_budget_test(_Config)->
   end.
 
 %%=================================================================
-%%  Milliseconds increase the budget without a step. The ceiling
-%%  still applies to an old context.
+%%  Age increases the budget in 100 ms steps, with a floor and ceiling.
 %%=================================================================
 -spec age_budget_test(list()) -> ok.
 age_budget_test(_Config)->
-  fanout(100, 108, quiet),
-  fanout(100, 109, probe_limit),
-  fanout(20000, 9998, quiet),
-  fanout(20000, 9999, probe_limit).
+  % Age counts in steps of 100 milliseconds; one hold reaches the cap at 999 s.
+  fanout(100, 98, quiet),
+  fanout(100, 99, probe_limit),
+  fanout(10000, 108, quiet),
+  fanout(10000, 109, probe_limit),
+  fanout(999000, 9998, quiet),
+  fanout(999000, 9999, probe_limit).
 
 %%=================================================================
 %%  The origin itself consumes a slot: ten thousand distinct held
@@ -242,38 +225,45 @@ ordinary_cycle_test(_Config)->
   end.
 
 %%=================================================================
-%%  Delayed launches and returning continuations retire when the
-%%  exact origin request is gone. Another waiter is not that origin.
+%%  Launches and hops retain their captured origin after its row is gone.
+%%  Both budget cancellations and cycle verdicts still reach that client.
 %%=================================================================
--spec obsolete_origin_test(list()) -> ok.
-obsolete_origin_test(_Config)->
+-spec captured_origin_test(list()) -> ok.
+captured_origin_test(_Config)->
   Origin = key(node()),
   Held = key(node()),
   Ref = make_ref(),
-  Row = #waiter{
-    lock = Origin, ref = Ref, birth = 1, client = self(),
-    holds = #{Held => self()}
-  },
-  Branch = #waiter{
-    lock = Held, ref = make_ref(), birth = 2, client = self(),
-    holds = leaves(101, node())
-  },
-  Other = Row#waiter{ref = make_ref()},
-  ets:insert(elock_graph, Branch),
+  Row = #waiter{lock = Origin, ref = Ref, birth = 2, client = self(),
+    holds = #{Held => self()}},
+  Branch = #waiter{lock = Held, ref = make_ref(), birth = 3, client = self(),
+    holds = leaves(101, node())},
+  Probe = #deadlock_probe{ref = Ref, edge = Origin, client = self(), birth = 2,
+    limit = 100, expand = [Held], visited = #{Origin => true, Held => true}},
   try
-    ok = elock_graph:launch(Row, [Held], 0),
-    no_deadlock(Ref),
-    ets:insert(elock_graph, Other),
-    ok = elock_graph:launch(Row, [Held], 0),
-    no_deadlock(Ref),
-    ok = elock_graph:handle_probe(#deadlock_probe{
-      ref = Ref, edge = Origin, client = self(), birth = 1,
-      limit = 100, expand = [Held], visited = #{Origin => true, Held => true}
-    }),
-    no_deadlock(Ref)
+    lists:foreach(fun(WasInserted)->
+      case WasInserted of
+        true->
+          ets:insert(elock_graph, Row),
+          ets:delete_object(elock_graph, Row);
+        false-> ok
+      end,
+      ets:insert(elock_graph, Branch),
+      ok = elock_graph:launch(Row, [Held], 0),
+      deadlock(Ref, probe_limit),
+      ok = elock_graph:handle_probe(Probe),
+      deadlock(Ref, probe_limit),
+      ets:delete_object(elock_graph, Branch),
+      Closer = Branch#waiter{birth = 1, holds = #{Origin => self()}},
+      ets:insert(elock_graph, Closer),
+      ok = elock_graph:launch(Row, [Held], 0),
+      deadlock(Ref, Held),
+      ok = elock_graph:handle_probe(Probe),
+      deadlock(Ref, Held),
+      ets:delete_object(elock_graph, Closer)
+    end, [false, true])
   after
-    ets:delete(elock_graph, Origin),
-    ets:delete_object(elock_graph, Branch)
+    ets:delete(elock_graph, Held),
+    ets:delete(elock_graph, Origin)
   end.
 
 %%=================================================================
@@ -325,7 +315,7 @@ remote_budget_test(Config)->
   ets:insert(elock_graph, Row),
   true = erpc:call(Node, ets, insert, [elock_graph, Branch]),
   try
-    ok = elock_graph:launch(Row, [Held], 100),
+    ok = elock_graph:launch(Row, [Held], 10000),
     deadlock(Ref, probe_limit)
   after
     ets:delete_object(elock_graph, Row),
@@ -390,7 +380,8 @@ fixed_request_age_test(Config)->
     Second = publication(),
     ?assertEqual(First#add_edges.ref, Second#add_edges.ref),
     ?assertEqual(First#add_edges.age, Second#add_edges.age),
-    ?assert(First#add_edges.age =< (erlang:system_time(microsecond) - First#add_edges.birth) div 1000),
+    ?assert(First#add_edges.age =<
+      max(1, (erlang:system_time(microsecond) - First#add_edges.birth) div 1000)),
     ?assert(First#add_edges.age >= max(0, (Started - First#add_edges.birth) div 1000)),
     receive after 30-> ok end,
     ok = call(LocalBlocker, fun()-> elock:unlock(LocalRef) end),
@@ -471,38 +462,20 @@ publication()->
     ct:fail(no_graph_publication)
   end.
 
--spec start_scope() -> pid().
-start_scope()->
-  {ok, Scope} = elock:start_link(?SCOPE),
-  unlink(Scope),
-  await(fun()-> ets:whereis(?SCOPE) =/= undefined end),
-  Scope.
-
--spec start_distribution() -> ok.
-start_distribution()->
-  case node() of
-    nonode@nohost->
-      Epmd = filename:join([code:root_dir(), "erts-" ++ erlang:system_info(version), "bin", "epmd"]),
-      _ = os:cmd(Epmd ++ " -daemon"),
-      Name = list_to_atom("elock_probe_controller_" ++ os:getpid()),
-      {ok, _} = net_kernel:start([Name, shortnames]),
-      ok;
-    _->
-      ok
-  end.
-
 -spec client_loop() -> no_return().
 client_loop()->
   receive
-    {From, Ref, Fun}->
+    {call, From, Ref, Fun}->
       From ! {Ref, Fun()},
       client_loop()
+  after ?DEADLINE->
+    exit(idle_fixture_timeout)
   end.
 
 -spec cast(pid(), fun(() -> term())) -> reference().
 cast(Client, Fun)->
   Ref = make_ref(),
-  Client ! {self(), Ref, Fun},
+  Client ! {call, self(), Ref, Fun},
   Ref.
 
 -spec call(pid(), fun(() -> term())) -> term().

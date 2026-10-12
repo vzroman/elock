@@ -1,27 +1,10 @@
 %%=================================================================
-%%  Functional tests of the deadlock detection on a single node:
-%%  cycles within a scope and across scopes, the weights and the
-%%  coin, chains that are no cycles, what the loser keeps and how
-%%  the winners drain.
-%%
-%%  A scenario is a list of participants {Client, Held, Want}: every
-%%  client takes its Held locks, then the Want requests are issued
-%%  one by one with lock_queued/5. A request does not bring the
-%%  held locks with it, only their number: the manager asks the
-%%  client for them when the request is queued (#queued{}), and it
-%%  is the answer of the client that puts the request into the
-%%  wait-for graph and sends its probes. Every cycle of this suite
-%%  is found through that answer. lock_queued/5 returns when all of
-%%  it is over: the request stands in its manager's queue, its
-%%  client has answered, and the managers have handled the answer
-%%  and every probe it set off (see elock_test_utils:lock_queued/6;
-%%  on one node that is exact). So nothing of a request is on its
-%%  way when the next one is issued: the probes of the requests
-%%  before the last find no cycle, the probe of the request that
-%%  closes the cycle finds the rest of the cycle in place, hence
-%%  the cycle gets exactly one verdict. The property asserted
-%%  everywhere: exactly one loser per cycle, and every winner is
-%%  granted once the loser releases what it holds
+%% Single-node deadlock scenarios: each client's graph worker publishes its
+%% request to the graph of the lock node, and the walk expands held keys.
+%% Earlier context birth wins; the youngest request closing a sequential
+%% cycle loses. lock_queued waits for publication and a completed walk before
+%% issuing the next request. A loser releases its holds so winners can drain.
+%% Equal-birth reference coins are covered in elock_graph_SUITE.
 %%=================================================================
 -module(elock_deadlock_SUITE).
 
@@ -41,13 +24,15 @@
   end_per_suite/1
 ]).
 
+%% Test cases
 -export([
+  verdict_removes_row_test/1,
   two_cycle_test/1,
   concurrent_two_cycle_test/1,
-  weight_decides_test/1,
+  age_decides_test/1,
   tie_test/1,
   three_cycle_test/1,
-  three_cycle_with_weights_test/1,
+  three_cycle_oldest_wins_test/1,
   two_independent_cycles_test/1,
   shared_locks_cycle_test/1,
   shared_holder_in_cycle_test/1,
@@ -60,7 +45,7 @@
   cross_scope_cycle_test/1,
   cross_scope_different_terms_cycle_test/1,
   cross_scope_no_false_positive_test/1,
-  cross_scope_weight_test/1,
+  cross_scope_age_test/1,
   deadlock_and_timeout_test/1,
   ring_test/1
 ]).
@@ -69,7 +54,8 @@
 -record(context,{
   ref2lock,
   locked,
-  counts
+  counts,
+  birth
 }).
 -record(node,{manager, holder}).
 -record(lock,{
@@ -88,7 +74,7 @@
   cross_scope_cycle_test,
   cross_scope_different_terms_cycle_test,
   cross_scope_no_false_positive_test,
-  cross_scope_weight_test
+  cross_scope_age_test
 ]).
 
 all()->
@@ -103,12 +89,13 @@ all()->
 groups()->
   [
     {cycles, [], [
+      verdict_removes_row_test,
       two_cycle_test,
       concurrent_two_cycle_test,
-      weight_decides_test,
+      age_decides_test,
       tie_test,
       three_cycle_test,
-      three_cycle_with_weights_test,
+      three_cycle_oldest_wins_test,
       two_independent_cycles_test,
       shared_locks_cycle_test,
       shared_holder_in_cycle_test,
@@ -127,7 +114,7 @@ groups()->
       cross_scope_cycle_test,
       cross_scope_different_terms_cycle_test,
       cross_scope_no_false_positive_test,
-      cross_scope_weight_test
+      cross_scope_age_test
     ]},
     {mixed, [], [
       deadlock_and_timeout_test,
@@ -139,6 +126,7 @@ suite()->
   [{timetrap, {minutes, 10}}].
 
 init_per_suite(Config)->
+  {ok, _} = application:ensure_all_started(elock),
   Config.
 
 end_per_suite(_Config)->
@@ -181,6 +169,25 @@ end_per_testcase(_TestCase, Config)->
 %%=================================================================
 %%  Cycles
 %%=================================================================
+%% A verdict removes only the loser; the winner stays published until granted.
+verdict_removes_row_test(Config)->
+  Scope = ?config(scope, Config),
+  Node = node(),
+  [Older, Younger] = clients(2),
+  {ok, R1} = elock_test_utils:lock(Older, Scope, t1, [Node]),
+  {ok, R2} = elock_test_utils:lock(Younger, Scope, t2, [Node]),
+  Wait = elock_test_utils:lock_queued(Older, Scope, t2, [Node], #{}),
+  [WinnerRow] = elock_test_utils:graph_rows(Scope, t2),
+  ?assertEqual({error, {deadlock, {Scope, t2, Node}}},
+    elock_test_utils:lock(Younger, Scope, t1, [Node])),
+  ?WAIT(elock_test_utils:graph_rows(Scope, t1) =:= []),
+  ?assertEqual([WinnerRow], elock_test_utils:graph_rows(Scope, t2)),
+  ok = elock_test_utils:unlock(Younger, R2),
+  R3 = granted(Wait),
+  ?WAIT(ets:info(elock_graph, size) =:= 0),
+  ok = elock_test_utils:unlock(Older, R3),
+  ok = elock_test_utils:unlock(Older, R1).
+
 %%-----------------------------------------------------------------
 %%  A holds t1, B holds t2, each asks for the other's term - with
 %%  either request closing the cycle: exactly one of them gets
@@ -285,37 +292,37 @@ concurrent_two_cycle_test(Config)->
   ct:pal("concurrent two-cycle: ~p of ~p rounds with two losers", [TwoLoserRounds, Rounds]).
 
 %%-----------------------------------------------------------------
-%%  The weight decides: the client holding two terms never loses
-%%  against the one holding one, whichever request closes the cycle,
-%%  ten times each
+%%  The older context wins whichever request closes, ten rounds each way.
+%%  The younger client has two holds and the older only one.
 %%-----------------------------------------------------------------
-weight_decides_test(Config)->
+age_decides_test(Config)->
   Scope = ?config(scope, Config),
   Node = node(),
   lists:foreach(
     fun({Closing, _Round})->
-      [Heavy, Light] = clients(2),
-      HeavyPart = {Heavy, [{Scope, t1}, {Scope, t3}], {Scope, t2}},
-      LightPart = {Light, [{Scope, t2}], {Scope, t1}},
+      [Younger, Older] = clients(2),
+      YoungerPart = {Younger, [{Scope, t1}, {Scope, t3}], {Scope, t2}},
+      OlderPart = {Older, [{Scope, t2}], {Scope, t1}},
       Requests =
         case Closing of
-          heavy_closes-> setup(Node, [LightPart, HeavyPart]);
-          light_closes-> setup(Node, [HeavyPart, LightPart])
+          younger_closes-> setup_age(Node, [OlderPart, YoungerPart], [OlderPart, YoungerPart]);
+          older_closes-> setup_age(Node, [OlderPart, YoungerPart], [YoungerPart, OlderPart])
         end,
+      ?assert(elock_test_utils:context_birth(Older) <
+        elock_test_utils:context_birth(Younger)),
       Verdicts = resolve(Requests),
-      ?assertEqual([Light], losers(Verdicts)),
-      ?assertEqual([Heavy], winners(Verdicts)),
-      ?assertEqual({error, {deadlock, {Scope, t2, Node}}}, maps:get(Light, Verdicts)),
+      ?assertEqual([Younger], losers(Verdicts)),
+      ?assertEqual([Older], winners(Verdicts)),
+      ?assertEqual({error, {deadlock, {Scope, t1, Node}}}, maps:get(Younger, Verdicts)),
       elock_test_utils:wait_idle(Scope),
-      stop([Heavy, Light])
+      stop([Younger, Older])
     end,
-    [ {Closing, Round} || Round <- lists:seq(1, 10), Closing <- [heavy_closes, light_closes] ]
+    [ {Closing, Round} || Round <- lists:seq(1, 10), Closing <- [younger_closes, older_closes] ]
   ).
 
 %%-----------------------------------------------------------------
-%%  Equal weights: exactly one loser every time, twenty cycles with
-%%  the closing request alternating (which one loses is up to the
-%%  coin and is not asserted)
+%%  Alternating sequential cycles still have exactly one loser. Context births
+%%  are microsecond timestamps; this API test does not manufacture equal births.
 %%-----------------------------------------------------------------
 tie_test(Config)->
   Scope = ?config(scope, Config),
@@ -361,11 +368,9 @@ three_cycle_test(Config)->
   stop([A, B, C]).
 
 %%-----------------------------------------------------------------
-%%  A cycle of three where A holds two terms: A never loses, one of
-%%  the two light ones does, whichever request closes the cycle -
-%%  ten rounds with the order of the requests rotating
+%%  The first context never loses in a three-cycle while request order rotates.
 %%-----------------------------------------------------------------
-three_cycle_with_weights_test(Config)->
+three_cycle_oldest_wins_test(Config)->
   Scope = ?config(scope, Config),
   Node = node(),
   lists:foreach(
@@ -376,7 +381,7 @@ three_cycle_with_weights_test(Config)->
         {B, [{Scope, t2}], {Scope, t3}},
         {C, [{Scope, t3}], {Scope, t1}}
       ],
-      Requests = setup(Node, rotate(Parts, Round)),
+      Requests = setup_age(Node, Parts, rotate(Parts, Round)),
       Verdicts = resolve(Requests),
       ?assertMatch([Loser] when Loser =:= B; Loser =:= C, losers(Verdicts)),
       ?assert(lists:member(A, winners(Verdicts))),
@@ -582,6 +587,7 @@ loser_keeps_other_locks_test(Config)->
   CycleManager = elock_test_utils:wait_manager(Scope, CycleTerm),
   OtherManager = elock_test_utils:wait_manager(Scope, OtherTerm),
   ?assertEqual(#context{
+    birth = elock_test_utils:context_birth(Loser),
     ref2lock = #{
       CycleRef => #lock{
         scope = Scope,
@@ -591,7 +597,8 @@ loser_keeps_other_locks_test(Config)->
       OtherRef => #lock{
         scope = Scope,
         term = OtherTerm,
-        nodes = #{ Node => #node{manager = OtherManager} }
+        nodes = elock_test_utils:lock_nodes(Loser, OtherRef,
+          {held_something, #{Node => OtherManager}})
       }
     },
     locked = #{
@@ -791,15 +798,10 @@ cross_scope_no_false_positive_test(Config)->
   stop([A, B, C]).
 
 %%-----------------------------------------------------------------
-%%  The weight counts the holds of every scope: A holds t1 in the
-%%  first scope and tx in the second (weight 2), B holds t2 in the
-%%  first (weight 1); A asks t2 and B asks t1, both in the first
-%%  scope - B always loses, whichever request closes the cycle, ten
-%%  rounds each. The same with the cycle across the scopes: A holds
-%%  t1 and tx in the first, B holds t2 in the second, A asks t2 in
-%%  the second, B asks t1 in the first
+%%  Context age decides within and across scopes. A younger client has an
+%%  extra hold in another scope; that hold does not change its priority.
 %%-----------------------------------------------------------------
-cross_scope_weight_test(Config)->
+cross_scope_age_test(Config)->
   Scope1 = ?config(scope, Config),
   Scope2 = ?config(scope2, Config),
   Node = node(),
@@ -810,23 +812,26 @@ cross_scope_weight_test(Config)->
     {[{Scope1, t1}, {Scope1, tx}], {Scope2, t2}, [{Scope2, t2}], {Scope1, t1}}
   ],
   lists:foreach(
-    fun({{HeavyHeld, HeavyWant, LightHeld, LightWant}, Closing, _Round})->
-      [Heavy, Light] = clients(2),
-      HeavyPart = {Heavy, HeavyHeld, HeavyWant},
-      LightPart = {Light, LightHeld, LightWant},
+    fun({{YoungerHeld, YoungerWant, OlderHeld, OlderWant}, Closing, _Round})->
+      [Younger, Older] = clients(2),
+      YoungerPart = {Younger, YoungerHeld, YoungerWant},
+      OlderPart = {Older, OlderHeld, OlderWant},
       Requests =
         case Closing of
-          heavy_closes-> setup(Node, [LightPart, HeavyPart]);
-          light_closes-> setup(Node, [HeavyPart, LightPart])
+          younger_closes-> setup_age(Node, [OlderPart, YoungerPart], [OlderPart, YoungerPart]);
+          older_closes-> setup_age(Node, [OlderPart, YoungerPart], [YoungerPart, OlderPart])
         end,
+      ?assert(elock_test_utils:context_birth(Older) <
+        elock_test_utils:context_birth(Younger)),
       Verdicts = resolve(Requests),
-      ?assertEqual([Light], losers(Verdicts)),
-      ?assertEqual([Heavy], winners(Verdicts)),
+      ?assertEqual([Younger], losers(Verdicts)),
+      ?assertEqual([Older], winners(Verdicts)),
       ?WAIT(elock_test_utils:locks(Scope1) =:= []),
       elock_test_utils:wait_idle(Scope2),
-      stop([Heavy, Light])
+      stop([Younger, Older])
     end,
-    [ {Shape, Closing, Round} || Shape <- Shapes, Round <- lists:seq(1, 10), Closing <- [heavy_closes, light_closes] ]
+    [ {Shape, Closing, Round} || Shape <- Shapes, Round <- lists:seq(1, 10),
+      Closing <- [younger_closes, older_closes] ]
   ).
 
 %%=================================================================
@@ -856,6 +861,7 @@ deadlock_and_timeout_test(Config)->
   M1 = elock_test_utils:wait_manager(Scope, t1),
   M2 = elock_test_utils:wait_manager(Scope, t2),
   ?assertEqual(#context{
+    birth = elock_test_utils:context_birth(A),
     ref2lock = #{ RefA => #lock{
       scope = Scope,
       term = t1,
@@ -865,6 +871,7 @@ deadlock_and_timeout_test(Config)->
     counts = #{}
   }, elock_test_utils:context(A)),
   ?assertEqual(#context{
+    birth = elock_test_utils:context_birth(B),
     ref2lock = #{ RefB => #lock{
       scope = Scope,
       term = t2,
@@ -923,7 +930,7 @@ stop(Clients)->
 
 % A scenario: every participant {Client, Held, Want} takes its Held
 % locks, then the Want requests are issued in the order of the list,
-% each one settled at its manager (queued, answered, probed - see
+% each one settled at its manager (queued, published, walked - see
 % elock_test_utils:lock_queued/6) before the next is issued. A lock
 % is {Scope, Term} (exclusive) or {Scope, Term, Options}. The result
 % is [{Client, Request, HeldRefs}]
@@ -944,29 +951,19 @@ ask(Client, Node, {Scope, Term})->
 ask(Client, Node, {Scope, Term, Options})->
   elock_test_utils:lock_queued(Client, Scope, Term, [Node], Options).
 
-% An upgrade request that has settled like one of lock_queued/5: the
-% upgrade is pending at the manager, the client has answered with its
-% locks and the probes of the answer are handled. The client holds
-% the term shared already, so it is monitored since its first request
-% and the monitor can not tell whether the manager has taken the
-% upgrade. Awaited instead, in this order - each step is what makes
-% the next one conclusive:
-% * the client waits in elock_manager:wait_verdict/4 - the request
-%   is sent, hence it is in the mailbox of the manager
-% * the managers are quiet - the request is handled: the upgrade is
-%   pending and the manager has asked the client for its locks (an
-%   upgrade holds at least the term itself), #queued{} is in the
-%   mailbox of the client
-% * the request has settled - the client is suspended again, it has
-%   answered, and the managers are quiet once more: the answer and
-%   its probes are handled
-% or the verdict is in already: a second upgrade loses at once
+%%-----------------------------------------------------------------
+%%  An upgrade already holds its term: the client waits in wait_verdict/2,
+%%  its proxy in elock_manager:wait_verdict/3. Await publication plus quiet
+%%  graph work, or a completed request if a second upgrade loses immediately.
+%%-----------------------------------------------------------------
 upgrade_queued(Client, Scope, Term, Node)->
   R = elock_test_utils:lock_async(Client, Scope, Term, [Node], #{}),
   ?WAIT(
     not elock_test_utils:pending(R)
     orelse (
-      process_info(Client, current_function) =:= {current_function, {elock_manager, wait_verdict, 4}}
+      process_info(Client, current_function) =:=
+        {current_function, {elock_context, wait_verdict, 2}}
+      andalso elock_test_utils:published(Node, Client, Scope, Term)
       andalso elock_test_utils:quiet([Node]) =:= true
       andalso elock_test_utils:settled(Client, [Node]) =:= true
     )
@@ -1026,3 +1023,10 @@ any_result(Requests, Timeout)->
   after Timeout->
     erlang:error({any_result_timeout, Requests, elock_test_utils:flush()})
   end.
+
+%% Hold order fixes context age independently of request order.
+setup_age(Node, Participants, AskOrder)->
+  Holding = maps:from_list([ {Client, [take(Client, Node, Lock) || Lock <- Held]}
+    || {Client, Held, _Want} <- Participants ]),
+  [ {Client, ask(Client, Node, Want), maps:get(Client, Holding)}
+    || {Client, _Held, Want} <- AskOrder ].

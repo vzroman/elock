@@ -42,4 +42,7 @@
 %% Nothing arrives within the quiet window
 -define(NO_MESSAGE, elock_test_utils:no_message(?QUIET)).
 
+%% Mirrors elock_graph.erl; these module tests intentionally inspect its ETS rows.
+-record(waiter,{lock, ref, birth, client, holds}).
+
 -endif.

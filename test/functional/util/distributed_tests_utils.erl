@@ -8,10 +8,10 @@
 %%
 %%  start_nodes/1,2 make the controller (the ct node) distributed on
 %%  demand with a unique cookie per run, starts the peers, connects
-%%  them pairwise, starts ecall on every one of them and establishes
+%%  them pairwise, starts elock on every one of them and establishes
 %%  the ecall connections in both directions, verified. The
-%%  controller itself does not run ecall: it only drives the clients
-%%  on the peers through rpc. The nodes started so far live in a
+%%  controller runs elock too and drives remote clients through rpc.
+%%  The nodes started so far live in a
 %%  persistent_term, in the order they were started.
 %%  Modules requested by start_nodes/2 are loaded before each peer
 %%  is returned, including peers added or restarted later. This
@@ -51,7 +51,7 @@
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  Start the nodes of the configs ([#{name => atom()}]), connect
-%%  them pairwise, start ecall on each and connect ecall both ways.
+%%  them pairwise, start elock on each and connect ecall both ways.
 %%  Modules are loaded on every peer before it is returned, also
 %%  on later start_node/1 calls. A load failure fails startup.
 %%  The result is the node names in the order of the configs
@@ -64,7 +64,7 @@ start_nodes(Configs, Modules)->
   put_state((state())#{modules => Modules}),
   Nodes = [ start_peer(Config, Cookie) || Config <- Configs ],
   ok = connect_nodes(Nodes),
-  ok = start_ecall(Nodes),
+  ok = start_elock(Nodes),
   ok = connect_ecall(Nodes),
   Nodes.
 
@@ -73,7 +73,7 @@ stop_nodes(Nodes)->
   ok.
 
 %%-----------------------------------------------------------------
-%%  One more node: connected to every node started so far, ecall
+%%  One more node: connected to every node started so far, elock
 %%  started and connected both ways with each of them
 %%-----------------------------------------------------------------
 start_node(Config)->
@@ -82,7 +82,7 @@ start_node(Config)->
   Node = start_peer(Config, Cookie),
   Nodes = Known ++ [Node],
   ok = connect_nodes(Nodes),
-  ok = start_ecall([Node]),
+  ok = start_elock([Node]),
   ok = connect_ecall(Nodes),
   Node.
 
@@ -213,13 +213,13 @@ connect_pair(From, To)->
   true = rpc(From, net_kernel, connect_node, [To]),
   wait_until(fun()-> lists:member(To, rpc(From, erlang, nodes, [connected])) end).
 
-start_ecall(Nodes)->
-  [ {ok, _} = rpc(Node, application, ensure_all_started, [ecall]) || Node <- Nodes ],
+start_elock(Nodes)->
+  [ {ok, _} = rpc(Node, application, ensure_all_started, [elock]) || Node <- Nodes ],
   ok.
 
 %%-----------------------------------------------------------------
-%%  The ecall connections are established from the peers (the
-%%  controller does not run ecall) in both directions and verified:
+%%  The ecall connections are established from the peers in both
+%%  directions and verified:
 %%  connection_info/1 must report the pair connected
 %%-----------------------------------------------------------------
 connect_ecall(Nodes)->

@@ -52,6 +52,7 @@
   end_per_suite/1
 ]).
 
+%% Test cases
 -export([
   distributed_mutual_exclusion_test/1,
   distributed_shared_exclusive_test/1,
@@ -121,6 +122,7 @@ suite()->
 %%  connected both ways between every pair
 %%-----------------------------------------------------------------
 init_per_suite(Config)->
+  {ok, _} = application:ensure_all_started(elock),
   Nodes = distributed_tests_utils:start_nodes(
     [#{name => n1}, #{name => n2}, #{name => n3}], [?MODULE]
   ),
@@ -202,7 +204,8 @@ distributed_mutual_exclusion_test(Config)->
   check_results(Results, [ok]),
   ?assertEqual([], ets:tab2list(Violations)),
   ?assertEqual(length(Clients) * Rounds, length(lists:append(maps:values(Results)))),
-  ct:pal("distributed mutual exclusion: ~p requests repeated after a deadlock", [deadlocks()]),
+  ct:pal("distributed mutual exclusion: ~p cycle retries, ~p probe-limit retries",
+    [deadlocks(), probe_limits()]),
   finish([Scope], Nodes, Clients).
 
 %%-----------------------------------------------------------------
@@ -229,7 +232,8 @@ distributed_shared_exclusive_test(Config)->
   check_results(Results, [ok]),
   ?assertEqual([], ets:tab2list(Violations)),
   ?assertEqual(length(Clients) * Rounds, length(lists:append(maps:values(Results)))),
-  ct:pal("distributed shared/exclusive: ~p requests repeated after a deadlock", [deadlocks()]),
+  ct:pal("distributed shared/exclusive: ~p cycle retries, ~p probe-limit retries",
+    [deadlocks(), probe_limits()]),
   finish([Scope], Nodes, Clients).
 
 %%=================================================================
@@ -270,6 +274,7 @@ storm_rounds(Clients, Work, Scopes, Nodes, Cap, Round, _Deadlocks)->
   Results = run(Clients, Work),
   check_results(Results, fun
     (ok)-> true;
+    ({error, {deadlock, probe_limit}})-> true;
     ({error, {deadlock, {Scope, _Term, Node}}})->
       lists:member(Scope, Scopes) andalso lists:member(Node, Nodes);
     (_Unexpected)-> false
@@ -278,7 +283,11 @@ storm_rounds(Clients, Work, Scopes, Nodes, Cap, Round, _Deadlocks)->
   Deadlocks = length([
     O || O = {error, {deadlock, {_, _, _}}} <- lists:append(maps:values(Results))
   ]),
-  ct:pal("distributed deadlock storm round ~p: ~p deadlocks, ~p holds repeated after a deadlock", [Round, Deadlocks, deadlocks()]),
+  ProbeLimits = length([Outcome || Outcome = {error, {deadlock, probe_limit}}
+    <- lists:append(maps:values(Results))]),
+  ct:pal("distributed storm round ~p: ~p cycles, ~p probe limits; "
+    "retries ~p cycles, ~p probe limits",
+    [Round, Deadlocks, ProbeLimits, deadlocks(), probe_limits()]),
   storm_rounds(Clients, Work, Scopes, Nodes, Cap, Round + 1, Deadlocks).
 
 %%-----------------------------------------------------------------
@@ -309,8 +318,9 @@ distributed_timeouts_under_load_test(Config)->
   Outcomes = lists:append(maps:values(Results)),
   Granted = length([ O || O <- Outcomes, O =:= ok ]),
   TimedOut = length([ O || O <- Outcomes, O =:= {error, timeout} ]),
-  ct:pal("distributed timeouts under load: ~p granted, ~p timed out, ~p requests repeated after a deadlock",
-    [Granted, TimedOut, deadlocks()]),
+  ct:pal("distributed timeouts under load: ~p granted, ~p timed out, "
+    "~p cycle retries, ~p probe-limit retries",
+    [Granted, TimedOut, deadlocks(), probe_limits()]),
   ?assert(Granted > 0),
   ?assert(TimedOut > 0),
   finish([Scope], Nodes, Clients).
@@ -595,6 +605,9 @@ subset(Nodes)->
 % deadlock reported to the coordinator: {ok, Ref} or {error, timeout}
 request(Scope, Term, Nodes, Options, Coordinator)->
   case elock:lock(Scope, Term, Nodes, Options) of
+    {error, {deadlock, probe_limit}}->
+      Coordinator ! {probe_limit, self()},
+      request(Scope, Term, Nodes, Options, Coordinator);
     {error, {deadlock, {_Scope, _Term, _Node}}}->
       Coordinator ! {deadlock, self()},
       request(Scope, Term, Nodes, Options, Coordinator);
@@ -714,6 +727,8 @@ deadlock_work(#{
             {ok, Ref2}->
               ok = elock:unlock(Ref2),
               ok;
+            {error, {deadlock, probe_limit}} = Limit->
+              Limit;
             Other->
               Other
           end,
@@ -748,4 +763,11 @@ kill_work(#{
         Coordinator ! {progress, self()},
         Outcome
       end || _ <- lists:seq(1, Rounds) ]
+  end.
+
+%% Budget retries are reported independently from cycle retries.
+probe_limits()->
+  receive
+    {probe_limit, _Client}-> 1 + probe_limits()
+  after 0-> 0
   end.

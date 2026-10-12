@@ -38,6 +38,7 @@
   end_per_suite/1
 ]).
 
+%% Test cases
 -export([
   exclusive_mutual_exclusion_test/1,
   shared_exclusive_invariant_test/1,
@@ -103,6 +104,7 @@ suite()->
   [{timetrap, {minutes, 20}}].
 
 init_per_suite(Config)->
+  {ok, _} = application:ensure_all_started(elock),
   Config.
 
 end_per_suite(_Config)->
@@ -324,6 +326,7 @@ storm_rounds(Clients, Work, Scopes, Cap, Round, _Deadlocks)->
   Results = run(Clients, Work),
   check_results(Results, fun
     (ok)-> true;
+    ({error, {deadlock, probe_limit}})-> true;
     ({error, {deadlock, {Scope, _Term, Node}}})->
       lists:member(Scope, Scopes) andalso Node =:= node();
     (_Unexpected)-> false
@@ -332,7 +335,10 @@ storm_rounds(Clients, Work, Scopes, Cap, Round, _Deadlocks)->
   Deadlocks = length([
     O || O = {error, {deadlock, {_, _, _}}} <- lists:append(maps:values(Results))
   ]),
-  ct:pal("deadlock storm round ~p: ~p deadlocks", [Round, Deadlocks]),
+  ProbeLimits = length([Outcome || Outcome = {error, {deadlock, probe_limit}}
+    <- lists:append(maps:values(Results))]),
+  ct:pal("deadlock storm round ~p: ~p cycles, ~p probe limits",
+    [Round, Deadlocks, ProbeLimits]),
   storm_rounds(Clients, Work, Scopes, Cap, Round + 1, Deadlocks).
 
 %%=================================================================
@@ -710,6 +716,8 @@ deadlock_work(#{
             {ok, Ref2}->
               ok = elock:unlock(Ref2),
               ok;
+            {error, {deadlock, probe_limit}} = Limit->
+              Limit;
             Other->
               Other
           end,

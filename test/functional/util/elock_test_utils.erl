@@ -38,7 +38,8 @@
   settled/2,
   quiet/1,
   unlock/2,
-  context/1
+  context/1, context_birth/1, lock_nodes/3,
+  published/4
 ]).
 
 %% Observation
@@ -47,7 +48,8 @@
   manager/2, manager/3,
   wait_manager/2, wait_manager/3,
   managers/0, managers/1,
-  kill_managers/0, kill_managers/1
+  kill_managers/0, kill_managers/1,
+  graph_rows/2, graph_rows/3, wait_graph_idle/1, remote_pid/2
 ]).
 
 %% Waiting
@@ -77,8 +79,13 @@
   scope_holder/2,
   client_init/1,
   collector_init/1,
-  managers_work/0
+  managers_work/0, graph_walkers/0, quiet_node/0
 ]).
+
+%% Intentional test-only inspection of elock_context's private dictionary.
+-record(context,{ref2lock, locked, counts, birth}).
+-record(lock,{scope, term, nodes}).
+-record(node,{manager, holder}).
 
 -define(POLL, 10).
 -define(CONTEXT, '$elock_context$').
@@ -166,12 +173,15 @@ finish_scope(Holder)->
       Scope->
         ?safe(wait_idle(Node, Scope))
     end,
+  GraphIdle = ?safe(wait_graph_idle(Node)),
   stop_scope(Holder),
   kill_managers(Node),
-  case Idle of
-    ok->
+  case {Idle, GraphIdle} of
+    {ok, ok}->
       ok;
-    Error->
+    {ok, Error}->
+      {fail, {graph_not_idle, Error}};
+    {Error, _GraphResult}->
       {fail, {scope_not_idle, Error}}
   end.
 
@@ -234,6 +244,7 @@ client_init(Parent)->
   MonRef = erlang:monitor(process, Parent),
   client_loop(Parent, MonRef).
 
+% Idle waits expire; the parent monitor owns the service lifetime.
 client_loop(Parent, MonRef)->
   receive
     {?CALL, From, Ref, Fun}->
@@ -247,6 +258,8 @@ client_loop(Parent, MonRef)->
       client_loop(Parent, MonRef);
     {'DOWN', MonRef, process, Parent, _Reason}->
       exit(parent_down)
+  after ?DEADLINE->
+    client_loop(Parent, MonRef)
   end.
 
 %%-----------------------------------------------------------------
@@ -318,57 +331,19 @@ lock_async(Client, Scope, Term, Nodes, Options)->
   cast(Client, fun()-> elock:lock(Scope, Term, Nodes, Options) end).
 
 %%-----------------------------------------------------------------
-%%  An asynchronous lock request that has settled before the helper
-%%  returns, so that the next request finds it in place: it stands
-%%  in the queue of its manager and, if its client holds locks, it
-%%  is in the wait-for graph and its probes have been handled. A
-%%  request does not bring the held locks with it: the manager asks
-%%  the client for them (#queued{}) and it is the answer of the
-%%  client that joins the request to the graph and sends its
-%%  probes. Hence three things are awaited, in this order - each
-%%  one is what makes the next one conclusive:
-%%  * taken - the entry shows the ticket the request took and the
-%%    manager monitors a local client, which it does once the request
-%%    is in its queue (or granted). The manager registers the
-%%    client after it has sent #queued{}, if it asks at all, hence
-%%    the question is in the mailbox of the client by now
-%%  * answered - the client is suspended in its receive again. A
-%%    local send puts the message into the mailbox at once and a
-%%    process with a message it waits for is not suspended, hence
-%%    the client has taken the question and has sent its answer:
-%%    the answer is in the mailbox of the manager. A client that is
-%%    not asked (it holds nothing and names one node) is suspended
-%%    from the start
-%%  * quiet - the managers have nothing to do and have done nothing
-%%    for a while (see quiet/1), hence the answer is handled, the
-%%    request is in the graph, and its probes, the ones passed on
-%%    from manager to manager included, and the verdicts they have
-%%    brought are handled by every manager they got to
-%%  or the verdict is in already, then there is nothing to look at:
-%%  a request that closes a deadlock cycle loses at once and a
-%%  dequeued request is demonitored.
-%%
-%%  On one node this is exact: everything is a local send, there is
-%%  no moment when a message is in nobody's mailbox. The client
-%%  must be new to the manager: one that holds the term already is
-%%  monitored since its first request. The verdict is collected
-%%  with result/2
+%%  Await the manager's ticket, publication by the client's graph worker,
+%%  and quiet workers and walkers. A held context is published through
+%%  manager -> proxy -> client -> graph worker -> graph node -> walker.
+%%  The result may arrive at any phase, in which case there is no queue
+%%  left to await. Collect the result with result/2.
 %%-----------------------------------------------------------------
 lock_queued(Client, Scope, Term, Nodes, Options)->
   lock_queued(node(), Client, Scope, Term, Nodes, Options).
 
 %%-----------------------------------------------------------------
-%%  The same for a request of a remote scope: Watch is the node, or
-%%  the nodes, whose managers must have taken the request (the
-%%  tables and local-client monitors are read through rpc) - for a
-%%  multi node request every node of it. The client and the managers
-%%  of every node are looked at through rpc the same way, but
-%%  remote clients have no process monitor at their managers: only
-%%  the ticket and settled/2 are checked there. Across nodes this is
-%%  not a guarantee: #queued{}, the answer and the probes travel through
-%%  ecall, and a message on its way
-%%  between two nodes is in nobody's mailbox. The checks only
-%%  narrow the window there
+%%  Watch names the lock nodes whose ticket and publication are observed.
+%%  Remote casts in flight are invisible; checking all connected nodes
+%%  narrows that transport window. Local sends are visible immediately.
 %%-----------------------------------------------------------------
 lock_queued(Watch, Client, Scope, Term, Nodes, Options) when is_atom(Watch)->
   lock_queued([Watch], Client, Scope, Term, Nodes, Options);
@@ -391,7 +366,13 @@ lock_queued(Watch, Client, Scope, Term, Nodes, Options)->
               Tickets
             ),
           case Taken of
-            true-> settled(Client, Watch);
+            true->
+              case context(Client) of
+                #context{locked = Held} when map_size(Held) > 0->
+                  lists:all(fun(Node)-> published(Node, Client, Scope, Term) end,
+                    Watch) andalso settled(Client, Watch);
+                _NoHolds-> settled(Client, Watch)
+              end;
             Problem-> Problem
           end
       end
@@ -426,16 +407,8 @@ taken(Node, Client, Scope, Term, Ticket)->
   end.
 
 %%-----------------------------------------------------------------
-%%  The request the client waits with has settled: the client is
-%%  suspended in its receive - it has answered whatever it was
-%%  asked - and after that the managers are quiet, i.e. they have
-%%  handled the answer and what it set off. The order matters: the
-%%  answer is in the mailbox of the manager only once the client is
-%%  seen suspended. The caller sees to it that the manager has
-%%  taken the request (see lock_queued/6). The managers looked at
-%%  are those of the node of the client, of Nodes and of every
-%%  node connected to this one. The result is true or what is in
-%%  the way
+%%  A suspended client and quiet elock work on its node, the lock nodes,
+%%  and every connected node. Publication is checked by lock_queued/6.
 %%-----------------------------------------------------------------
 settled(Client, Nodes)->
   case rpc(node(Client), erlang, process_info, [Client, status]) of
@@ -446,65 +419,79 @@ settled(Client, Nodes)->
   end.
 
 %%-----------------------------------------------------------------
-%%  No manager of the nodes has anything to do, nor has it done
-%%  anything lately: every one of them is suspended with an empty
-%%  mailbox in two looks in a row and its reductions have not moved
-%%  in between. One look is not enough. The managers are looked at
-%%  one after another: a manager seen idle may get a probe passed
-%%  on right after by a manager that is seen idle as well when its
-%%  turn comes. The second look tells: a manager that has got a
-%%  message since the first one has it in its mailbox, runs, or has
-%%  run - its reductions have moved. If nothing moved, then between
-%%  the two looks no manager ran and no mailbox of theirs had a
-%%  message, so there was nobody to send one: the managers are at
-%%  rest, all at the same moment. A manager that came or went in
-%%  between is a change as well. The result is true or what is in
-%%  the way
+%%  Two identical work snapshots on each node: every elock process waits
+%%  with an empty mailbox and unchanged reductions. The full process census
+%%  must stay unchanged from before discovery until after both snapshots.
+%%  Walkers and erpc callbacks are included by their stack/initial call.
+%%  Process inspection is intentionally isolated here for test observation.
 %%-----------------------------------------------------------------
 quiet(Nodes)->
-  Look = fun()-> [ {Node, managers_work(Node)} || Node <- Nodes ] end,
-  First = Look(),
-  case [ Busy || {_Node, Managers} <- First, Busy <- busy(Managers) ] of
+  lists:foldl(fun
+    (Node, true)-> rpc(Node, ?MODULE, quiet_node, []);
+    (_Node, Problem)-> Problem
+  end, true, Nodes).
+
+%% Discover once: stack/function inspection itself costs the graph process
+%% reductions on OTP 27. The two work snapshots do not inspect its stack.
+%% The census guard rejects new processes appearing during discovery too.
+quiet_node()->
+  Census = lists:sort(processes()),
+  {_Count, Processes} = managers_work(),
+  Pids = [ Pid || {Pid, _Work} <- Processes ],
+  First = [ {Pid, work(Pid)} || Pid <- Pids ],
+  case busy(First) of
     []->
-      case Look() of
-        First-> true;
-        Second-> {managers_not_quiet, First, Second}
+      Second = [ {Pid, work(Pid)} || Pid <- Pids ],
+      case {lists:sort(processes()), Second} of
+        {Census, First}-> true;
+        Changed-> {elock_not_quiet, {Census, First}, Changed}
       end;
-    Busy->
-      {managers_busy, Busy}
+    Busy-> {elock_busy, Busy}
   end.
 
-% What the managers of the node are doing: [{Manager, Work}] or what
-% is wrong with the node
 managers_work(Node) when Node =:= node()->
   managers_work();
 managers_work(Node)->
-  rpc:call(Node, ?MODULE, managers_work, []).
+  rpc(Node, ?MODULE, managers_work, []).
 
-% The managers are the ones the lock entries of the scopes of the
-% node name, sorted: two looks at the same managers are equal terms.
-% An entry without a pid is a manager that is starting, a dead
-% manager has nothing to do
+%% Remote snapshot entry point: process count plus relevant process work.
 managers_work()->
-  lists:sort([ {Manager, work(Manager)} || Scope <- scopes(), {_Term, Manager, _Ticket} <- entries(Scope) ]).
+  Entries = [ Manager || Scope <- scopes(),
+    {_Term, Manager, _Ticket} <- entries(Scope) ],
+  Processes = [ Pid || Pid <- processes(), elock_process(Pid) ],
+  {erlang:system_info(process_count),
+    lists:sort([ {Pid, work(Pid)} || Pid <- lists:usort(Entries ++ Processes) ])}.
 
-work(Manager) when is_pid(Manager)->
-  process_info(Manager, [message_queue_len, status, reductions]);
+elock_process(Pid)->
+  case process_info(Pid, current_function) of
+    {current_function, MFA}->
+      lists:member(MFA, [{elock_manager, loop, 1},
+        {elock_manager, wait_verdict, 3}, {elock_context, wait_verdict, 2},
+        {elock_context, wait_unlock, 2}, {elock_context, graph_loop, 1},
+        {elock_graph, loop, 0}]) orelse graph_process(Pid);
+    undefined-> false
+  end.
+
+graph_process(Pid)->
+  case process_info(Pid, [initial_call, current_stacktrace]) of
+    [{initial_call, {elock_graph, _Function, _Arity}}, _Stack]-> true;
+    [{initial_call, _Initial}, {current_stacktrace, Stack}]->
+      lists:any(fun({Module, _Function, _Args, _Location})->
+        Module =:= elock_graph end, Stack);
+    undefined-> false
+  end.
+
+work(Pid) when is_pid(Pid)->
+  process_info(Pid, [message_queue_len, status, reductions]);
 work(_NotRegistered)->
   starting.
 
-% The managers that are not at rest
-busy(Managers) when is_list(Managers)->
-  [ M || {_Manager, Work} = M <- Managers, not at_rest(Work) ];
-busy(NodeProblem)->
-  [NodeProblem].
+busy(Processes)->
+  [ Process || {_Pid, Work} = Process <- Processes, not at_rest(Work) ].
 
-at_rest(undefined)->
-  true;
-at_rest([{message_queue_len, 0}, {status, waiting}, {reductions, _}])->
-  true;
-at_rest(_Work)->
-  false.
+at_rest(undefined)-> true;
+at_rest([{message_queue_len, 0}, {status, waiting}, {reductions, _}])-> true;
+at_rest(_Work)-> false.
 
 % The scopes of the node: the pg scope of a scope is registered as
 % <Scope>_$pg$ (see elock:start_link/1)
@@ -541,6 +528,79 @@ context(Client)->
     _->
       undefined
   end.
+
+%% Birth stays visible in full context comparisons; reject a missing field.
+context_birth(Client)->
+  case context(Client) of
+    undefined-> undefined;
+    #context{birth = Birth}->
+      ?assert(is_integer(Birth)),
+      Birth
+  end.
+
+%% Expected nodes, with the pre-request context mode chosen by the caller.
+%% Holder pids are observed but their location, lifetime and monitors checked.
+lock_nodes(Client, Ref, {Mode, Managers})->
+  #context{ref2lock = Ref2Lock} = context(Client),
+  #lock{nodes = Nodes} = maps:get(Ref, Ref2Lock),
+  maps:map(fun(Node, Manager)->
+    #node{holder = Holder} = maps:get(Node, Nodes),
+    case {Node =:= node(Client), map_size(Managers), Mode} of
+      {true, 1, held_nothing}->
+        ?assertEqual(undefined, Holder),
+        ?WAIT(monitors(Manager, Client));
+      {true, _Count, _Mode}->
+        ?assert(is_pid(Holder)),
+        ?assertEqual(node(Client), node(Holder)),
+        ?WAIT(not rpc(node(Client), erlang, is_process_alive, [Holder])),
+        ?WAIT(monitors(Manager, Client));
+      {false, _Count, _Mode}->
+        ?assert(is_pid(Holder)),
+        ?assertEqual(node(Client), node(Holder)),
+        ?WAIT(monitors(Holder, Client))
+    end,
+    #node{manager = Manager, holder = Holder}
+  end, Managers).
+
+monitors(Pid, Client)->
+  case rpc(node(Pid), erlang, process_info, [Pid, monitors]) of
+    {monitors, Monitors}-> lists:member({process, Client}, Monitors);
+    undefined-> false
+  end.
+
+%% True only for a held context whose complete held-key set is published.
+published(Node, Client, Scope, Term)->
+  case context(Client) of
+    #context{locked = Held} when map_size(Held) > 0->
+      lists:any(fun(#waiter{holds = Holds, client = Worker})->
+        lists:all(fun(Key)-> is_map_key(Key, Holds) end, maps:keys(Held))
+          andalso monitors(Worker, Client)
+      end, graph_rows(Node, Scope, Term));
+    _NoHolds-> false
+  end.
+
+%% Rows at one lock; remote ETS observation is confined to test support.
+graph_rows(Scope, Term)-> graph_rows(node(), Scope, Term).
+graph_rows(Node, Scope, Term)->
+  rpc(Node, ets, lookup, [elock_graph, {Scope, Term, Node}]).
+
+%% Empty graph and no active walker/callback before scope teardown.
+wait_graph_idle(Node)->
+  wait_until(fun()->
+    rpc(Node, ets, info, [elock_graph, size]) =:= 0
+      andalso rpc(Node, ?MODULE, graph_walkers, []) =:= []
+  end, ?DEADLINE).
+
+%% Remote entry point for active graph work, excluding the table owner.
+graph_walkers()->
+  [ Pid || Pid <- processes(), Pid =/= whereis(elock_graph),
+    graph_process(Pid) ].
+
+%% NEW_PID_EXT with a bounded fake node name for state-only remote clients.
+remote_pid(Node, ID)->
+  Name = atom_to_binary(Node, latin1),
+  binary_to_term(<<131, 88, 100, (byte_size(Name)):16, Name/binary,
+    ID:32, 0:32, 1:32>>).
 
 %%=================================================================
 %%  Observation
@@ -687,6 +747,8 @@ collector_init(Parent)->
   MonRef = erlang:monitor(process, Parent),
   collector_loop(Parent, MonRef).
 
+% An intentional protocol observer: arbitrary tagged production messages
+% are forwarded unchanged. Idle expiry renews the parent-monitored service.
 collector_loop(Parent, MonRef)->
   receive
     {'DOWN', MonRef, process, Parent, _Reason}->
@@ -694,6 +756,8 @@ collector_loop(Parent, MonRef)->
     Message->
       Parent ! {self(), Message},
       collector_loop(Parent, MonRef)
+  after ?DEADLINE->
+    collector_loop(Parent, MonRef)
   end.
 
 %%-----------------------------------------------------------------

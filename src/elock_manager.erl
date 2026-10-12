@@ -16,9 +16,9 @@
 %%  The requests may arrive out of order, the manager takes them in
 %%  by the ticket (see handle_request/2).
 %%
-%%  An admitted waiter is sent #queued{}: a worker passes it on to the
-%%  client, which uses the manager PID for the withdrawal and for its
-%%  graph worker. Immediate grants send no notification.
+%%  An admitted waiter sends #queued{} through its proxy to the client.
+%%  The client uses the manager PID for cancellation and updates its
+%%  graph worker. Immediate grants do not send a queue notification.
 %%
 %%  The manager exits once it has removed the entry from ETS.
 %%=================================================================
@@ -26,14 +26,12 @@
 -moduledoc false.
 
 -include("elock.hrl").
--include("elock_manager.hrl").
 
 %%=================================================================
 %%	API
 %%=================================================================
 -export([
-  lock/1,
-  take/1
+  lock/1
 ]).
 
 -type holder() :: {boolean(), pid()}.
@@ -46,10 +44,23 @@
 %%  monitor per node. Their holders send #unlock{} when they exit.
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The replies to the proxy, ?reply(Tag, Verdict) with Tag of
-%%  #request.tag, are in elock_manager.hrl: the client matches them
-%%  as its own proxy, see elock_context:direct_verdict/4
+%%  Every message from the manager to the proxy. Tag is #request.tag
 %%-----------------------------------------------------------------
+-define(reply(Tag, Message), {Tag, Message}).
+
+%%-----------------------------------------------------------------
+%%  The verdicts. #retry{}: the ticket is void, take a new one.
+%%  #deadlock{} is in elock.hrl
+%%-----------------------------------------------------------------
+-record(locked,{
+  ref :: reference()
+}).
+-record(timeout,{
+  ref :: reference()
+}).
+-record(retry,{
+  ref :: reference()
+}).
 
 %%=================================================================
 %%  Client side
@@ -58,13 +69,9 @@
 %%  itself or a worker on its behalf
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  The first step of a proxy: the free lock is taken and its manager
-%%  started, otherwise the request is to be sent to the manager with
-%%  the ticket. The client itself for the local node alone (see
-%%  elock_context:direct_request/3), a worker for the others
+%%  The worker of elock_context:run_request/6, remote apply
 %%-----------------------------------------------------------------
--spec take(#request{}) -> {ok, pid()} | {wait, pid(), pos_integer()}.
-take(
+lock(
     #request{
       scope = Scope,
       term = Term
@@ -72,36 +79,27 @@ take(
 )->
   case ets:update_counter(Scope, Term, {3,1}, {Term,0,0}) of
     1->
-      {ok, start_manager(Request)};
+      Manager = start_manager(Request),
+      {ok, Manager};
+
     Ticket->
       case get_manager(Scope, Term, Ticket) of
         Manager when is_pid(Manager) ->
-          {wait, Manager, Ticket};
-        retry->
-          take(Request)
-      end
-  end.
-
-%%-----------------------------------------------------------------
-%%  The worker of elock_context:run_request/6, remote apply
-%%-----------------------------------------------------------------
-lock(Request)->
-  case take(Request) of
-    {wait, Manager, Ticket}->
-      % A manager that exits takes the request with it and never
-      % answers. The monitor ref is also the tag of the replies
-      MonitorRef = erlang:monitor(process, Manager),
-      Manager ! Request#request{ ticket = Ticket, proxy = self(), tag = MonitorRef },
-      Verdict = wait_verdict(MonitorRef, Manager, Request),
-      erlang:demonitor(MonitorRef, [flush]),
-      case Verdict of
-        retry ->
-          lock(Request);
+          % A manager that exits takes the request with it and never
+          % answers. The monitor ref is also the tag of the replies
+          MonitorRef = erlang:monitor(process, Manager),
+          Manager ! Request#request{ ticket = Ticket, proxy = self(), tag = MonitorRef },
+          Verdict = wait_verdict(MonitorRef, Manager, Request),
+          erlang:demonitor(MonitorRef, [flush]),
+          case Verdict of
+            retry ->
+              lock(Request);
+            _->
+              Verdict
+          end;
         _->
-          Verdict
-      end;
-    Taken->
-      Taken
+          lock(Request)
+      end
   end.
 
 %%-----------------------------------------------------------------
@@ -478,7 +476,7 @@ handle_unlock(
       % Not unlocked: a new ticket is taken and the state is reset. The
       % reset state has lost the leaving client's monitor, drop it here
       Req = #req{client = Client} = maps:get(Ref, Requests),
-      release_proxy(Req),
+      kill_proxy(Req),
       demonitor_client(maps:get(Client, Clients)),
 
       State;
@@ -646,7 +644,7 @@ remove_request(
     #req{has_lock = false} = Req,
     State0
 )->
-  release_proxy(Req),
+  kill_proxy(Req),
   State = dequeue(Req, State0),
   next(State);
 
@@ -654,32 +652,22 @@ remove_request(
     #req{has_lock = true} = Req,
     State0
 )->
-  release_proxy(Req),
+  kill_proxy(Req),
   State = unlocked(Req, State0),
   next(State).
 
-%%-----------------------------------------------------------------
-%%  The proxy of a leaving request. A waiting one is withdrawn without
-%%  a verdict: its worker is killed, a client that is its own proxy is
-%%  told, so that it drains the replies. A held one has no proxy
-%%-----------------------------------------------------------------
--spec release_proxy(#req{}) -> ok.
-release_proxy(#req{
-  proxy = undefined
-})->
-  ok;
-release_proxy(#req{
-  ref = Ref,
+-spec kill_proxy(#req{}) -> ok.
+kill_proxy(#req{
   client = ClientPID,
-  proxy = ClientPID,
-  tag = Tag
+  proxy = Proxy
 })->
-  ClientPID ! ?reply(Tag, #withdrawn{ref = Ref}),
-  ok;
-release_proxy(#req{
-  proxy = Worker
-})->
-  exit(Worker, kill),
+  if
+    % A worker (see lock/1)
+    is_pid(Proxy), Proxy =/= ClientPID ->
+      exit(Proxy, kill);
+    true ->
+      ignore
+  end,
   ok.
 
 -spec new_req(#request{}) -> #req{}.
@@ -1207,21 +1195,26 @@ stop_waiting(Req, _State)->
   stop_timer(Req).
 
 %%-----------------------------------------------------------------
-%%  The request has joined the queue. A client holding nothing takes
-%%  no notice, see elock_context:queued_direct/4
+%%  Notify only admitted worker requests. The direct local caller
+%%  has no other node to cancel and does not need a notification.
 %%-----------------------------------------------------------------
--spec notify_queued(#request{}) -> ok.
+-spec notify_queued(#request{}) -> {reference(), #queued{}} | ignore.
 notify_queued(#request{
   ref = Ref,
+  client = ClientPID,
   proxy = Proxy,
   tag = Tag
 })->
-  Proxy ! ?reply(Tag, #queued{
-    ref = Ref,
-    manager = self(),
-    node = node()
-  }),
-  ok.
+  if
+    is_pid(Proxy), Proxy =/= ClientPID ->
+      Proxy ! ?reply(Tag, #queued{
+        ref = Ref,
+        manager = self(),
+        node = node()
+      });
+    true ->
+      ignore
+  end.
 
 -spec start_timer(#req{}, pos_integer() | undefined) -> #req{}.
 start_timer(

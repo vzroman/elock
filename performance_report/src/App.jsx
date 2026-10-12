@@ -244,6 +244,7 @@ function RunConstants({config, dateTime}) {
         <div><dt>Clients / node</dt><dd>{config.clients_per_node.toLocaleString()}</dd></div>
         <div><dt>Transactions / client</dt><dd>{config.transactions_per_client.toLocaleString()}</dd></div>
         <div><dt>Transaction</dt><dd>{transactionLabel(config.transaction)}</dd></div>
+        <div><dt>Keys</dt><dd>{config.unique_keys ? 'unique per lock (pool and order do not apply)' : 'shared pool'}</dd></div>
         <div><dt>Object pool</dt><dd>{config.objects_pool_size.toLocaleString()}</dd></div>
         <div><dt>Read cost</dt><dd>{config.read_ms} ms</dd></div>
         <div><dt>Write cost / operation</dt><dd>{config.write_ms} ms</dd></div>
@@ -255,7 +256,7 @@ function RunConstants({config, dateTime}) {
         <div><dt>Date/time</dt><dd>{dateTime}</dd></div>
       </dl>
       <p className="table-note">Mnesia uses its native retries and backoff; configured timeout and restart delay do not apply.
-        Lock time is measured directly across all attempts and excludes read, commit, unlock and restart work.
+        Lock time is the transaction time less the work of the attempt that committed; aborted attempts, releases and restart delays count as lock time.
         Think time is outside both transaction and lock measurements.</p>
       {config.skipped_paths?.length > 0 && <p className="table-note">
         Skipped: {config.skipped_paths.join(', ')}. Global requires zero reads, sorted order, and the configured lock capacity limit.

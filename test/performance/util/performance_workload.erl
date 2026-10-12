@@ -6,15 +6,22 @@
 size(#{read := Read, update := Update, write := Write})->
   Read + Update + Write.
 
-plan(#{objects_pool_size := Pool, transaction := Transaction, deadlocks := Deadlocks}, State0)->
-  #{read := Read, update := Update, write := Write} = Transaction,
+%% unique_keys: every operation locks a fresh reference, so no key is ever
+%% locked twice by any client on any path. The pool and the order do not
+%% apply, and the random state is left as it is
+plan(#{unique_keys := true, transaction := Transaction}, State)->
+  {[{make_ref(), Operation} || Operation <- operations(Transaction)], State};
+plan(#{unique_keys := false, objects_pool_size := Pool, transaction := Transaction,
+    deadlocks := Deadlocks}, State0)->
   {Keys, State1} = draw(?MODULE:size(Transaction), Pool, #{}, [], State0),
-  Operations = lists:zip(Keys,
-    lists:duplicate(Read, read) ++ lists:duplicate(Update, update) ++ lists:duplicate(Write, write)),
+  Operations = lists:zip(Keys, operations(Transaction)),
   case Deadlocks of
     false-> {lists:sort(Operations), State1};
     true-> shuffle(Operations, State1)
   end.
+
+operations(#{read := Read, update := Update, write := Write})->
+  lists:duplicate(Read, read) ++ lists:duplicate(Update, update) ++ lists:duplicate(Write, write).
 
 %% A sparse partial Fisher-Yates draw: O(number of operations), including when
 %% the transaction uses the complete pool. Retain draw order for mode assignment.

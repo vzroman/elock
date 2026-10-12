@@ -20,7 +20,7 @@
 -define(TAG, ?MODULE).
 -define(SCOPE, performance_scope).
 -define(TABLE, performance_table).
--define(LOCK_US, '$performance_lock_us$').
+-define(WORK_US, '$performance_work_us$').
 -define(RUNS, '$performance_runs$').
 -define(RPC_TIMEOUT, 30000).
 -define(TABLE_TIMEOUT, 10000).
@@ -32,7 +32,10 @@
   node3 => local
 }).
 
-% The measurements of a transaction, summed per client, node and point
+% The measurements of a transaction, summed per client, node and point.
+% The lock time is the transaction time less the work of the attempt
+% that committed: the lock calls, the aborted attempts, the releases
+% and the restart delays, whatever the path spends them on
 -record(sums, {
   transaction_us = 0,
   lock_us = 0,
@@ -301,32 +304,39 @@ transactions(Count, #{think_ms := ThinkMs} = Client, State0, Sums)->
   end,
   transactions(Count - 1, Client, State1, add(Sums, Measured)).
 
-%% The clock and accumulators cover all attempts of the same generated plan.
+%% The clock covers all attempts of the same generated plan. The work left
+%% in the process dictionary is the work of the attempt that committed,
+%% see start_attempt/0.
 transaction(#{path := Path} = Client, Plan)->
-  init_measurements(),
+  put(?RUNS, 0),
   StartedAt = erlang:monotonic_time(microsecond),
   case Path of
     mnesia-> mnesia_retry(fun()-> mnesia_operations(Plan, Client), commit(Client) end);
     _-> attempts(Client, Plan)
   end,
-  #sums{transaction_us = erlang:monotonic_time(microsecond) - StartedAt,
-    lock_us = erase(?LOCK_US), restarts = erase(?RUNS) - 1}.
+  TransactionUs = erlang:monotonic_time(microsecond) - StartedAt,
+  #sums{transaction_us = TransactionUs, lock_us = TransactionUs - erase(?WORK_US),
+    restarts = erase(?RUNS) - 1}.
 
-init_measurements()->
-  put(?LOCK_US, 0),
-  put(?RUNS, 0),
+%% Every attempt starts with no work done, so an aborted attempt leaves
+%% none. The counters are in the process dictionary, which survives
+%% Mnesia's reruns of the callback and the harness retries after a
+%% returned abort.
+start_attempt()->
+  put(?RUNS, get(?RUNS) + 1),
+  put(?WORK_US, 0),
   ok.
 
-%% after executes also for Mnesia's abort exits; process dictionary measurements
-%% survive native callback reruns and returned-abort harness retries.
-timed_lock(Fun)->
+%% The simulated work, a read under its lock or the commit, measured as
+%% the client sees it
+work(Milliseconds)->
   StartedAt = erlang:monotonic_time(microsecond),
-  try Fun()
-  after put(?LOCK_US, get(?LOCK_US) + erlang:monotonic_time(microsecond) - StartedAt)
-  end.
+  delay(Milliseconds),
+  put(?WORK_US, get(?WORK_US) + erlang:monotonic_time(microsecond) - StartedAt),
+  ok.
 
 attempts(#{path := Path, restart_ms := RestartMs} = Client, Plan)->
-  put(?RUNS, get(?RUNS) + 1),
+  start_attempt(),
   Attempt = case Path of elock-> []; global-> start_global_owner(maps:get(nodes, Client)) end,
   case operations(Plan, Client, Attempt) of
     {ok, Held}->
@@ -353,13 +363,13 @@ acquire(elock, Key, Operation, #{nodes := Nodes, timeout := Timeout}, Refs)->
     read-> {[node()], #{is_shared => true, timeout => Timeout}};
     _-> {Nodes, #{timeout => Timeout}}
   end,
-  case timed_lock(fun()-> elock:lock(?SCOPE, Key, LockNodes, Options) end) of
+  case elock:lock(?SCOPE, Key, LockNodes, Options) of
     {ok, Ref}-> {ok, [Ref | Refs]};
     {error, timeout}-> abort;
     {error, {deadlock, _}}-> abort
   end;
 acquire(global, Key, _Operation, #{timeout := Timeout}, Owner)->
-  case timed_lock(fun()-> global_acquire(Owner, Key, Timeout) end) of
+  case global_acquire(Owner, Key, Timeout) of
     ok-> {ok, Owner};
     timeout-> abort
   end.
@@ -372,10 +382,10 @@ cancel(global, Owner)-> cancel_global_owner(Owner).
 
 read(write, _Client)-> ok;
 read(_Operation, #{read_ms := ReadMs})->
-  delay(ReadMs).
+  work(ReadMs).
 
 commit(#{transaction := #{update := Update, write := Write}, write_ms := WriteMs})->
-  delay((Update + Write) * WriteMs).
+  work((Update + Write) * WriteMs).
 
 delay(0)-> ok;
 delay(Milliseconds)-> timer:sleep(Milliseconds).
@@ -383,7 +393,7 @@ delay(Milliseconds)-> timer:sleep(Milliseconds).
 mnesia_retry(Fun)->
   Before = get(?RUNS),
   Result = mnesia:transaction(fun()->
-    put(?RUNS, get(?RUNS) + 1),
+    start_attempt(),
     Fun()
   end),
   %% A returned abort before invoking the callback is still an attempt.
@@ -396,7 +406,7 @@ mnesia_retry(Fun)->
 mnesia_operations([], _Client)-> ok;
 mnesia_operations([{Key, Operation} | Rest], Client)->
   Kind = case Operation of read-> read; _-> write end,
-  _ = timed_lock(fun()-> mnesia:lock({record, ?TABLE, Key}, Kind) end),
+  _ = mnesia:lock({record, ?TABLE, Key}, Kind),
   read(Operation, Client),
   mnesia_operations(Rest, Client).
 

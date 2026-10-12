@@ -51,6 +51,7 @@ function validatePoint(point) {
   ['read', 'update', 'write'].forEach(operation =>
     requireValue(isNonNegativeInteger(point.transaction[operation]), `transaction.${operation}`));
   requireValue(typeof point.deadlocks === 'boolean', 'deadlocks');
+  requireValue(typeof point.unique_keys === 'boolean', 'unique_keys');
   validateNodes(point.nodes);
   requireValue(isNonNegativeInteger(point.elapsed_ms), 'elapsed_ms');
   rateFields.forEach(field =>

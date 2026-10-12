@@ -30,8 +30,14 @@ their existing meaning. From the repository root:
 ./rebar3 ct --spec test/performance/test.spec
 ```
 
-`transaction => #{read => R, update => U, write => W}` selects exactly `R + U + W`
-distinct keys from `objects_pool_size`, shared across every client and node.
+`transaction => #{read => R, update => U, write => W}` gives every transaction
+`R + U + W` operations on distinct keys. With `unique_keys => false` the keys are
+drawn from `objects_pool_size`, shared across every client and node. With
+`unique_keys => true` every operation locks a fresh reference: no key is ever
+locked twice, by any client or on any path, so there is no contention, no
+deadlock and no restart on any path. `objects_pool_size` and `deadlocks` do not
+apply then, the seeded state is not consumed, and the references differ between
+paths, which is immaterial since nothing shares them.
 Reads take shared locks; updates and writes take exclusive locks. Reads and
 updates pay `read_ms` immediately under their lock. After all acquisitions,
 `(U + W) * write_ms` is paid once while all locks are held, then locks release.
@@ -66,12 +72,16 @@ The report compares paths directly and displays operation counts, pool, costs,
 timeout, restart delay, think time, seed and order. Historical result formats are not
 converted or supported.
 
-Lock time share is `100 * sum(acquisition durations) / sum(transaction durations)`.
-Acquisition time includes failed calls and every attempt. Transaction time starts
-after plan generation and includes reads, commit delay, release, and retry work.
-Think time is outside both transaction and lock measurements. Throughput and
-resource measurements retain the overall run window, which includes plan
-generation and think time.
+Lock time share is `100 * sum(lock durations) / sum(transaction durations)`.
+The lock duration of a transaction is its transaction duration less its work.
+The work is the measured duration of the reads and the commit delay of the
+attempt that committed; an aborted attempt does no work. Everything else is
+lock time: the lock calls, the aborted attempts with their reads, the releases,
+the restart delay, and for Mnesia its own restart backoff and transaction
+engine overhead. Transaction time starts after plan generation and ends after
+release. Think time is outside both transaction and lock measurements.
+Throughput and resource measurements retain the overall run window, which
+includes plan generation and think time.
 
 Report checks:
 

@@ -36,6 +36,7 @@ function validPoint(overrides = {}) {
     think_ms: 0,
     seed: 12345,
     deadlocks: false,
+    unique_keys: false,
     write_ms: 10,
     elapsed_ms: 36,
     transactions: 12,
@@ -87,7 +88,7 @@ async function writeMarker(root, run, content) {
 function validMarker(pid) {
   const {path: pointPath, nodes, clients_per_node, transactions_per_client,
     transaction, objects_pool_size, read_ms, timeout, restart_ms, think_ms, seed, deadlocks,
-    write_ms} = validPoint();
+    unique_keys, write_ms} = validPoint();
   return {
     path: pointPath,
     nodes,
@@ -101,6 +102,7 @@ function validMarker(pid) {
     think_ms,
     seed,
     deadlocks,
+    unique_keys,
     write_ms,
     index: 7,
     total: 28,
@@ -232,6 +234,27 @@ test('rejects a point without a boolean deadlocks', async () => {
       'invalid performance point field: deadlocks',
       'invalid performance point field: deadlocks',
       'invalid performance point field: deadlocks'
+    ]);
+  });
+});
+
+test('rejects a point without a boolean unique_keys', async () => {
+  await withRoot('unique_keys', async (root) => {
+    // A point file of the format before the unique_keys setting
+    const {unique_keys: _uniqueKeys, ...older} = validPoint();
+    await writeRun(root, 'ct_run.unique_keys', {
+      'older.json': older,
+      'word.json': validPoint({unique_keys: 'true'}),
+      'number.json': validPoint({unique_keys: 1})
+    });
+
+    const result = await scanRuns(root);
+
+    assert.equal(result.runs[0].points.length, 0);
+    assert.deepEqual(errorFields(result.runs[0]), [
+      'invalid performance point field: unique_keys',
+      'invalid performance point field: unique_keys',
+      'invalid performance point field: unique_keys'
     ]);
   });
 });

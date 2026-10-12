@@ -401,7 +401,7 @@ wait_verdict(
           },
           wait_verdict(Ref, Waiting);
         Error ->
-          cancel(Waiting0#waiting{pending = Pending}),
+          cancel(Ref, Waiting0#waiting{pending = Pending}),
           Error
       end;
     #queued{ref = Ref, manager = Manager, node = Node} = QueuedMessage->
@@ -416,7 +416,7 @@ wait_verdict(
           wait_verdict(Ref, Waiting0)
       end;
     {'DOWN', GraphMon, process, Graph, #deadlock{ref = Ref, winner = Winner}}->
-      cancel(Waiting0),
+      cancel(Ref, Waiting0),
       {error, {deadlock, Winner}}
 
   end;
@@ -433,9 +433,7 @@ wait_verdict(
   erlang:demonitor(GraphMon, [flush]),
   {ok, Nodes}.
 
--spec cancel(#waiting{}) -> ok | true.
-cancel(#waiting{
-  ref = Ref,
+cancel(Ref, #waiting{
   nodes = Nodes0,
   pending = Pending,
   queued = Queued,

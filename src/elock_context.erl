@@ -8,6 +8,7 @@
 -moduledoc false.
 
 -include("elock.hrl").
+-include("elock_manager.hrl").
 
 %%=================================================================
 %%	API
@@ -274,8 +275,20 @@ held_locks(_NoContext)->
   pending :: pending_workers(), % the workers that have not returned yet
   nodes :: node_managers(),     % the grants so far
   queued :: queued_managers(),  % every manager reported before a node returns
-  graph :: pid(),
-  graph_monitor :: reference()
+  holds :: held_locks(),        % the context's holds at entry
+  birth :: integer(),
+  age :: non_neg_integer(),
+  graph :: pid() | undefined,   % spawned on the first #queued{}
+  graph_monitor :: reference() | undefined
+}).
+
+% The local node alone: the client is its own proxy
+-record(direct,{
+  holds :: held_locks(),        % the context's holds at entry
+  birth :: integer(),
+  age :: non_neg_integer(),
+  graph :: pid() | undefined,   % spawned on #queued{} if the client holds anything
+  graph_monitor :: reference() | undefined
 }).
 
 -record(graph,{
@@ -289,26 +302,26 @@ held_locks(_NoContext)->
   ref :: reference()
 }).
 
-% The local node alone: the client is the proxy itself
+% The local node alone: the client is its own proxy, no worker. A graph
+% worker only if the request is queued and the client holds something
 -spec run_request(reference(), integer(), non_neg_integer(), held_locks(),
   nonempty_list(node()), #request{}) -> request_result().
 run_request(
-    _Ref,
-    _Birth,
-    _Age,
+    Ref,
+    Birth,
+    Age,
     Holds,
     [Node],
     Request
-) when Node =:= node(), map_size(Holds) =:=0 ->
-  case elock_manager:lock(Request) of
-    {ok, Manager} ->
-      {ok, #{ Node => #node{manager = Manager} }};
-    Error ->
-      Error
-  end;
+) when Node =:= node() ->
+  direct_request(Ref, #direct{
+    holds = Holds,
+    birth = Birth,
+    age = Age
+  }, Request);
 % A worker per node sends its result tagged with Ref. A remote grant
 % keeps the worker as its holder, monitoring the client locally until
-% release. The client forwards #queued{} to the graph worker meanwhile
+% release. The graph worker is spawned on the first #queued{}
 run_request(
     Ref,
     Birth,
@@ -339,19 +352,6 @@ run_request(
       #{},
       Nodes
     ),
-  {Graph, GraphMon} = spawn_monitor(fun()->
-    init_graph(#graph{
-      client = Client,
-      scope = Scope,
-      term = Term,
-      nodes = [],
-      holds = Holds,
-      birth = Birth,
-      age = Age,
-      ref = Ref
-    })
-  end),
-
   wait_verdict(Ref, #waiting{
     ref = Ref,
     scope = Scope,
@@ -359,8 +359,9 @@ run_request(
     pending = Pending,
     nodes = #{},
     queued = #{},
-    graph = Graph,
-    graph_monitor = GraphMon
+    holds = Holds,
+    birth = Birth,
+    age = Age
   }).
 
 
@@ -384,7 +385,7 @@ wait_verdict(
       {Holder, Pending} = maps:take(Node, Pending0),
       case NodeResult of
         {ok, {ok,Manager}} ->
-          Graph ! {add, Ref, Node, Manager},
+          graph_add(Ref, Graph, Node, Manager),
           Queued = maps:filter(
             fun(_Manager, N)->
               N =/= Node
@@ -408,8 +409,9 @@ wait_verdict(
       % A result may overtake the notification on its way from a remote proxy.
       case is_map_key(Node, Pending0) of
         true->
-          Graph ! QueuedMessage,
-          wait_verdict(Ref, Waiting0#waiting{
+          Waiting = #waiting{graph = Graph1} = ensure_graph(Ref, Waiting0),
+          Graph1 ! QueuedMessage,
+          wait_verdict(Ref, Waiting#waiting{
             queued = Queued0#{ Manager => Node }
           });
         false->
@@ -429,8 +431,7 @@ wait_verdict(
       graph_monitor = GraphMon
     }
 )->
-  Graph ! {remove, Ref},
-  erlang:demonitor(GraphMon, [flush]),
+  stop_graph(Ref, Graph, GraphMon),
   {ok, Nodes}.
 
 cancel(Ref, #waiting{
@@ -442,9 +443,7 @@ cancel(Ref, #waiting{
 })->
   release(Nodes0, Ref),
   unlock_queued(Queued, Ref),
-
-  Graph ! {remove, Ref},
-  erlang:demonitor(GraphMon, [flush]),
+  stop_graph(Ref, Graph, GraphMon),
 
   % A local worker is also its proxy and withdrawal may kill it
   % before it can reply. Remote workers report their proxy's exit.
@@ -531,8 +530,233 @@ kill_holder(undefined)-> ok;
 kill_holder(Holder)-> exit(Holder, kill).
 
 %%=================================================================
+%%  The local node alone: the client is its own proxy
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  Every clause of the receives matches Ref, a plain argument from
+%%  make_ref/0 in lock/4: the replies and the manager monitor are
+%%  tagged with it, the graph verdict carries it
+%%-----------------------------------------------------------------
+-spec direct_request(reference(), #direct{}, #request{}) -> request_result().
+direct_request(Ref, Direct0, Request)->
+  case elock_manager:take(Request) of
+    {ok, Manager}->
+      direct_locked(Ref, Direct0, Manager);
+    {wait, Manager, Ticket}->
+      % A manager that exits takes the request with it and never answers
+      MonitorRef = erlang:monitor(process, Manager, [{tag, Ref}]),
+      Manager ! Request#request{ ticket = Ticket, proxy = self(), tag = Ref },
+      {Verdict, Direct} = direct_verdict(Ref, Manager, Direct0, Request),
+      erlang:demonitor(MonitorRef, [flush]),
+      case Verdict of
+        {ok, Manager}->
+          direct_locked(Ref, Direct, Manager);
+        retry->
+          direct_request(Ref, Direct, Request);
+        Error->
+          #direct{graph = Graph, graph_monitor = GraphMon} = Direct,
+          stop_graph(Ref, Graph, GraphMon),
+          Error
+      end
+  end.
+
+-spec direct_locked(reference(), #direct{}, pid()) -> request_result().
+direct_locked(Ref, #direct{graph = Graph, graph_monitor = GraphMon}, Manager)->
+  stop_graph(Ref, Graph, GraphMon),
+  {ok, #{ node() => #node{manager = Manager} }}.
+
+-spec direct_verdict(reference(), pid(), #direct{}, #request{}) ->
+  {request_result() | retry, #direct{}}.
+direct_verdict(
+    Ref,
+    Manager,
+    #direct{
+      graph = Graph,
+      graph_monitor = GraphMon
+    } = Direct,
+    #request{
+      scope = Scope,
+      term = Term
+    } = Request
+)->
+  receive
+    ?reply(Ref, #locked{})->
+      {{ok, Manager}, Direct};
+    ?reply(Ref, #queued{} = Queued)->
+      direct_verdict(Ref, Manager, queued_direct(Ref, Direct, Queued, Request), Request);
+    ?reply(Ref, #deadlock{winner = Winner})->
+      {{error, {deadlock, Winner}}, Direct};
+    ?reply(Ref, #timeout{})->
+      {{error, timeout}, Direct};
+    ?reply(Ref, #retry{})->
+      {retry, Direct};
+    {Ref, _MonitorRef, process, Manager, _Reason}->
+      % A crashed manager leaves its entry behind
+      ets:match_delete(Scope, {Term, Manager, '_'}),
+      {retry, Direct};
+    {'DOWN', GraphMon, process, Graph, #deadlock{ref = Ref, winner = Winner}}->
+      withdraw(Ref, Manager, Request),
+      {{error, {deadlock, Winner}}, Direct#direct{
+        graph = undefined,
+        graph_monitor = undefined
+      }}
+  end.
+
+%%-----------------------------------------------------------------
+%%  A client holding nothing can not be in a cycle, and a request for
+%%  one node gains no holds while it waits: the notification is taken
+%%  and nothing is spawned. A later #queued{}, after a retry, goes to
+%%  the graph worker already running
+%%-----------------------------------------------------------------
+-spec queued_direct(reference(), #direct{}, #queued{}, #request{}) -> #direct{}.
+queued_direct(
+    _Ref,
+    #direct{
+      holds = Holds
+    } = Direct,
+    _Queued,
+    _Request
+) when map_size(Holds) =:= 0->
+  Direct;
+queued_direct(
+    Ref,
+    #direct{
+      graph = undefined,
+      holds = Holds,
+      birth = Birth,
+      age = Age
+    } = Direct,
+    Queued,
+    #request{
+      scope = Scope,
+      term = Term
+    }
+)->
+  {Graph, GraphMon} = spawn_graph(Ref, Scope, Term, Holds, Birth, Age),
+  Graph ! Queued,
+  Direct#direct{
+    graph = Graph,
+    graph_monitor = GraphMon
+  };
+queued_direct(
+    _Ref,
+    #direct{
+      graph = Graph
+    } = Direct,
+    Queued,
+    _Request
+)->
+  Graph ! Queued,
+  Direct.
+
+%%-----------------------------------------------------------------
+%%  The request has lost: it is withdrawn and exactly one final reply
+%%  is drained. The manager may have granted it already, or may not
+%%  have taken it in yet and ignored the #unlock{}: on a grant the
+%%  #unlock{} is sent again, ignored if it has released the lock
+%%  already, and on an admission it is repeated
+%%-----------------------------------------------------------------
+-spec withdraw(reference(), pid(), #request{}) -> ok.
+withdraw(Ref, Manager, Request)->
+  Manager ! #unlock{ref = Ref},
+  withdrawn(Ref, Manager, Request).
+
+-spec withdrawn(reference(), pid(), #request{}) -> ok.
+withdrawn(
+    Ref,
+    Manager,
+    #request{
+      scope = Scope,
+      term = Term
+    } = Request
+)->
+  receive
+    ?reply(Ref, #withdrawn{})->
+      ok;
+    ?reply(Ref, #locked{})->
+      Manager ! #unlock{ref = Ref},
+      ok;
+    ?reply(Ref, #queued{})->
+      Manager ! #unlock{ref = Ref},
+      withdrawn(Ref, Manager, Request);
+    ?reply(Ref, #timeout{})->
+      ok;
+    ?reply(Ref, #retry{})->
+      ok;
+    ?reply(Ref, #deadlock{})->
+      ok;
+    {Ref, _MonitorRef, process, Manager, _Reason}->
+      ets:match_delete(Scope, {Term, Manager, '_'}),
+      ok
+  end.
+
+%%=================================================================
 %%  Graph worker
 %%=================================================================
+%%-----------------------------------------------------------------
+%%  Spawned on the first #queued{} with the holds of the context and
+%%  the grants so far; the later grants are reported to it
+%%-----------------------------------------------------------------
+-spec ensure_graph(reference(), #waiting{}) -> #waiting{}.
+ensure_graph(
+    Ref,
+    #waiting{
+      graph = undefined,
+      scope = Scope,
+      term = Term,
+      nodes = Nodes,
+      holds = Holds0,
+      birth = Birth,
+      age = Age
+    } = Waiting
+)->
+  Holds = maps:fold(
+    fun(Node, #node{manager = Manager}, Acc)->
+      Acc#{ {Scope, Term, Node} => Manager }
+    end,
+    Holds0,
+    Nodes
+  ),
+  {Graph, GraphMon} = spawn_graph(Ref, Scope, Term, Holds, Birth, Age),
+  Waiting#waiting{
+    graph = Graph,
+    graph_monitor = GraphMon
+  };
+ensure_graph(_Ref, Waiting)->
+  Waiting.
+
+-spec graph_add(reference(), pid() | undefined, node(), pid()) -> ok.
+graph_add(_Ref, undefined, _Node, _Manager)->
+  ok;
+graph_add(Ref, Graph, Node, Manager)->
+  Graph ! {add, Ref, Node, Manager},
+  ok.
+
+-spec stop_graph(reference(), pid() | undefined, reference() | undefined) -> ok.
+stop_graph(_Ref, undefined, _GraphMon)->
+  ok;
+stop_graph(Ref, Graph, GraphMon)->
+  Graph ! {remove, Ref},
+  erlang:demonitor(GraphMon, [flush]),
+  ok.
+
+-spec spawn_graph(reference(), atom(), term(), held_locks(), integer(), non_neg_integer()) ->
+  {pid(), reference()}.
+spawn_graph(Ref, Scope, Term, Holds, Birth, Age)->
+  Client = self(),
+  spawn_monitor(fun()->
+    init_graph(#graph{
+      client = Client,
+      scope = Scope,
+      term = Term,
+      nodes = [],
+      holds = Holds,
+      birth = Birth,
+      age = Age,
+      ref = Ref
+    })
+  end).
+
 -spec init_graph(#graph{}) -> ok.
 init_graph(#graph{
   client = Client

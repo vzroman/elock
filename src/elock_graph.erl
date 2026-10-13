@@ -181,8 +181,15 @@ graph_loop(#graph{
     {remove, Ref}->
       remove_edges(Nodes0, Graph);
     {add, Ref, Node, Manager}->
-      remove_edges([Node], Graph),
-      Nodes = ordsets:del_element(Node, Nodes0),
+      % Only a node that reported #queued{} has a row to remove
+      Nodes =
+        case ordsets:is_element(Node, Nodes0) of
+          true->
+            remove_edges([Node], Graph),
+            ordsets:del_element(Node, Nodes0);
+          false->
+            Nodes0
+        end,
       Holds = #{ {Scope, Term, Node} => Manager },
       add_edges(Nodes, Holds, Graph),
       graph_loop(Graph#graph{

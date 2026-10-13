@@ -32,6 +32,17 @@
   node :: node()
 }).
 
+-record(graph,{
+  client :: pid(),                % application client monitored by this helper
+  scope :: atom(),
+  term :: term(),
+  nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
+  holds :: held_locks(),          % the context and the grants so far
+  birth :: integer(),             % priority fixed for the life of the context
+  age :: non_neg_integer(),       % context age in ms, fixed at lock entry
+  ref :: reference()
+}).
+
 % Client -> manager: the answer to #queued{} and every later grant
 -record(add_held_locks,{
   ref :: reference(),

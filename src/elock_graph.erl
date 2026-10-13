@@ -70,6 +70,9 @@
   handle_probe/1
 ]).
 
+-export([
+  init_graph/2
+]).
 %%=================================================================
 %%  Client graph worker and walker protocol is in elock.hrl
 %%=================================================================
@@ -134,6 +137,115 @@ handle_nodedown(Node)->
   }]),
   ok.
 
+-spec init_graph(#queued{}, #graph{}) -> ok.
+init_graph(
+    #queued{
+      node = Node
+    },
+    #graph{
+      client = Client
+    } = Graph
+)->
+  erlang:monitor(process, Client),
+  graph_loop(queued(Node, Graph)).
+
+%% The request waits on Node: the holds are published there
+-spec queued(node(), #graph{}) -> #graph{}.
+queued(
+    Node,
+    #graph{
+      nodes = Nodes0,
+      holds = Holds
+    } = Graph
+)->
+  add_edges([Node], Holds, Graph),
+  Graph#graph{
+    nodes = ordsets:add_element(Node, Nodes0)
+  }.
+
+-spec graph_loop(#graph{}) -> ok.
+graph_loop(#graph{
+  ref = Ref,
+  client = Client,
+  scope = Scope,
+  term = Term,
+  nodes = Nodes0,
+  holds = Holds0
+} = Graph)->
+  receive
+    #queued{ref = Ref, node = Node}->
+      graph_loop(queued(Node, Graph));
+    #deadlock{ ref = Ref } = DeadLock->
+      remove_edges(Nodes0, Graph),
+      exit(DeadLock);
+    {remove, Ref}->
+      remove_edges(Nodes0, Graph);
+    {add, Ref, Node, Manager}->
+      remove_edges([Node], Graph),
+      Nodes = ordsets:del_element(Node, Nodes0),
+      Holds = #{ {Scope, Term, Node} => Manager },
+      add_edges(Nodes, Holds, Graph),
+      graph_loop(Graph#graph{
+        nodes = Nodes,
+        holds = maps:merge(Holds0, Holds)
+      });
+    {'DOWN', _MonRef, process, Client, _Reason}->
+      remove_edges(Nodes0, Graph)
+  end.
+
+%%-----------------------------------------------------------------
+%%  A new waiter gets all the holds; existing waiters get each later grant.
+%%  Sequential calls finish publication before the next update or removal.
+%%  Unreachable nodes are reported through the lock request path
+%%-----------------------------------------------------------------
+-spec add_edges([node()], held_locks(), #graph{}) -> ok.
+add_edges(
+    Nodes,
+    Holds,
+    #graph{
+      scope = Scope,
+      term = Term,
+      birth = Birth,
+      age = Age,
+      ref = Ref
+    }
+) when map_size(Holds) > 0->
+  AddEdges = #add_edges{
+    ref = Ref,
+    birth = Birth,
+    age = Age,
+    client = self(),
+    holds = Holds
+  },
+  lists:foreach(
+    fun(Node)->
+      ecall:call(Node, ?MODULE, handle_add_edges, [
+        AddEdges#add_edges{ lock = {Scope, Term, Node} }
+      ])
+    end,
+    Nodes
+  );
+add_edges(_Nodes, _Holds, _Graph)->
+  ok.
+
+%%-----------------------------------------------------------------
+%%  Terminal removal follows completed additions for each waiting copy
+%%-----------------------------------------------------------------
+-spec remove_edges([node()], #graph{}) -> ok.
+remove_edges(Nodes, #graph{
+  scope = Scope,
+  term = Term,
+  ref = Ref
+})->
+  RemoveEdges = #remove_edges{ref = Ref},
+  lists:foreach(
+    fun(Node)->
+      ecall:cast(Node, ?MODULE, handle_remove_edges, [
+        RemoveEdges#remove_edges{ lock = {Scope, Term, Node} }
+      ])
+    end,
+    Nodes
+  ).
 %%=================================================================
 %%  The edges
 %%=================================================================

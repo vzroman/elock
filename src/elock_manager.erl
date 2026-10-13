@@ -31,7 +31,7 @@
 %%	API
 %%=================================================================
 -export([
-  lock/1
+  lock/2
 ]).
 
 -type holder() :: {boolean(), pid()}.
@@ -50,7 +50,8 @@
 
 %%-----------------------------------------------------------------
 %%  The verdicts. #retry{}: the ticket is void, take a new one.
-%%  #deadlock{} is in elock.hrl
+%%  #deadlock{} is in elock.hrl. #withdrawn{} answers the unlock of a
+%%  direct waiter (see release_proxy/1)
 %%-----------------------------------------------------------------
 -record(locked,{
   ref :: reference()
@@ -59,6 +60,9 @@
   ref :: reference()
 }).
 -record(retry,{
+  ref :: reference()
+}).
+-record(withdrawn,{
   ref :: reference()
 }).
 
@@ -75,7 +79,8 @@ lock(
     #request{
       scope = Scope,
       term = Term
-    } = Request
+    } = Request,
+    OnQueued
 )->
   case ets:update_counter(Scope, Term, {3,1}, {Term,0,0}) of
     1->
@@ -89,16 +94,16 @@ lock(
           % answers. The monitor ref is also the tag of the replies
           MonitorRef = erlang:monitor(process, Manager),
           Manager ! Request#request{ ticket = Ticket, proxy = self(), tag = MonitorRef },
-          Verdict = wait_verdict(MonitorRef, Manager, Request),
+          Verdict = wait_verdict(MonitorRef, Manager, OnQueued, Request),
           erlang:demonitor(MonitorRef, [flush]),
           case Verdict of
             retry ->
-              lock(Request);
+              lock(Request, OnQueued);
             _->
               Verdict
           end;
         _->
-          lock(Request)
+          lock(Request, OnQueued)
       end
   end.
 
@@ -111,23 +116,33 @@ lock(
 wait_verdict(
     MonitorRef,
     Manager,
+    OnQueued,
     #request{
       ref = Ref,
       scope = Scope,
-      term = Term,
-      client = ClientPID
+      term = Term
     } = Request
 )->
   receive
     ?reply(MonitorRef, #locked{})->
       {ok, Manager};
     ?reply(MonitorRef, #queued{ref = Ref} = Queued)->
-      ecall:send(ClientPID, Queued),
-      wait_verdict(MonitorRef, Manager, Request);
+      OnDeadlock =
+        fun(Deadlock)-> exit({MonitorRef, Deadlock}) end,
+      OnQueued(Queued, OnDeadlock),
+      wait_verdict(MonitorRef, Manager, OnQueued, Request);
     ?reply(MonitorRef, #deadlock{winner = Winner})->
       {error, {deadlock, Winner}};
     ?reply(MonitorRef, #timeout{})->
       {error, timeout};
+    {'DOWN', _GraphMon, process, _Graph, {MonitorRef, #deadlock{winner = Winner}}}->
+      % The graph worker of a direct request has lost. Exactly one
+      % reply follows the unlock: #withdrawn{} for a waiter, or the
+      % #locked{} (released by this unlock) or #timeout{} sent before
+      % the manager took the unlock
+      Manager ! #unlock{ref = Ref},
+      receive ?reply(MonitorRef, _Reply)-> ok end,
+      {error, {deadlock, Winner}};
     ?reply(MonitorRef, #retry{})->
       retry;
     {'DOWN', MonitorRef, process, Manager, _Reason}->
@@ -476,7 +491,7 @@ handle_unlock(
       % Not unlocked: a new ticket is taken and the state is reset. The
       % reset state has lost the leaving client's monitor, drop it here
       Req = #req{client = Client} = maps:get(Ref, Requests),
-      kill_proxy(Req),
+      release_proxy(Req),
       demonitor_client(maps:get(Client, Clients)),
 
       State;
@@ -644,7 +659,7 @@ remove_request(
     #req{has_lock = false} = Req,
     State0
 )->
-  kill_proxy(Req),
+  release_proxy(Req),
   State = dequeue(Req, State0),
   next(State);
 
@@ -652,18 +667,26 @@ remove_request(
     #req{has_lock = true} = Req,
     State0
 )->
-  kill_proxy(Req),
+  release_proxy(Req),
   State = unlocked(Req, State0),
   next(State).
 
--spec kill_proxy(#req{}) -> ok.
-kill_proxy(#req{
+%%-----------------------------------------------------------------
+%%  A direct waiter withdraws itself after its graph verdict and waits
+%%  for the answer (see wait_verdict/4); a dead one does not read it.
+%%  A worker is killed. A holder has no proxy
+%%-----------------------------------------------------------------
+-spec release_proxy(#req{}) -> ok.
+release_proxy(#req{
+  ref = Ref,
   client = ClientPID,
-  proxy = Proxy
+  proxy = Proxy,
+  tag = Tag
 })->
   if
-    % A worker (see lock/1)
-    is_pid(Proxy), Proxy =/= ClientPID ->
+    Proxy =:= ClientPID ->
+      Proxy ! ?reply(Tag, #withdrawn{ref = Ref});
+    is_pid(Proxy) ->
       exit(Proxy, kill);
     true ->
       ignore
@@ -1201,12 +1224,12 @@ stop_waiting(Req, _State)->
 -spec notify_queued(#request{}) -> {reference(), #queued{}} | ignore.
 notify_queued(#request{
   ref = Ref,
-  client = ClientPID,
   proxy = Proxy,
-  tag = Tag
+  tag = Tag,
+  notify_queued = NotifyQueued
 })->
   if
-    is_pid(Proxy), Proxy =/= ClientPID ->
+    NotifyQueued =:= true, is_pid(Proxy) ->
       Proxy ! ?reply(Tag, #queued{
         ref = Ref,
         manager = self(),

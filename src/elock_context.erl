@@ -72,15 +72,18 @@ lock(Scope, Term, Nodes, Options)->
   % System time can move backwards; age is fixed for this acquisition.
   Age = max(1, (Now - Birth) div 1000),
   Holds = held_locks(Context),
+  RequestNodes = lists:usort(Nodes),
+  NotifyQueued = length(RequestNodes)>1 orelse map_size(Holds)>0,
   Request = #request{
     ref = Ref,
     scope = Scope,
     term = Term,
     client = self(),
     timeout = Timeout,
-    shared = IsShared
+    shared = IsShared,
+    notify_queued = NotifyQueued
   },
-  RequestNodes = lists:usort(Nodes),
+
   % Ref is passed as a plain argument for the receive marker optimization
   % (see wait_verdict/2)
   case run_request(Ref, Birth, Age, Holds, RequestNodes, Request) of
@@ -285,14 +288,40 @@ held_locks(_NoContext)->
 -spec run_request(reference(), integer(), non_neg_integer(), held_locks(),
   nonempty_list(node()), #request{}) -> request_result().
 run_request(
-    _Ref,
-    _Birth,
-    _Age,
+    Ref,
+    Birth,
+    Age,
     Holds,
     [Node],
-    Request
-) when Node =:= node(), map_size(Holds) =:=0 ->
-  case elock_manager:lock(Request) of
+    #request{
+      scope = Scope,
+      term = Term
+    } = Request
+) when Node =:= node() ->
+  OnQueued =
+    fun(#queued{manager = Manager} = Queued, OnDeadlock)->
+      #waiting{
+        graph = Graph,
+        graph_monitor = GraphMon
+      } = spawn_graph(Ref, Queued, OnDeadlock, #waiting{
+        ref = Ref,
+        scope = Scope,
+        term = Term,
+        pending = #{},
+        nodes = #{},
+        queued = #{ Manager => Node },
+        holds = Holds,
+        birth = Birth,
+        age = Age
+      }),
+      put({?MODULE, graph}, {Graph, GraphMon})
+    end,
+  Result = elock_manager:lock(Request, OnQueued),
+  case erase({?MODULE, graph}) of
+    {Graph, GraphMon}-> stop_graph(Ref, Graph, GraphMon);
+    _-> ignore
+  end,
+  case Result of
     {ok, Manager} ->
       {ok, #{ Node => #node{manager = Manager} }};
     Error ->
@@ -313,11 +342,15 @@ run_request(
     } = Request
 )->
   Client = self(),
+  OnQueued =
+    fun(Queued, _ManagerMon)->
+      ecall:send(Client, Queued)
+    end,
   Pending =
     lists:foldl(
       fun(N, Acc)->
         Holder = spawn(fun()->
-          Result = ecall_connection:call(N, elock_manager, lock, [Request]),
+          Result = ecall_connection:call(N, elock_manager, lock, [Request, OnQueued]),
           Client ! {Ref, N, Result},
           case Result of
             {ok, {ok, Manager}} when N =/= node()->
@@ -391,7 +424,8 @@ wait_verdict(
           Waiting =
             case Graph of
               undefined->
-                spawn_graph(Ref, QueuedMessage, Waiting0);
+                OnDeadlock = fun(Deadlock)->exit(Deadlock) end,
+                spawn_graph(Ref, QueuedMessage, OnDeadlock, Waiting0);
               _->
                 Graph ! QueuedMessage,
                 Waiting0
@@ -522,10 +556,10 @@ kill_holder(Holder)-> exit(Holder, kill).
 %%  holds of the context and the grants so far; the later grants are
 %%  reported to it
 %%-----------------------------------------------------------------
--spec spawn_graph(reference(), #queued{}, #waiting{}) -> #waiting{}.
 spawn_graph(
     Ref,
     QueuedMessage,
+    OnDeadlock,
     #waiting{
       scope = Scope,
       term = Term,
@@ -552,7 +586,8 @@ spawn_graph(
       holds = Holds,
       birth = Birth,
       age = Age,
-      ref = Ref
+      ref = Ref,
+      on_deadlock = OnDeadlock
     })
   end),
   Waiting#waiting{

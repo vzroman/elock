@@ -18,7 +18,8 @@
   proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
-  timeout :: pos_integer() | undefined
+  timeout :: pos_integer() | undefined,
+  notify_queued
 }).
 
 -record(unlock,{
@@ -40,7 +41,8 @@
   holds :: held_locks(),          % the context and the grants so far
   birth :: integer(),             % priority fixed for the life of the context
   age :: non_neg_integer(),       % context age in ms, fixed at lock entry
-  ref :: reference()
+  ref :: reference(),
+  on_deadlock
 }).
 
 % Client -> manager: the answer to #queued{} and every later grant

@@ -6,8 +6,7 @@ const positiveIntegerFields = [
   'clients_per_node',
   'transactions_per_client',
   'objects_pool_size',
-  'transactions',
-  'locks'
+  'transactions'
 ];
 const costFields = ['read_ms', 'write_ms', 'restart_ms', 'pacing_ms'];
 const rateFields = [
@@ -43,6 +42,8 @@ function validatePoint(point) {
   requireValue(paths.has(point.path), 'path');
   positiveIntegerFields.forEach(field =>
     requireValue(isPositiveInteger(point[field]), field));
+  // A workload without operations locks nothing
+  requireValue(isNonNegativeInteger(point.locks), 'locks');
   costFields.forEach(field =>
     requireValue(isNonNegativeInteger(point[field]), field));
   requireValue(Number.isInteger(point.seed), 'seed');

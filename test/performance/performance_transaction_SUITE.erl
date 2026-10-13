@@ -39,7 +39,13 @@
 -record(sums, {
   transaction_us = 0,
   lock_us = 0,
-  restarts = 0
+  restarts = 0,
+  %% TEMPORARY metrics, to be removed: the longest transaction, the rests
+  %% as planned and as slept, the largest overshoot of a rest
+  transaction_max_us = 0,
+  rest_planned_us = 0,
+  rest_slept_us = 0,
+  rest_overshoot_max_us = 0
 }).
 
 %%=================================================================
@@ -163,11 +169,12 @@ run_point(#{clients_per_node := Clients, transactions_per_client := PerClient} =
   ]),
   ok = await_runners_ready(map_size(Runners), RunRef, Runners),
   [Runner ! {?TAG, RunRef, start} || Runner := _ <- Runners],
-  StartedAt = erlang:monotonic_time(microsecond),
-  {Sums, Metrics} = await_runners(RunRef, Runners, #sums{}, #{}),
-  ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
+  RunStartedAt = erlang:monotonic_time(microsecond),
+  {Sums, ElapsedUs, RateSum, Metrics} = await_runners(RunRef, Runners, #sums{}, 0, 0.0, #{}),
+  RunUs = erlang:monotonic_time(microsecond) - RunStartedAt,
   Transactions = map_size(Nodes) * Clients * PerClient,
-  Result = result(Point, ElapsedUs, Transactions, Sums, Metrics),
+  ClientRate = RateSum / (map_size(Nodes) * Clients),
+  Result = result(Point, ElapsedUs, RunUs, Transactions, ClientRate, Sums, Metrics),
   performance_metrics:point(Config, Result).
 
 start_runner(Name, Node, Controller, RunRef, Clients, Client)->
@@ -188,14 +195,19 @@ await_runners_ready(Count, RunRef, Runners)->
       runner_failed(Runner, Reason, Runners)
   end.
 
-await_runners(_RunRef, Runners, Sums, Metrics) when map_size(Runners) =:= 0->
-  {Sums, Metrics};
-await_runners(RunRef, Runners, Sums, Metrics)->
+%%  The elapsed time of the point is the longest of the nodes: the
+%%  runners are started together and every node measures its own
+%%  clients on its own clock. The rates of the clients are summed
+%%  over the nodes for their mean
+await_runners(_RunRef, Runners, Sums, ElapsedUs, RateSum, Metrics) when map_size(Runners) =:= 0->
+  {Sums, ElapsedUs, RateSum, Metrics};
+await_runners(RunRef, Runners, Sums, ElapsedUs, RateSum, Metrics)->
   receive
-    {?TAG, RunRef, completed, Runner, RunnerSums, NodeMetrics}->
+    {?TAG, RunRef, completed, Runner, RunnerSums, NodeElapsedUs, NodeRateSum, NodeMetrics}->
       {{Name, MonRef}, Rest} = maps:take(Runner, Runners),
       erlang:demonitor(MonRef, [flush]),
-      await_runners(RunRef, Rest, add(Sums, RunnerSums), Metrics#{Name => NodeMetrics});
+      await_runners(RunRef, Rest, add(Sums, RunnerSums), max(ElapsedUs, NodeElapsedUs),
+        RateSum + NodeRateSum, Metrics#{Name => NodeMetrics#{elapsed_ms => NodeElapsedUs div 1000}});
     {'DOWN', _MonRef, process, Runner, Reason}->
       runner_failed(Runner, Reason, Runners)
   end.
@@ -210,29 +222,46 @@ runner_failed(Runner, Reason, Runners)->
   [ exit(Pid, kill) || Pid := _ <- Runners ],
   exit({runner_failed, Name, Reason}).
 
-result(#{transaction := Transaction} = Point, ElapsedUs, Transactions, #sums{
-  transaction_us = TransactionUs, lock_us = LockUs, restarts = Restarts
+%% elapsed_ms: the longest node span, from the start of its first client to
+%% the last transaction of its latest client; the rates are over it. run_ms:
+%% the controller's clock around the point, the start and the reporting of
+%% the clients included. client_transactions_per_second: the mean over the
+%% clients of the transactions of a client over its own span
+result(#{transaction := Transaction, transactions_per_client := PerClient} = Point,
+    ElapsedUs, RunUs, Transactions, ClientRate, #sums{
+  transaction_us = TransactionUs, lock_us = LockUs, restarts = Restarts,
+  transaction_max_us = TransactionMaxUs, rest_planned_us = RestPlannedUs,
+  rest_slept_us = RestSleptUs, rest_overshoot_max_us = RestOvershootMaxUs
 }, Metrics)->
   Locks = performance_workload:size(Transaction),
+  %% TEMPORARY: every client rests after each transaction but its last
+  Rests = Transactions - Transactions div PerClient,
   Point#{
     elapsed_ms => ElapsedUs div 1000,
+    run_ms => RunUs div 1000,
     transactions => Transactions,
     transactions_per_second => Transactions * 1000000 / ElapsedUs,
+    client_transactions_per_second => ClientRate,
     locks => Transactions * Locks,
     locks_per_second => Transactions * Locks * 1000000 / ElapsedUs,
     lock_time_percent => 100 * LockUs / TransactionUs,
     restarts => Restarts,
+    %% TEMPORARY metrics, to be removed
+    transaction_avg_us => TransactionUs / Transactions,
+    transaction_max_us => TransactionMaxUs,
+    rest_planned_ms => RestPlannedUs div 1000,
+    rest_slept_ms => RestSleptUs div 1000,
+    rest_overshoot_avg_us => case Rests of 0-> 0.0; _-> (RestSleptUs - RestPlannedUs) / Rests end,
+    rest_overshoot_max_us => RestOvershootMaxUs,
     metrics => Metrics
   }.
 
 %%=================================================================
 %%  The point runner on a node
 %%=================================================================
-runner(Controller, RunRef, Count, #{nodes := Nodes} = Client)->
-  %% Load before creating clients, outside the measured interval, so their
-  %% first calls do not contend on code_server for the same unloaded modules.
-  [ {module, Module} = code:ensure_loaded(Module)
-    || Module <- [performance_workload, elock, elock_context, elock_manager] ],
+runner(Controller, RunRef, Count, #{nodes := Nodes, path := Path,
+    transactions_per_client := PerClient} = Client)->
+  ok = preload(Path),
   Runner = self(),
   Clients = [start_client(Runner, RunRef, Client#{client_index => I}) || I <- lists:seq(1, Count)],
   ok = await_clients_ready(Count, RunRef),
@@ -243,8 +272,32 @@ runner(Controller, RunRef, Count, #{nodes := Nodes} = Client)->
   end,
   Collector = performance_metrics:start(Nodes -- [node()]),
   lists:foreach(fun(Pid)-> Pid ! {?TAG, RunRef, start} end, Clients),
-  Sums = await_clients(Count, RunRef, #sums{}),
-  Controller ! {?TAG, RunRef, completed, Runner, Sums, performance_metrics:finish(Collector)}.
+  {Sums, ElapsedUs, RateSum} = await_clients(Count, RunRef, PerClient, #sums{}, undefined, 0.0),
+  Controller ! {?TAG, RunRef, completed, Runner, Sums, ElapsedUs, RateSum,
+    performance_metrics:finish(Collector)}.
+
+%%-----------------------------------------------------------------
+%%  Everything a client may call, loaded before the clients are
+%%  created, outside the measured interval: the first calls of the
+%%  clients would otherwise contend on code_server for the same
+%%  unloaded modules. The harness modules, the delays and all the
+%%  modules of the applications of the path, whichever of them the
+%%  calls reach
+%%-----------------------------------------------------------------
+preload(Path)->
+  {Modules, Applications} = case Path of
+    elock-> {[], [elock, ecall]};
+    mnesia-> {[], [mnesia]};
+    global-> {[global], []}
+  end,
+  [ {module, Module} = code:ensure_loaded(Module)
+    || Module <- [performance_workload, timer, rand | Modules]
+      ++ lists:append([ application_modules(Application) || Application <- Applications ]) ],
+  ok.
+
+application_modules(Application)->
+  {ok, Modules} = application:get_key(Application, modules),
+  Modules.
 
 start_client(Runner, RunRef, Client)->
   spawn_link(fun()-> client(Runner, RunRef, Client) end).
@@ -258,25 +311,46 @@ await_clients_ready(Count, RunRef)->
   end.
 
 %%-----------------------------------------------------------------
-%%  A client reports its sums as its last act. A client that fails
-%%  takes the runner down through the link
+%%  A client reports its sums and its span as its last act. A client
+%%  that fails takes the runner down through the link. The elapsed
+%%  time of the node is from the start of its first client to the
+%%  end of the last transaction of its latest client, on the clock
+%%  of the node: the reporting of the clients is outside it. The
+%%  throughput of a client is its transactions over its own span,
+%%  summed here for the mean of the point
 %%-----------------------------------------------------------------
-await_clients(0, _RunRef, Sums)->
-  Sums;
-await_clients(Count, RunRef, Sums)->
+await_clients(0, _RunRef, _PerClient, Sums, {StartedAt, FinishedAt}, RateSum)->
+  {Sums, FinishedAt - StartedAt, RateSum};
+await_clients(Count, RunRef, PerClient, Sums, Span, RateSum)->
   receive
-    {?TAG, RunRef, completed, ClientSums}->
-      await_clients(Count - 1, RunRef, add(Sums, ClientSums))
+    {?TAG, RunRef, completed, ClientSums, {ClientStartedAt, ClientFinishedAt} = ClientSpan}->
+      ClientRate = PerClient * 1000000 / max(1, ClientFinishedAt - ClientStartedAt),
+      await_clients(Count - 1, RunRef, PerClient, add(Sums, ClientSums), span(Span, ClientSpan),
+        RateSum + ClientRate)
   end.
 
+span(undefined, Span)->
+  Span;
+span({StartedAt1, FinishedAt1}, {StartedAt2, FinishedAt2})->
+  {min(StartedAt1, StartedAt2), max(FinishedAt1, FinishedAt2)}.
+
 add(
-  #sums{transaction_us = TransactionUs1, lock_us = LockUs1, restarts = Restarts1},
-  #sums{transaction_us = TransactionUs2, lock_us = LockUs2, restarts = Restarts2}
+  #sums{transaction_us = TransactionUs1, lock_us = LockUs1, restarts = Restarts1,
+    transaction_max_us = TransactionMax1, rest_planned_us = RestPlanned1,
+    rest_slept_us = RestSlept1, rest_overshoot_max_us = RestOvershootMax1},
+  #sums{transaction_us = TransactionUs2, lock_us = LockUs2, restarts = Restarts2,
+    transaction_max_us = TransactionMax2, rest_planned_us = RestPlanned2,
+    rest_slept_us = RestSlept2, rest_overshoot_max_us = RestOvershootMax2}
 )->
   #sums{
     transaction_us = TransactionUs1 + TransactionUs2,
     lock_us = LockUs1 + LockUs2,
-    restarts = Restarts1 + Restarts2
+    restarts = Restarts1 + Restarts2,
+    %% TEMPORARY metrics, to be removed
+    transaction_max_us = max(TransactionMax1, TransactionMax2),
+    rest_planned_us = RestPlanned1 + RestPlanned2,
+    rest_slept_us = RestSlept1 + RestSlept2,
+    rest_overshoot_max_us = max(RestOvershootMax1, RestOvershootMax2)
   }.
 
 %%=================================================================
@@ -288,7 +362,10 @@ client(Runner, RunRef, #{transactions_per_client := Count, seed := Seed,
   Runner ! {?TAG, RunRef, ready},
   receive
     {?TAG, RunRef, start}->
-      Runner ! {?TAG, RunRef, completed, transactions(Count, Client, State, #sums{})}
+      StartedAt = erlang:monotonic_time(microsecond),
+      Sums = transactions(Count, Client, State, #sums{}),
+      FinishedAt = erlang:monotonic_time(microsecond),
+      Runner ! {?TAG, RunRef, completed, Sums, {StartedAt, FinishedAt}}
   end.
 
 %% A cycle of the pacing: the plan, its transaction, then the idle rest of
@@ -301,11 +378,23 @@ transactions(Count, #{pacing_ms := PacingMs} = Client, State0, Sums)->
   CycleStartedAt = erlang:monotonic_time(millisecond),
   {Plan, State1} = performance_workload:plan(Client, State0),
   Measured = transaction(Client, Plan),
-  case Count > 1 of
-    true-> delay(rest(PacingMs, CycleStartedAt));
-    false-> ok
+  Rested = case Count > 1 of
+    true-> rest_measured(Measured, rest(PacingMs, CycleStartedAt));
+    false-> Measured
   end,
-  transactions(Count - 1, Client, State1, add(Sums, Measured)).
+  transactions(Count - 1, Client, State1, add(Sums, Rested)).
+
+%% TEMPORARY, to be removed: the rest as planned and as slept, in the sums
+%% of the transaction it follows
+rest_measured(Sums, RestMs)->
+  StartedAt = erlang:monotonic_time(microsecond),
+  delay(RestMs),
+  SleptUs = erlang:monotonic_time(microsecond) - StartedAt,
+  Sums#sums{
+    rest_planned_us = RestMs * 1000,
+    rest_slept_us = SleptUs,
+    rest_overshoot_max_us = SleptUs - RestMs * 1000
+  }.
 
 %% The idle rest of a cycle, none when the transaction has overrun the pacing
 rest(PacingMs, CycleStartedAt)->
@@ -323,7 +412,8 @@ transaction(#{path := Path} = Client, Plan)->
   end,
   TransactionUs = erlang:monotonic_time(microsecond) - StartedAt,
   #sums{transaction_us = TransactionUs, lock_us = TransactionUs - erase(?WORK_US),
-    restarts = erase(?RUNS) - 1}.
+    restarts = erase(?RUNS) - 1,
+    transaction_max_us = TransactionUs}. % TEMPORARY, to be removed
 
 %% Every attempt starts with no work done, so an aborted attempt leaves
 %% none. The counters are in the process dictionary, which survives

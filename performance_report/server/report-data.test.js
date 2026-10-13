@@ -197,6 +197,25 @@ test('reports malformed and invalid point files as run errors', async () => {
   });
 });
 
+test('accepts a point of a workload without operations, which locks nothing', async () => {
+  await withRoot('no-operations', async (root) => {
+    await writeRun(root, 'ct_run.no-operations', {
+      'elock.json': validPoint({
+        transaction: {read: 0, update: 0, write: 0},
+        locks: 0,
+        locks_per_second: 0
+      })
+    });
+
+    const result = await scanRuns(root);
+    const [run] = result.runs;
+
+    assert.deepEqual(run.errors, []);
+    assert.equal(run.points.length, 1);
+    assert.equal(run.points[0].locks, 0);
+  });
+});
+
 test('rejects a point without memory.start_bytes', async () => {
   await withRoot('memory', async (root) => {
     await writeRun(root, 'ct_run.memory', {

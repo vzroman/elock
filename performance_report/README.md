@@ -84,8 +84,18 @@ lock time: the lock calls, the aborted attempts with their reads, the releases,
 the restart delay, and for Mnesia its own restart backoff and transaction
 engine overhead. Transaction time starts after plan generation and ends after
 release. The idle rest of a cycle is outside both transaction and lock
-measurements. Throughput and resource measurements retain the overall run
-window, which includes plan generation and the idle rests.
+measurements. Throughput is over the elapsed time of the point: on the node
+that takes longest, from the start of its first client to the last transaction
+of its latest client, which includes plan generation and the idle rests but
+not the reporting of the clients. `run_ms` is the controller's clock around
+the point, with the start and the reporting of the clients. Throughput per
+client is the mean over the clients of a client's own transactions per second,
+over its own span from its start to its last transaction. The span holds one
+pacing less than transactions, as a client never idles after its last one, so
+the pacing bounds it at `1000 / pacing_ms` only up to the factor
+`N / (N - 1)` for `N` transactions per client. Resource
+measurements cover each node from the start of its clients to their last
+report.
 
 Report checks:
 

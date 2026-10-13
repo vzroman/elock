@@ -33,10 +33,12 @@ function sum(values) {
 
 const metrics = [
   {id: 'throughput', label: 'Throughput', unit: 'tx/s', value: point => point.transactions_per_second},
+  {id: 'client_throughput', label: 'Throughput per client (mean)', unit: 'tx/s', value: point => point.client_transactions_per_second},
   {id: 'locks', label: 'Locks', unit: 'locks/s', value: point => point.locks_per_second},
   {id: 'lock_time', label: 'Lock time share', unit: '%', value: point => point.lock_time_percent},
   {id: 'restarts', label: 'Restarts', unit: '', count: true, value: point => point.restarts},
   {id: 'elapsed', label: 'Elapsed time', unit: 's', value: point => point.elapsed_ms / 1000},
+  {id: 'run', label: 'Run time (controller clock)', unit: 's', value: point => point.run_ms / 1000},
   {
     id: 'memory_growth', label: 'Memory growth', unit: 'GB',
     value: point => Math.max(...nodeMetrics(point).map(({memory}) =>
@@ -60,6 +62,25 @@ const metrics = [
       (point.elapsed_ms / 1000) / 1_000_000
   }
 ];
+
+// TEMPORARY metrics, to be removed with the suite's: the average and the
+// longest transaction, the rest of a cycle as planned and as slept, and
+// the overshoot of the rests. Points of earlier runs lack them: N/A
+function rests(point) {
+  return point.transactions - point.transactions / point.transactions_per_client;
+}
+
+const temporaryMetrics = [
+  {id: 'transaction_avg', label: 'Transaction avg', unit: 'ms', value: point => point.transaction_avg_us / 1000},
+  {id: 'transaction_max', label: 'Transaction max', unit: 'ms', value: point => point.transaction_max_us / 1000},
+  {id: 'rest_planned', label: 'Rest planned (avg per rest)', unit: 'ms', value: point => point.rest_planned_ms / rests(point)},
+  {id: 'rest_slept', label: 'Rest slept (avg per rest)', unit: 'ms', value: point => point.rest_slept_ms / rests(point)},
+  {id: 'rest_overshoot_avg', label: 'Rest overshoot avg', unit: 'ms', value: point => point.rest_overshoot_avg_us / 1000},
+  {id: 'rest_overshoot_max', label: 'Rest overshoot max', unit: 'ms', value: point => point.rest_overshoot_max_us / 1000}
+];
+
+// TEMPORARY: metrics alone once the temporary ones are removed
+const shownMetrics = [...metrics, ...temporaryMetrics];
 
 function runAnchor(run) {
   return `run-${run.id}`;
@@ -85,6 +106,11 @@ function offeredLoad(config) {
   if (config.pacing_ms === 0) return 'Unbounded';
   const clients = Object.keys(config.nodes).length * config.clients_per_node;
   return formatValue(clients * 1000 / config.pacing_ms, 'tx/s');
+}
+
+function offeredLoadPerClient(config) {
+  if (config.pacing_ms === 0) return 'Unbounded';
+  return formatValue(1000 / config.pacing_ms, 'tx/s');
 }
 
 function pathsPresent(points) {
@@ -150,7 +176,7 @@ function MetricGrid({points}) {
         <thead><tr><th>Metric</th>{points.map(point => (
           <th key={point.path}><span className={`path-marker ${point.path}`} />{point.path}</th>
         ))}</tr></thead>
-        <tbody>{metrics.map(metric => (
+        <tbody>{shownMetrics.map(metric => (
           <tr key={metric.id}>
             <th>{metric.label}</th>
             {points.map(point => <td key={point.path}>{formatValue(metric.value(point), metric.unit)}</td>)}
@@ -228,8 +254,14 @@ function PointsView({points, theme}) {
         utilization the mean, max run queue the largest, network the sum of the
         octets sent per second.
       </p>
+      {/* TEMPORARY note, to be removed with the temporary metrics */}
+      <p className="table-note">
+        Temporary: the rest planned and slept are averages per rest, a client
+        rests after every transaction but its last; the overshoot of a rest is
+        its slept time less its planned time, averaged and at its largest.
+      </p>
       <div className="charts">
-        {metrics.map(metric => (
+        {shownMetrics.map(metric => (
           <MetricChart
             key={metric.id}
             points={points}
@@ -259,6 +291,7 @@ function RunConstants({config, dateTime}) {
         <div><dt>Restart delay (elock/global)</dt><dd>{config.restart_ms} ms</dd></div>
         <div><dt>Pacing (transaction cycle)</dt><dd>{config.pacing_ms} ms</dd></div>
         <div><dt>Offered load (pacing bound)</dt><dd>{offeredLoad(config)}</dd></div>
+        <div><dt>Offered load per client</dt><dd>{offeredLoadPerClient(config)}</dd></div>
         <div><dt>Seed</dt><dd>{config.seed}</dd></div>
         <div><dt>Deadlocks</dt><dd>{config.deadlocks ? 'true (random order)' : 'false (sorted order)'}</dd></div>
         <div><dt>Date/time</dt><dd>{dateTime}</dd></div>

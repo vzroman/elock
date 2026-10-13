@@ -33,7 +33,7 @@ function validPoint(overrides = {}) {
     read_ms: 0,
     timeout: 'undefined',
     restart_ms: 0,
-    think_ms: 0,
+    pacing_ms: 0,
     seed: 12345,
     deadlocks: false,
     unique_keys: false,
@@ -87,7 +87,7 @@ async function writeMarker(root, run, content) {
 
 function validMarker(pid) {
   const {path: pointPath, nodes, clients_per_node, transactions_per_client,
-    transaction, objects_pool_size, read_ms, timeout, restart_ms, think_ms, seed, deadlocks,
+    transaction, objects_pool_size, read_ms, timeout, restart_ms, pacing_ms, seed, deadlocks,
     unique_keys, write_ms} = validPoint();
   return {
     path: pointPath,
@@ -99,7 +99,7 @@ function validMarker(pid) {
     read_ms,
     timeout,
     restart_ms,
-    think_ms,
+    pacing_ms,
     seed,
     deadlocks,
     unique_keys,
@@ -406,18 +406,18 @@ test('returns no runs when the Common Test log root does not exist', async () =>
   assert.deepEqual(result.runs, []);
 });
 
-test('requires a nonnegative scalar think time and retains positive values', async () => {
-  await withRoot('think', async root => {
-    await writeRun(root, 'ct_run.think', {
-      'positive.json': validPoint({think_ms: 25}),
-      'missing.json': validPoint({think_ms: undefined}),
-      'negative.json': validPoint({think_ms: -1}),
-      'list.json': validPoint({think_ms: [0, 25]})
+test('requires nonnegative scalar pacing and retains positive values', async () => {
+  await withRoot('pacing', async root => {
+    await writeRun(root, 'ct_run.pacing', {
+      'positive.json': validPoint({pacing_ms: 25}),
+      'missing.json': validPoint({pacing_ms: undefined}),
+      'negative.json': validPoint({pacing_ms: -1}),
+      'list.json': validPoint({pacing_ms: [0, 25]})
     });
     const {runs: [run]} = await scanRuns(root);
     assert.equal(run.points.length, 1);
-    assert.equal(run.points[0].think_ms, 25);
-    assert.deepEqual(errorFields(run), Array(3).fill('invalid performance point field: think_ms'));
+    assert.equal(run.points[0].pacing_ms, 25);
+    assert.deepEqual(errorFields(run), Array(3).fill('invalid performance point field: pacing_ms'));
   });
 });
 

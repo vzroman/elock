@@ -56,11 +56,15 @@ locks, sleep `restart_ms` once, and retry the full plan without a cap. Mnesia
 uses native transactions, retries and backoff; **configured timeout and restart
 delay do not apply to Mnesia**, including retries after a returned abort.
 
-`think_ms` is the required delay between completed logical transactions on
-every path, including Mnesia. It starts after commit and lock release, before
-generating the next plan. A client completing `N` transactions pauses `N - 1`
-times; there is no pause before its first transaction, after its last, or after
-an aborted attempt. Set `think_ms => 0` for no deliberate pause.
+`pacing_ms` is the fixed length of a transaction cycle on every path, including
+Mnesia. A cycle starts before plan generation and covers every attempt of the
+plan, the commit and the lock release; the client then idles for the rest of
+the cycle and starts the next one. A transaction that overruns its cycle leaves
+no rest, and the next cycle starts at once. A client completing `N` transactions
+idles at most `N - 1` times; it never idles after its last transaction. Set
+`pacing_ms => 0` to start every transaction immediately. The pacing bounds the
+offered load at `nodes * clients_per_node * 1000 / pacing_ms` transactions per
+second; the report shows this bound next to the run constants.
 
 Global runs only for zero reads, sorted order (`deadlocks => false`), and when
 `node_count * clients_per_node * (R + U + W) <= global_max_locks`. Skips appear
@@ -69,7 +73,7 @@ in the Common Test log and in executed paths' report data.
 Each executed path writes `performance_data/<path>.json` in the suite's
 `log_private` directory. The running marker carries the same fixed workload.
 The report compares paths directly and displays operation counts, pool, costs,
-timeout, restart delay, think time, seed and order. Historical result formats are not
+timeout, restart delay, pacing, seed and order. Historical result formats are not
 converted or supported.
 
 Lock time share is `100 * sum(lock durations) / sum(transaction durations)`.
@@ -79,9 +83,9 @@ attempt that committed; an aborted attempt does no work. Everything else is
 lock time: the lock calls, the aborted attempts with their reads, the releases,
 the restart delay, and for Mnesia its own restart backoff and transaction
 engine overhead. Transaction time starts after plan generation and ends after
-release. Think time is outside both transaction and lock measurements.
-Throughput and resource measurements retain the overall run window, which
-includes plan generation and think time.
+release. The idle rest of a cycle is outside both transaction and lock
+measurements. Throughput and resource measurements retain the overall run
+window, which includes plan generation and the idle rests.
 
 Report checks:
 

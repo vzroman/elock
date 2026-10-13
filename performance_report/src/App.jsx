@@ -80,6 +80,13 @@ function transactionLabel(transaction) {
   return `${transaction.read} read / ${transaction.update} update / ${transaction.write} write`;
 }
 
+// Every client offers at most one transaction per cycle of the pacing
+function offeredLoad(config) {
+  if (config.pacing_ms === 0) return 'Unbounded';
+  const clients = Object.keys(config.nodes).length * config.clients_per_node;
+  return formatValue(clients * 1000 / config.pacing_ms, 'tx/s');
+}
+
 function pathsPresent(points) {
   return paths.filter(path => points.some(point => point.path === path));
 }
@@ -250,14 +257,15 @@ function RunConstants({config, dateTime}) {
         <div><dt>Write cost / operation</dt><dd>{config.write_ms} ms</dd></div>
         <div><dt>Timeout (elock/global)</dt><dd>{config.timeout === 'undefined' ? 'No limit' : `${config.timeout} ms`}</dd></div>
         <div><dt>Restart delay (elock/global)</dt><dd>{config.restart_ms} ms</dd></div>
-        <div><dt>Think time between transactions</dt><dd>{config.think_ms} ms</dd></div>
+        <div><dt>Pacing (transaction cycle)</dt><dd>{config.pacing_ms} ms</dd></div>
+        <div><dt>Offered load (pacing bound)</dt><dd>{offeredLoad(config)}</dd></div>
         <div><dt>Seed</dt><dd>{config.seed}</dd></div>
         <div><dt>Deadlocks</dt><dd>{config.deadlocks ? 'true (random order)' : 'false (sorted order)'}</dd></div>
         <div><dt>Date/time</dt><dd>{dateTime}</dd></div>
       </dl>
       <p className="table-note">Mnesia uses its native retries and backoff; configured timeout and restart delay do not apply.
         Lock time is the transaction time less the work of the attempt that committed; aborted attempts, releases and restart delays count as lock time.
-        Think time is outside both transaction and lock measurements.</p>
+        The idle rest of a cycle is outside both transaction and lock measurements.</p>
       {config.skipped_paths?.length > 0 && <p className="table-note">
         Skipped: {config.skipped_paths.join(', ')}. Global requires zero reads, sorted order, and the configured lock capacity limit.
       </p>}

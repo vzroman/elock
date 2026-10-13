@@ -291,18 +291,25 @@ client(Runner, RunRef, #{transactions_per_client := Count, seed := Seed,
       Runner ! {?TAG, RunRef, completed, transactions(Count, Client, State, #sums{})}
   end.
 
+%% A cycle of the pacing: the plan, its transaction, then the idle rest of
+%% the pacing. The transaction has completed and released its locks before
+%% the rest. The rest is outside transaction measurements but inside the
+%% run, and only when another cycle follows.
 transactions(0, _Client, _State, Sums)->
   Sums;
-transactions(Count, #{think_ms := ThinkMs} = Client, State0, Sums)->
+transactions(Count, #{pacing_ms := PacingMs} = Client, State0, Sums)->
+  CycleStartedAt = erlang:monotonic_time(millisecond),
   {Plan, State1} = performance_workload:plan(Client, State0),
   Measured = transaction(Client, Plan),
-  %% The transaction has completed and released its locks. Pause only when
-  %% another plan follows, outside transaction measurements but inside the run.
   case Count > 1 of
-    true-> delay(ThinkMs);
+    true-> delay(rest(PacingMs, CycleStartedAt));
     false-> ok
   end,
   transactions(Count - 1, Client, State1, add(Sums, Measured)).
+
+%% The idle rest of a cycle, none when the transaction has overrun the pacing
+rest(PacingMs, CycleStartedAt)->
+  max(0, PacingMs - (erlang:monotonic_time(millisecond) - CycleStartedAt)).
 
 %% The clock covers all attempts of the same generated plan. The work left
 %% in the process dictionary is the work of the attempt that committed,

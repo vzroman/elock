@@ -75,6 +75,8 @@
 %%-----------------------------------------------------------------
 %%  The worker of elock_context:run_request/6, remote apply
 %%-----------------------------------------------------------------
+-spec lock(#request{}, fun((#queued{}, reference()) -> term())) ->
+  {ok, pid()} | {error, timeout | {deadlock, lock_key() | probe_limit}}.
 lock(
     #request{
       scope = Scope,
@@ -113,6 +115,9 @@ lock(
 %%  The request Ref can not do it: it is made in elock_context, maybe
 %%  on another node. A worker passes #queued{} on to the client.
 %%-----------------------------------------------------------------
+-spec wait_verdict(reference(), pid(), fun((#queued{}, reference()) -> term()),
+  #request{}) ->
+  {ok, pid()} | {error, timeout | {deadlock, lock_key() | probe_limit}} | retry.
 wait_verdict(
     MonitorRef,
     Manager,
@@ -1168,7 +1173,7 @@ remove_client_request(
     clients = ClientsClients
   }.
 
--spec demonitor_client(#client{}) -> ok | boolean().
+-spec demonitor_client(#client{}) -> ok | true.
 demonitor_client(#client{ monitor_ref = MonRef })
   when is_reference(MonRef)->
   erlang:demonitor(MonRef);

@@ -19,7 +19,7 @@
 %%=================================================================
 %%	OTP API
 %%=================================================================
--spec start(application:start_type(), term()) -> {ok, pid()}.
+-spec start(application:start_type(), term()) -> {ok, pid()} | {error, term()}.
 start(_StartType, _StartArgs)->
   elock_sup:start_link().
 

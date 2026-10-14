@@ -96,7 +96,7 @@
 %%=================================================================
 %%	OTP API
 %%=================================================================
--spec start_link() -> {ok, pid()}.
+-spec start_link() -> {ok, pid()} | {error, term()}.
 start_link()->
   proc_lib:start_link(?MODULE, init, []).
 
@@ -370,7 +370,7 @@ launch(
 %%  A hop: the sender has scheduled the entry locks in visited.
 %%  The cast execution continues the walk directly
 %%-----------------------------------------------------------------
--spec handle_probe(#deadlock_probe{}) -> ok.
+-spec handle_probe(#deadlock_probe{expand :: [lock_key()], visited :: visited()}) -> ok.
 handle_probe(#deadlock_probe{
   expand = Entry,
   visited = Visited
@@ -535,6 +535,7 @@ verdict(
       ecall:send(Client, #deadlock{ref = Ref, winner = Edge})
     end || {Ref, Client} <- Losers ],
   forward_probe(Probe#deadlock_probe{ visited = Visited }, Hops).
+-spec forward_probe(#deadlock_probe{visited :: visited()}, hops()) -> ok.
 forward_probe(
     #deadlock_probe{
       visited = Visited

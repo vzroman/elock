@@ -115,7 +115,7 @@ lock(Scope, Term, IsShared, Timeout, Nodes)->
       Error
   end.
 
--spec locked(#request{}, node_managers(), context()) -> context().
+-spec locked(#request{}, node_managers(), #context{}) -> context().
 locked(
     #request{
       ref = Ref,
@@ -452,6 +452,7 @@ wait_verdict(
   stop_graph(Ref, Graph, GraphMon),
   {ok, Nodes}.
 
+-spec cancel(reference(), #waiting{}) -> ok | true.
 cancel(Ref, #waiting{
   nodes = Nodes0,
   pending = Pending,
@@ -555,6 +556,8 @@ kill_holder(Holder)-> exit(Holder, kill).
 %%  holds of the context and the grants so far; the later grants are
 %%  reported to it
 %%-----------------------------------------------------------------
+-spec spawn_graph(reference(), #queued{}, reference(), #waiting{}) ->
+  #waiting{graph :: pid(), graph_monitor :: reference()}.
 spawn_graph(
     Ref,
     QueuedMessage,
@@ -601,7 +604,8 @@ graph_add(Ref, Graph, Node, Manager)->
   Graph ! {add, Ref, Node, Manager},
   ok.
 
--spec stop_graph(reference(), pid() | undefined, reference() | undefined) -> ok.
+-spec stop_graph(reference(), undefined, reference() | undefined) -> ok;
+  (reference(), pid(), reference()) -> ok.
 stop_graph(_Ref, undefined, _GraphMon)->
   ok;
 stop_graph(Ref, Graph, GraphMon)->

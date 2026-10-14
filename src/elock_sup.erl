@@ -18,7 +18,7 @@
 %%=================================================================
 %%	OTP API
 %%=================================================================
--spec start_link() -> {ok, pid()}.
+-spec start_link() -> {ok, pid()} | {error, term()}.
 start_link()->
   supervisor:start_link(?MODULE, []).
 

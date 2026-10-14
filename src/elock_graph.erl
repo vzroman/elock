@@ -2,51 +2,38 @@
 %%=================================================================
 %%  The wait-for graph of the node and the deadlock walks.
 %%
-%%  One process per node, registered as elock_graph, started by
-%%  elock_sup. It owns a public ETS bag of the waiting requests of
-%%  the node that hold something, keyed by the lock they wait for:
+%%  One process per node, registered as elock_graph. It owns a public
+%%  ETS bag of the waiting requests that hold something, keyed by the
+%%  lock they wait for:
 %%
 %%      #waiter{ lock, ref, birth, client, holds }
 %%
-%%  The waiters at a key all belong to one manager, which runs on
-%%  the lock's node: the rows of the waiters at lock L are complete
-%%  on node(L) and nowhere else. A walk expands a lock on its node,
-%%  and hops to the other nodes for the locks it has there.
+%%  The rows of a lock are complete on its node and nowhere else: a
+%%  walk expands a lock on its node and hops for the locks held on
+%%  the others.
 %%
-%%  The graph worker of elock_context calls handle_add_edges/1 after
-%%  a manager reports #queued{}, and adds each later grant to the
-%%  waiting nodes. New holds are published before an independent
-%%  walker starts and the call returns. The worker casts
-%%  handle_remove_edges/1 when a node grants or the request finishes,
-%%  and when its client dies.
-%%  The owner only receives node status and removes departed clients.
+%%  The graph worker of a request (see elock_context) publishes its
+%%  holds on every node it is queued on: handle_add_edges/1 is called
+%%  after each #queued{} and each later grant, handle_remove_edges/1
+%%  is cast when the node grants, the request finishes or its client
+%%  dies. The process itself only drops the rows of a departed node.
 %%
 %%  A walk serves one launch: the origin request, waiting for Edge
-%%  with Birth, fixed for the life of the context. Every new hold
-%%  of a waiting request starts a walk when it appears. During normal
-%%  updates the last edge of a stable cycle starts a walk that finds
-%%  the rest in place. The waiters of an expanded lock depend on the
-%%  origin: it holds the lock, or a waiter expanded before does.
-%%    * a waiter holding Edge closes a cycle: compared,
-%%      never expanded. A closer that beats the origin ends the walk,
-%%      #deadlock{} goes to the origin helper and nothing else is
-%%      sent. The losing closers are collected.
-%%    * the other waiters are expanded through the locks they hold.
-%%      A lock is visited from the moment it is scheduled, so no lock
-%%      is expanded twice in a branch and the walk ends.
-%%  When the list is empty every collected closer gets #deadlock{}
-%%  at its helper, then the remote locks go out as one
-%%  #deadlock_probe{} cast per node, with this branch's visited set.
-%%  Separate branches can discover the same previously unseen lock.
-%%  Each cast execution walks on from its entry locks.
-%%  Each launch has a fixed visited limit, based on its origin's holds
-%%  and context age at lock entry. Exceeding it aborts the origin with
-%%  probe_limit. Launches and hops continue with their captured origin
-%%  even after its waiting row has been removed.
+%%  with its Birth. Every new hold of a waiter starts one, so the
+%%  edge that closes a cycle finds the rest in place. A waiter of an
+%%  expanded lock that holds Edge closes a cycle: compared, never
+%%  expanded. One that beats the origin ends the walk with
+%%  #deadlock{} to the origin, the losers get theirs when the branch
+%%  is done. The other waiters are expanded through their holds, a
+%%  lock once per branch. The remote locks go out as one
+%%  #deadlock_probe{} cast per node with the visited set of the
+%%  branch, and the cast walks on from them. A launch has a visited
+%%  limit from the origin's holds and age, past it the origin loses
+%%  with probe_limit.
 %%
-%%  Walkers read the table while updates run. Replacement inserts
-%%  before deleting the old object, so a walk may read either or both.
-%%  Verdicts go to graph helpers and never change the table directly.
+%%  Walkers read the table while updates run: a replacement inserts
+%%  before deleting the old row, so a walk may read either or both.
+%%  Verdicts go to graph workers and never change the table
 %%=================================================================
 -module(elock_graph).
 -moduledoc false.
@@ -74,14 +61,14 @@
   init_graph/2
 ]).
 %%=================================================================
-%%  Client graph worker and walker protocol is in elock.hrl
+%%  The table row. The messages are in elock.hrl
 %%=================================================================
 -record(waiter,{
   lock :: lock_key(),           % the lock the request waits for, the key
   ref :: reference(),           % the request
   birth :: non_neg_integer(),   % priority fixed for the life of the context
-  client :: pid(),              % the graph helper receiving verdicts
-  holds :: held_locks()         % #{lock_key() => pid()}, as the client sent it
+  client :: pid(),              % the graph worker, receives the verdicts
+  holds :: held_locks()         % as the graph worker sent them
 }).
 
 -type visited() :: #{lock_key() => true}.
@@ -125,8 +112,8 @@ loop()->
   loop().
 
 %%-----------------------------------------------------------------
-%%  Remove departed clients' rows, including both replacement versions.
-%%  Updates still in flight can publish after this cleanup pass
+%%  The rows of the departed node's clients, both versions of a
+%%  replacement. An update in flight can publish after this pass
 %%-----------------------------------------------------------------
 -spec handle_nodedown(node()) -> ok.
 handle_nodedown(Node)->
@@ -202,9 +189,8 @@ graph_loop(#graph{
   end.
 
 %%-----------------------------------------------------------------
-%%  A new waiter gets all the holds; existing waiters get each later grant.
-%%  Sequential calls finish publication before the next update or removal.
-%%  Unreachable nodes are reported through the lock request path
+%%  Calls: the holds are in place before the next update or removal.
+%%  An unreachable node fails the request through its worker
 %%-----------------------------------------------------------------
 -spec add_edges([node()], held_locks(), #graph{}) -> ok.
 add_edges(
@@ -237,7 +223,7 @@ add_edges(_Nodes, _Holds, _Graph)->
   ok.
 
 %%-----------------------------------------------------------------
-%%  Terminal removal follows completed additions for each waiting copy
+%%  Casts: the additions were calls, a removal never overtakes them
 %%-----------------------------------------------------------------
 -spec remove_edges([node()], #graph{}) -> ok.
 remove_edges(Nodes, #graph{
@@ -258,11 +244,10 @@ remove_edges(Nodes, #graph{
 %%  The edges
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  No row: the first publication by the client graph worker. A row: a
-%%  later grant of a multi node request, or a key held at a manager
-%%  that died and was replaced. The new keys only are launched: every
-%%  edge starts a walk when it appears. Birth stays with the row.
-%%  Holds is never empty (see elock_context:add_edges/3)
+%%  No row: the first publication. A row: a later grant of a multi
+%%  node request, or a key held at a manager that died and was
+%%  replaced. Only the new keys are launched. Holds is never empty
+%%  (see add_edges/3)
 %%-----------------------------------------------------------------
 -spec handle_add_edges(#add_edges{}) -> ok.
 handle_add_edges(#add_edges{
@@ -333,9 +318,9 @@ handle_remove_edges(#remove_edges{
 %%  The walk
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  A launch: the new holds of a waiter of this node. The origin's
-%%  own lock is never expanded: its waiters depend on its holders,
-%%  not on the origin. A barging request holds it, dropped there
+%%  A launch: the new holds of a waiter of this node. Edge is visited
+%%  from the start: its waiters depend on its holders, not on the
+%%  origin, and a barging origin holds it itself
 %%-----------------------------------------------------------------
 -spec launch(#waiter{}, [lock_key()], non_neg_integer()) -> ok.
 launch(
@@ -367,8 +352,7 @@ launch(
   verdict(Result, Probe).
 
 %%-----------------------------------------------------------------
-%%  A hop: the sender has scheduled the entry locks in visited.
-%%  The cast execution continues the walk directly
+%%  A hop: the sender has visited the entry locks already
 %%-----------------------------------------------------------------
 -spec handle_probe(#deadlock_probe{expand :: [lock_key()], visited :: visited()}) -> ok.
 handle_probe(#deadlock_probe{
@@ -400,10 +384,9 @@ walk([], _Probe, Visited, Losers, Hops)->
   {Losers, Visited, Hops}.
 
 %%-----------------------------------------------------------------
-%%  The copy of a multi node origin waiting on another node: a
-%%  barging one holds the origin's lock too, on a tie with itself the
-%%  origin would lose. It holds what the origin holds, launched here
-%%  already
+%%  The origin's own row, waiting here as a multi node request: a
+%%  barging one holds Edge and would close a cycle with itself. Its
+%%  holds were launched from here already
 %%-----------------------------------------------------------------
 -spec check_cycles([#waiter{}], #deadlock_probe{}, [loser()], [lock_key()]) ->
   origin | {[loser()], [lock_key()]}.
@@ -420,9 +403,8 @@ check_cycles(
   check_cycles(Rest, Probe, Losers, Found);
 
 %%-----------------------------------------------------------------
-%%  A waiter holding the origin's lock closes a cycle: compared,
-%%  never expanded. Its abort breaks every cycle through it, and so
-%%  does the origin's. The others expand through the locks they hold
+%%  A holder of Edge closes a cycle: compared, never expanded. The
+%%  others are expanded through their holds
 %%-----------------------------------------------------------------
 check_cycles(
     [#waiter{
@@ -489,10 +471,10 @@ drop_coin(Ref1, Ref2)->
   element(Winner, Tie).
 
 %%-----------------------------------------------------------------
-%%  A lock not yet visited is scheduled once per branch: local ones
-%%  ahead of the locks to expand here, remote ones under their node
-%%  for a hop. The origin counts towards the limit. Already scheduled
-%%  keys cost nothing; another unseen key at the limit aborts the origin
+%%  An unvisited lock is scheduled once per branch: a local one ahead
+%%  of the locks to expand here, a remote one under its node for the
+%%  hop. Edge counts towards the limit, an unseen key past it aborts
+%%  the origin
 %%-----------------------------------------------------------------
 -spec schedule([lock_key()], [lock_key()], visited(), hops(), pos_integer()) ->
   {[lock_key()], visited(), hops()} | probe_limit.
@@ -503,7 +485,6 @@ schedule([_Lock | _Rest], _Local, Visited, _Hops, Limit) when map_size(Visited) 
 schedule([{_Scope, _Term, Node} = Lock | Rest], Local, Visited, Hops, Limit) when Node =:= node()->
   schedule(Rest, [Lock | Local], Visited#{Lock => true}, Hops, Limit);
 schedule([{_Scope, _Term, Node} = Lock | Rest], Local, Visited, Hops, Limit)->
-  % The first lock of the node starts its list
   Locks = maps:get(Node, Hops, []),
   schedule(Rest, Local, Visited#{Lock => true}, Hops#{Node => [Lock | Locks]}, Limit);
 schedule([], Local, Visited, Hops, _Limit)->
@@ -511,9 +492,8 @@ schedule([], Local, Visited, Hops, _Limit)->
 
 %%-----------------------------------------------------------------
 %%  The origin lost: its abort breaks every cycle through it, the
-%%  closers collected before stay and no hop goes out. Otherwise the
-%%  losing closers receive verdicts at their helpers and the remote
-%%  locks go out, one probe cast per node with this branch's visited set
+%%  losers collected before stay and no hop goes out. Otherwise the
+%%  losers get their verdicts and the hops go out
 %%-----------------------------------------------------------------
 -spec verdict({origin, lock_key() | probe_limit} | {[loser()], visited(), hops()}, #deadlock_probe{}) -> ok.
 verdict(
@@ -535,6 +515,10 @@ verdict(
       ecall:send(Client, #deadlock{ref = Ref, winner = Edge})
     end || {Ref, Client} <- Losers ],
   forward_probe(Probe#deadlock_probe{ visited = Visited }, Hops).
+
+%%-----------------------------------------------------------------
+%%  A big probe bypasses the batched ecall channel
+%%-----------------------------------------------------------------
 -spec forward_probe(#deadlock_probe{visited :: visited()}, hops()) -> ok.
 forward_probe(
     #deadlock_probe{

@@ -38,8 +38,7 @@
 
 -record(context,{
   ref2lock :: #{reference() => #lock{}},
-  % Sent to managers as is. The same Term in two scopes is two locks.
-  locked :: held_locks(),
+  locked :: held_locks(), % published to the graph as the holds
   counts :: lock_counts(), % N >= 2: the re-entered keys only
   birth :: integer() % system time in microseconds, fixed for this context
 }).
@@ -69,7 +68,7 @@ lock(Scope, Term, Nodes, Options)->
   Ref = make_ref(),
   Context = init_context(Now),
   Birth = Context#context.birth,
-  % System time can move backwards; age is fixed for this acquisition.
+  % System time can move backwards
   Age = max(1, (Now - Birth) div 1000),
   Holds = held_locks(Context),
   RequestNodes = lists:usort(Nodes),
@@ -284,7 +283,9 @@ held_locks(_NoContext)->
   graph_monitor :: reference() | undefined
 }).
 
-% The local node alone: the client is the proxy itself
+% The local node alone: the client is the proxy itself. OnQueued runs
+% inside elock_manager:lock/2, the graph it spawns comes back through
+% the dictionary
 -spec run_request(reference(), integer(), non_neg_integer(), held_locks(),
   nonempty_list(node()), #request{}) -> request_result().
 run_request(
@@ -377,7 +378,6 @@ run_request(
   }).
 
 
-% Workers reply with their node and result; remote grants keep a holder.
 % Every clause matches Ref, a plain argument from make_ref/0 in lock/4:
 % the receive skips the older messages. Ref taken from #waiting{} would
 % break the optimization
@@ -552,9 +552,9 @@ kill_holder(Holder)-> exit(Holder, kill).
 %%  Graph worker
 %%=================================================================
 %%-----------------------------------------------------------------
-%%  Spawned on the first #queued{}, which it starts with, with the
-%%  holds of the context and the grants so far; the later grants are
-%%  reported to it
+%%  Spawned on the first #queued{} with the holds of the context and
+%%  the grants so far, the later grants are reported to it. Its state
+%%  is #graph{}, its loop is in elock_graph
 %%-----------------------------------------------------------------
 -spec spawn_graph(reference(), #queued{}, reference(), #waiting{}) ->
   #waiting{graph :: pid(), graph_monitor :: reference()}.
@@ -661,7 +661,6 @@ validate_option(timeout, Value)->
 validate_option(Unexpected, _Value)->
   throw({invalid_option, Unexpected}).
 
-% The process dictionary holds only this process's lock context.
 -spec get_context() -> context().
 get_context()->
   get(?context).

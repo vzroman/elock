@@ -19,7 +19,7 @@
   tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
   shared :: boolean(),
   timeout :: pos_integer() | undefined,
-  notify_queued
+  notify_queued                   % #queued{} is wanted: nodes to withdraw from or holds to publish
 }).
 
 -record(unlock,{
@@ -33,8 +33,9 @@
   node :: node()
 }).
 
+% The state of the graph worker (see elock_context)
 -record(graph,{
-  client :: pid(),                % application client monitored by this helper
+  client :: pid(),                % the requesting process, monitored
   scope :: atom(),
   term :: term(),
   nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
@@ -42,10 +43,10 @@
   birth :: integer(),             % priority fixed for the life of the context
   age :: non_neg_integer(),       % context age in ms, fixed at lock entry
   ref :: reference(),
-  tag
+  tag                             % of the verdict exit: Ref, or the manager monitor of a direct request
 }).
 
-% Walker -> graph helper: its exit reports the verdict to the client.
+% Walker -> graph worker, which exits with it to the proxy.
 % Manager -> proxy: the request has lost
 -record(deadlock,{
   ref :: reference(),
@@ -58,7 +59,7 @@
   ref :: reference(),
   birth :: non_neg_integer(),   % priority fixed for the life of the context
   age :: non_neg_integer(),     % context age in ms, fixed at lock entry
-  client :: pid(),              % the graph helper receiving verdicts
+  client :: pid(),              % the graph worker, receives the verdicts
   holds :: held_locks()         % the context's holds or a later grant
 }).
 
@@ -73,7 +74,7 @@
 -record(deadlock_probe,{
   ref :: reference(),           % the origin request
   edge :: lock_key(),           % the lock the origin waits for
-  client :: pid(),              % the origin graph helper receiving verdicts
+  client :: pid(),              % the origin's graph worker, receives the verdicts
   birth :: non_neg_integer(),   % the origin context's fixed priority
   limit :: pos_integer(),       % maximum visited keys, fixed for this launch
   expand :: [lock_key()] | undefined, % the locks to expand on the receiving node

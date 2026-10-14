@@ -1,7 +1,8 @@
 
 %%=================================================================
-%%  The scope: the process that owns the ETS table of the locks and
-%%  announces the node to the other nodes of the scope.
+%%  The scope: the process that owns the ETS table of the locks (the
+%%  entries are elock_manager's) and announces the node to the other
+%%  nodes of the scope
 %%=================================================================
 -module(elock_scope).
 -moduledoc false.
@@ -31,7 +32,6 @@
 start_link(Scope)->
   {ok, spawn_link(fun()->
 
-    % Prepare the storage for locks
     ets:new(Scope,[
       named_table,
       public,

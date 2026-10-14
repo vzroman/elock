@@ -20,9 +20,8 @@ are implementation details.
 ## Setup
 
 `elock` is an application: list it in the `applications` of your own
-application and it is started before yours. It runs one process per node,
-the wait-for graph of the node, where the deadlocks are detected. The nodes
-must be connected by Erlang distribution.
+application and it is started before yours. The nodes must be connected by
+Erlang distribution.
 
 A scope is an independent set of locks named by an atom. Start it under a
 supervisor of yours, on every node that is to keep locks of the scope:
@@ -103,29 +102,22 @@ fails with `{error, {deadlock, {Scope, Term, Node}}}`, which names the lock
 the winning request waits for.
 
 - A request of a younger context loses to a request of an older context.
-  Equal birth times are settled by a coin. The context starts with its
-  first acquisition and is erased when its last lock is released.
-- A walk that would exceed its visited-key budget rejects its origin with
-  `{error, {deadlock, probe_limit}}`, even without a cycle. The budget is
-  `min(10000, max(100, (10 + AgeMs) * Holds))`: context age is fixed at the
-  start of the acquisition; holds count distinct node-qualified keys at
-  launch. The origin key counts as visited. Each remote branch keeps the
-  same budget. Handle this error by releasing earlier locks and retrying,
-  as after a cycle verdict.
+  The context of a process starts with its first lock request while it
+  holds nothing and ends when it releases its last lock. Equal ages are
+  settled by a coin.
+- A request can also fail with `{error, {deadlock, probe_limit}}`, without
+  a cycle, when the search for one exceeds its limit. Handle it as a
+  deadlock.
 - The loser keeps the locks it holds, and the others keep waiting for them.
   To let them through, release those locks and then repeat the request.
 - Two processes that lock the same term on the same several nodes at the
   same time may get a part of the nodes each. That is a deadlock as well, so
   a request for several nodes can lose while its process holds nothing.
-- One cycle may cost more than one request. When the requests of a cycle are
-  issued at the same moment, several of them can get the deadlock error,
-  more often as the cycle gets longer. This is a performance trade-off: the
-  verdicts are made independently of each other, without the coordination
-  it takes to agree on a single loser.
-- A request can also lose while its cycle has just dissolved: the verdict is
-  made on the edges as the graph process has them, which lag the managers
-  by its backlog. The loser keeps its locks and the caller repeats the
-  request, as after a real deadlock.
+- One cycle may cost more than one request: the verdicts are made
+  independently, so several requests of a cycle issued at the same moment
+  can lose, more often as the cycle gets longer.
+- A request can lose to a cycle that has just dissolved. As after a real
+  deadlock, the loser keeps its locks and the caller repeats the request.
 
 ## Failures
 
@@ -221,8 +213,8 @@ are ignored.
 - `{error, {deadlock, {Scope, Term, Node}}}`: the request has lost a
   deadlock to a request that waits for the named lock. See the deadlocks in
   the module documentation.
-- `{error, {deadlock, probe_limit}}`: a deadlock walk reached its search
-  limit. The caller must release its earlier locks before retrying.
+- `{error, {deadlock, probe_limit}}`: the search for a deadlock reached its
+  limit. Handle it as a deadlock.
 - `{error, {badrpc, Reason}}`: a node of `Nodes` can not be reached.
 - `{error, {exit, badarg}}`: the scope is not started on a node of `Nodes`.
   If `Nodes` is the local node alone, the call raises `badarg` instead.

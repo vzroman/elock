@@ -40,8 +40,9 @@
 
 %%=================================================================
 %%  Client <-> manager protocol
-%%  Local clients have process monitors; remote clients share one node
-%%  monitor per node. Their holders send #unlock{} when they exit.
+%%  A local client is monitored; a remote one has a node monitor and a
+%%  holder worker that sends #unlock{} when the client exits (see
+%%  elock_context:hold/3)
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  Every message from the manager to the proxy. Tag is #request.tag
@@ -111,7 +112,7 @@ lock(
 
 %%-----------------------------------------------------------------
 %%  Every clause matches MonitorRef, a plain argument from
-%%  erlang:monitor/2 in lock/1: the receive skips the older messages.
+%%  erlang:monitor/2 in lock/2: the receive skips the older messages.
 %%  The request Ref can not do it: it is made in elock_context, maybe
 %%  on another node. A worker passes #queued{} on to the client.
 %%-----------------------------------------------------------------
@@ -207,7 +208,7 @@ start_manager(Request)->
 -record(req,{
   client :: pid(),
   ref :: reference(),
-  ticket :: pos_integer(), % the ticket
+  ticket :: pos_integer(),
   proxy :: pid() | undefined, % undefined once the lock is held
   tag :: reference() | undefined, % undefined once the lock is held
   shared :: boolean(),
@@ -1221,8 +1222,8 @@ stop_waiting(Req, _State)->
   stop_timer(Req).
 
 %%-----------------------------------------------------------------
-%%  Notify only admitted worker requests. The direct local caller
-%%  has no other node to cancel and does not need a notification.
+%%  Only if the client asked for it: other nodes to withdraw from or
+%%  holds to publish (see elock_context:lock/4)
 %%-----------------------------------------------------------------
 -spec notify_queued(#request{}) -> {reference(), #queued{}} | ignore.
 notify_queued(#request{

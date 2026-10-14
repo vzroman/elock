@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="424" viewBox="0 0 760 424" font-family='system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif' role="img" aria-label="Two nodes. On node 1 the PLC connection A holds lock A, taken exclusively on both nodes once at start, and writes its keys k1, k2, k3 under shared local locks on node 1 only. On node 2 a standby copy of the connection waits for lock A, and a user session writes k3 under an exclusive lock on both nodes, rarely. Only the lock A request and the occasional write cross the link">
+<rect width="760" height="424" fill="#fcfcfb"/>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0b0b0b"/></marker>
+<marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<text x="24" y="30" font-size="16" fill="#0b0b0b" text-anchor="start" font-weight="600">Design 4: one cross-node lock per piece of work, shared local locks per write</text>
+<rect x="24" y="56" width="344" height="346" rx="6" fill="none" stroke="#c3c2b7" stroke-width="1"/>
+<text x="36" y="76" font-size="12" fill="#0b0b0b" text-anchor="start" font-weight="600">node 1</text>
+<rect x="392" y="56" width="344" height="346" rx="6" fill="none" stroke="#c3c2b7" stroke-width="1"/>
+<text x="404" y="76" font-size="12" fill="#0b0b0b" text-anchor="start" font-weight="600">node 2</text>
+<rect x="36" y="92" width="180" height="44" rx="4" fill="#fcfcfb" stroke="#0b0b0b" stroke-width="1.2"/>
+<text x="126.0" y="110" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">PLC connection A</text>
+<text x="126.0" y="126" font-size="11" fill="#52514e" text-anchor="middle">holds lock A, works</text>
+<rect x="404" y="92" width="160" height="44" rx="4" fill="#fcfcfb" stroke="#c3c2b7" stroke-width="1.2"/>
+<text x="484.0" y="110" font-size="12" fill="#52514e" text-anchor="middle" font-weight="600">PLC connection A</text>
+<text x="484.0" y="126" font-size="11" fill="#52514e" text-anchor="middle">standby: waits for lock A</text>
+<rect x="556" y="196" width="160" height="44" rx="4" fill="#fcfcfb" stroke="#0b0b0b" stroke-width="1.2"/>
+<text x="636.0" y="214" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">user session</text>
+<text x="636.0" y="230" font-size="11" fill="#52514e" text-anchor="middle">writes k3 of A, rarely</text>
+<rect x="36" y="346" width="320" height="40" rx="4" fill="#f0efec"/>
+<text x="38" y="399" font-size="11" fill="#52514e" text-anchor="start">locks on node 1</text>
+<rect x="404" y="346" width="320" height="40" rx="4" fill="#f0efec"/>
+<text x="406" y="399" font-size="11" fill="#52514e" text-anchor="start">locks on node 2</text>
+<rect x="56.0" y="355" width="28" height="22" rx="3" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="70" y="370" font-size="11" fill="#0b0b0b" text-anchor="middle">A</text>
+<rect x="146.0" y="355" width="28" height="22" rx="3" fill="#e1e0d9"/>
+<text x="160" y="370" font-size="11" fill="#0b0b0b" text-anchor="middle">k1</text>
+<rect x="186.0" y="355" width="28" height="22" rx="3" fill="#e1e0d9"/>
+<text x="200" y="370" font-size="11" fill="#0b0b0b" text-anchor="middle">k2</text>
+<rect x="226.0" y="355" width="28" height="22" rx="3" fill="#e1e0d9"/>
+<text x="240" y="370" font-size="11" fill="#0b0b0b" text-anchor="middle">k3</text>
+<text x="268" y="370" font-size="11" fill="#52514e" text-anchor="start">...</text>
+<rect x="426.0" y="355" width="28" height="22" rx="3" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="440" y="370" font-size="11" fill="#0b0b0b" text-anchor="middle">A</text>
+<rect x="586.0" y="355" width="28" height="22" rx="3" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="600" y="370" font-size="11" fill="#0b0b0b" text-anchor="middle">k3</text>
+<line x1="70.0" y1="136.0" x2="70.0" y2="344.0" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="78" y="200" font-size="11" fill="#52514e" text-anchor="start">lock A</text>
+<text x="78" y="214" font-size="11" fill="#52514e" text-anchor="start">exclusive, both nodes</text>
+<text x="78" y="228" font-size="11" fill="#52514e" text-anchor="start">once, at start</text>
+<line x1="216.0" y1="114.0" x2="468.0" y2="344.0" stroke="#eb6834" stroke-width="1.5" marker-end="url(#arrow-accent)"/>
+<text x="330" y="186" font-size="11" fill="#52514e" text-anchor="start">lock A on node 2</text>
+<line x1="200.0" y1="136.0" x2="200.0" y2="344.0" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="208" y="258" font-size="11" fill="#52514e" text-anchor="start">every write:</text>
+<text x="208" y="272" font-size="11" fill="#52514e" text-anchor="start">shared lock on k1, k2, ...</text>
+<text x="208" y="286" font-size="11" fill="#52514e" text-anchor="start">local, granted at once</text>
+<line x1="440.0" y1="136.0" x2="440.0" y2="344.0" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="448" y="200" font-size="11" fill="#52514e" text-anchor="start">waits for lock A</text>
+<text x="448" y="214" font-size="11" fill="#52514e" text-anchor="start">on both nodes</text>
+<line x1="600.0" y1="240.0" x2="600.0" y2="344.0" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="608" y="280" font-size="11" fill="#52514e" text-anchor="start">k3: exclusive,</text>
+<text x="608" y="294" font-size="11" fill="#52514e" text-anchor="start">both nodes, rarely</text>
+<line x1="556.0" y1="218.0" x2="244.0" y2="344.0" stroke="#eb6834" stroke-width="1.5" marker-end="url(#arrow-accent)"/>
+<text x="450" y="300" font-size="11" fill="#52514e" text-anchor="start">k3 on node 1</text>
+<rect x="36" y="406" width="16" height="12" rx="2" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="58" y="416" font-size="11" fill="#52514e" text-anchor="start">exclusive lock</text>
+<rect x="150" y="406" width="16" height="12" rx="2" fill="#e1e0d9"/>
+<text x="172" y="416" font-size="11" fill="#52514e" text-anchor="start">shared lock</text>
+<line x1="260.0" y1="412.0" x2="278.0" y2="412.0" stroke="#eb6834" stroke-width="1.5"/>
+<text x="284" y="416" font-size="11" fill="#52514e" text-anchor="start">crosses the link</text>
+</svg>

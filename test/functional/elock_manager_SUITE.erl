@@ -1,6 +1,6 @@
 %%=================================================================
 %%  Module tests of elock_manager: the client side of the protocol
-%%  (lock/1 of the client itself, lock/1 of a proxy on its behalf),
+%%  (lock/2 of the client itself, lock/2 of a proxy on its behalf),
 %%  the state transformations of the manager on hand-built states
 %%  and the behaviour of the real manager process.
 %%
@@ -13,8 +13,8 @@
 %%  {Collector, ?reply(Tag, Message)}. The scope table is created by
 %%  the test process and goes with it.
 %%
-%%  A proxy relays #queued{} to its client; graph publication belongs
-%%  to the client graph worker and is tested in elock_SUITE.
+%%  A proxy passes #queued{} and its attempt tag to OnQueued; graph
+%%  publication belongs to the client graph worker, tested in elock_SUITE.
 %%
 %%  The functions that may exit(normal) (try_unlock/1 through
 %%  handle_unlock/2, handle_down/2, next/1, handle_postpone_timeout/2)
@@ -46,6 +46,8 @@
   lock_free_term_test/1,
   lock_busy_term_test/1,
   lock_queued_notice_test/1,
+  direct_waiter_deadlock_test/1,
+  withdraw_direct_waiter_test/1,
   manager_dies_before_verdict_test/1,
   manager_dies_after_queued_test/1,
   receive_marker_test/1,
@@ -81,7 +83,7 @@
   postpone_timeout_releases_test/1,
   handle_postponed_stale_ticket_test/1,
   postponed_asked_when_taken_test/1,
-  kill_proxy_test/1,
+  release_proxy_test/1,
   notify_queued_test/1,
   start_timer_test/1,
   stop_timer_test/1,
@@ -138,6 +140,7 @@
 -record(retry,{
   ref
 }).
+-record(withdrawn,{ref}).
 -define(reply(Tag, Message), {Tag, Message}).
 
 
@@ -160,6 +163,7 @@ groups()->
       lock_free_term_test,
       lock_busy_term_test,
       lock_queued_notice_test,
+      direct_waiter_deadlock_test,
       manager_dies_before_verdict_test,
       manager_dies_after_queued_test,
       receive_marker_test,
@@ -188,6 +192,7 @@ groups()->
       second_upgrade_deadlock_test,
       barging_dequeued_test,
       handle_unlock_waiter_test,
+      withdraw_direct_waiter_test,
       handle_down_test,
       handle_request_awaited_ticket_test,
       postponed_gap_test,
@@ -197,7 +202,7 @@ groups()->
       postpone_timeout_releases_test,
       handle_postponed_stale_ticket_test,
       postponed_asked_when_taken_test,
-      kill_proxy_test,
+      release_proxy_test,
       notify_queued_test,
       start_timer_test,
       stop_timer_test,
@@ -265,13 +270,14 @@ end_per_testcase(_TestCase, Config)->
 %%=================================================================
 %%-----------------------------------------------------------------
 %%  A free term is taken the same way in both modes, by the client
-%%  itself (lock/1) and by a proxy on its behalf (lock/1):
+%%  itself (lock/2) and by a proxy on its behalf (lock/2):
 %%  {ok, Manager}, the entry {Term, Manager, 1}, the manager runs
 %%  with high priority and an off heap mailbox and monitors the
 %%  client, not the proxy; #unlock{} of the only holder ends it
 %%  normally and the table is empty
 %%-----------------------------------------------------------------
 lock_free_term_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   Self = self(),
   Proxy = elock_test_utils:client(),
@@ -299,15 +305,15 @@ lock_free_term_test(Config)->
     end,
     [
       % the client itself, it holds nothing
-      fun(Request)-> elock_manager:lock(Request) end,
+      fun(Request)-> elock_manager:lock(Request, OnQueued) end,
       % a proxy on behalf of the client
-      fun(Request)-> elock_test_utils:call(Proxy, fun()-> elock_manager:lock(Request) end) end
+      fun(Request)-> elock_test_utils:call(Proxy, fun()-> elock_manager:lock(Request, OnQueued) end) end
     ]
   ),
   elock_test_utils:stop(Proxy).
 
 %%-----------------------------------------------------------------
-%%  lock/1 on a busy term (the test process is the manager): the
+%%  lock/2 on a busy term (the test process is the manager): the
 %%  exact #request{ticket = 2, proxy = Client, tag = Tag}, the tag is
 %%  a reference made for the attempt, the client monitors the
 %%  manager while it waits; every verdict is taken with that tag;
@@ -317,12 +323,13 @@ lock_free_term_test(Config)->
 %%  client's mailbox
 %%-----------------------------------------------------------------
 lock_busy_term_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   Self = self(),
   true = ets:insert(Scope, {?TERM, Self, 1}),
   C1 = elock_test_utils:client(),
   #request{ref = Ref} = Request = request(Scope, undefined, C1, true),
-  Lock = fun()-> elock_manager:lock(Request) end,
+  Lock = fun()-> elock_manager:lock(Request, OnQueued) end,
 
   % #locked{}
   R1 = elock_test_utils:cast(C1, Lock),
@@ -402,11 +409,9 @@ lock_busy_term_test(Config)->
   elock_test_utils:stop(C1).
 
 %%-----------------------------------------------------------------
-%%  Proxy mode, lock/1 on behalf of the client: the tagged #queued{}
-%%  of the manager reaches the client as the bare #queued{}, before
-%%  the grant; the proxy has no held map, it answers nothing and
-%%  keeps waiting; a #queued{} with another tag and a bare one are
-%%  left alone
+%%  The tagged #queued{} reaches OnQueued as the bare record and attempt
+%%  tag in the proxy process. Its return value is ignored; a queued notice
+%%  with another tag and a bare one remain in the mailbox.
 %%-----------------------------------------------------------------
 lock_queued_notice_test(Config)->
   Scope = ?config(scope, Config),
@@ -415,8 +420,12 @@ lock_queued_notice_test(Config)->
   Client = elock_test_utils:collector(),
   Proxy = elock_test_utils:client(),
   #request{ref = Ref} = Request = request(Scope, undefined, Client, false,
-    #{}),
-  R = elock_test_utils:cast(Proxy, fun()-> elock_manager:lock(Request) end),
+    #{notify_queued => true}),
+  OnQueued = fun(Queued0, Tag0)->
+    Self ! {callback, self(), Queued0, Tag0},
+    ignored_return
+  end,
+  R = elock_test_utils:cast(Proxy, fun()-> elock_manager:lock(Request, OnQueued) end),
   #request{tag = Tag} = Request1 = ?RECEIVE(#request{}),
   ?assert(is_reference(Tag)),
   ?assertEqual(Request#request{ticket = 2, proxy = Proxy, tag = Tag}, Request1),
@@ -428,7 +437,8 @@ lock_queued_notice_test(Config)->
 
   [ Proxy ! Message || Message <- Foreign ],
   Proxy ! ?reply(Tag, Queued),
-  ?assertEqual([Queued], elock_test_utils:collected(Client, 1)),
+  ?assertEqual({callback, Proxy, Queued, Tag},
+    ?RECEIVE({callback, Proxy, _, _})),
   ?assertEqual(timeout, elock_test_utils:result(R, ?QUIET)),
   ?assertEqual({messages, Foreign}, process_info(Proxy, messages)),
 
@@ -444,6 +454,7 @@ lock_queued_notice_test(Config)->
 %%  entry, retries with ticket 1 and starts a real manager
 %%-----------------------------------------------------------------
 manager_dies_before_verdict_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   Self = self(),
   Fake = spawn(fun()->
@@ -454,7 +465,7 @@ manager_dies_before_verdict_test(Config)->
   C1 = elock_test_utils:client(),
   #request{ref = Ref} = Request = request(Scope, undefined, C1, false),
 
-  R1 = elock_test_utils:cast(C1, fun()-> elock_manager:lock(Request) end),
+  R1 = elock_test_utils:cast(C1, fun()-> elock_manager:lock(Request, OnQueued) end),
   {fake_got, Fake, #request{tag = Tag} = Got} = ?RECEIVE({fake_got, Fake, _}),
   ?assert(is_reference(Tag)),
   ?assertEqual(Request#request{ticket = 2, proxy = C1, tag = Tag}, Got),
@@ -475,8 +486,8 @@ manager_dies_before_verdict_test(Config)->
   elock_test_utils:stop(C1).
 
 %%-----------------------------------------------------------------
-%%  A proxy relays the old manager's queued notice, retries after its death,
-%%  and accepts the new manager's grant under a new tag.
+%%  The callback runs under the first tag and, after manager death, under
+%%  the retry tag. The new manager's grant is accepted under that new tag.
 %%-----------------------------------------------------------------
 manager_dies_after_queued_test(Config)->
   Scope = ?config(scope, Config),
@@ -490,8 +501,9 @@ manager_dies_after_queued_test(Config)->
     Proxy ! ?reply(Tag, #queued{ref = Ref, manager = self(), node = node()})
   end),
   true = ets:insert(Scope, {?TERM, Fake, 1}),
-  #request{ref = Ref} = Request = request(Scope, undefined, Client, false),
-  Pending = elock_test_utils:cast(Proxy, fun()-> elock_manager:lock(Request) end),
+  #request{ref = Ref} = Request = request(Scope, undefined, Client, false, #{notify_queued => true}),
+  OnQueued = fun(Queued0, Tag0)-> Self ! {callback, self(), Queued0, Tag0} end,
+  Pending = elock_test_utils:cast(Proxy, fun()-> elock_manager:lock(Request, OnQueued) end),
   {fake_got, Fake, #request{tag = Tag1} = Got} = ?RECEIVE({fake_got, Fake, _}),
   ?assertEqual(Request#request{ticket = 2, proxy = Proxy, tag = Tag1}, Got),
   true = ets:insert(Scope, {?TERM, Self, 2}),
@@ -500,8 +512,14 @@ manager_dies_after_queued_test(Config)->
   #request{tag = Tag2} = Request2 = ?RECEIVE(#request{}),
   ?assertNotEqual(Tag1, Tag2),
   ?assertEqual(Request#request{ticket = 3, proxy = Proxy, tag = Tag2}, Request2),
-  ?assertEqual([#queued{ref = Ref, manager = Fake, node = node()}],
-    elock_test_utils:collected(Client, 1)),
+  ?assertEqual({callback, Proxy,
+    #queued{ref = Ref, manager = Fake, node = node()}, Tag1},
+    ?RECEIVE({callback, Proxy, _, Tag1})),
+  Queued2 = #queued{ref = Ref, manager = Self, node = node()},
+  Proxy ! ?reply(Tag2, Queued2),
+  ?assertEqual({callback, Proxy, Queued2, Tag2},
+    ?RECEIVE({callback, Proxy, _, Tag2})),
+  ?assertEqual(timeout, elock_test_utils:result(Pending, ?QUIET)),
   Proxy ! ?reply(Tag2, #locked{ref = Ref}),
   ?assertEqual({ok, {ok, Self}}, elock_test_utils:result(Pending, ?DEADLINE)),
   ?NO_MESSAGE,
@@ -509,18 +527,19 @@ manager_dies_after_queued_test(Config)->
 
 %%-----------------------------------------------------------------
 %%  The wait for the verdict does not scan the messages the process
-%%  had before the attempt: the monitor reference made in lock/1
+%%  had before the attempt: the monitor reference made in lock/2
 %%  marks the mailbox position, it is passed on as it is and every
-%%  clause of the receive of wait_verdict/3 matches it, its first
+%%  clause of the receive of wait_verdict/4 matches it, its first
 %%  parameter. A refactoring that hides the reference from the
 %%  compiler (it goes into a record, the receive takes it out)
 %%  passes every other test and only costs the scan
 %%-----------------------------------------------------------------
 receive_marker_test(_Config)->
   ?assertEqual([
-    {{lock, 1}, reserved_receive_marker},
-    {{lock, 1}, passed_marker},
-    {{wait_verdict, 3}, {used_receive_marker, {parameter, 1}}}
+    {{lock, 2}, reserved_receive_marker},
+    {{lock, 2}, passed_marker},
+    {{wait_verdict, 4}, {used_receive_marker, {parameter, 1}}},
+    {{wait_verdict, 4}, {used_receive_marker, {parameter, 1}}}
   ], [ Info || {{Function, _Arity}, _} = Info <- elock_test_utils:recv_opt_info(elock_manager),
     lists:member(Function, [lock, wait_verdict]) ]).
 
@@ -1102,7 +1121,7 @@ waiting_request_proxy_test(Config)->
   % withdrawn by #unlock{}
   C2 = elock_test_utils:collector(),
   P2 = elock_test_utils:collector(),
-  #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, false, #{proxy => P2}),
+  #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, false, #{notify_queued => true, proxy => P2}),
   State1 = elock_manager:add_request(Req2, State0),
   ?assertEqual([?reply(Tag2, #queued{ ref = Ref2, manager = Self, node = node() })],
     elock_test_utils:collected(P2, 1)),
@@ -1118,7 +1137,7 @@ waiting_request_proxy_test(Config)->
   C3 = elock_test_utils:collector(),
   P3 = elock_test_utils:collector(),
   #request{ref = Ref3, tag = Tag3} = Req3 =
-    request(Scope, 3, C3, false, #{proxy => P3, timeout => 100}),
+    request(Scope, 3, C3, false, #{notify_queued => true, proxy => P3, timeout => 100}),
   State3 = elock_manager:add_request(Req3, State0),
   [?reply(Tag3, #queued{ref = Ref3})] = elock_test_utils:collected(P3, 1),
   #state{requests = #{ Ref3 := #req{ timer = Timer3, proxy = P3, tag = Tag3 } }} = State3,
@@ -1132,7 +1151,7 @@ waiting_request_proxy_test(Config)->
   % the client is gone: nobody to serve, the proxy is killed
   C5 = elock_test_utils:collector(),
   P5 = elock_test_utils:collector(),
-  #request{ref = Ref5, tag = Tag5} = Req5 = request(Scope, 5, C5, false, #{proxy => P5}),
+  #request{ref = Ref5, tag = Tag5} = Req5 = request(Scope, 5, C5, false, #{notify_queued => true, proxy => P5}),
   State7 = elock_manager:add_request(Req5, State0),
   [?reply(Tag5, #queued{ref = Ref5})] = elock_test_utils:collected(P5, 1),
   State8 = elock_manager:handle_down(C5, State7),
@@ -1442,7 +1461,7 @@ handle_unlock_waiter_test(Config)->
   C3 = elock_test_utils:collector(),
   P2 = elock_test_utils:collector(),
   #request{ref = Ref1} = Req1 = request(Scope, 1, C1, true),
-  #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, false, #{proxy => P2}),
+  #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, false, #{notify_queued => true, proxy => P2}),
   #request{ref = Ref3, tag = Tag3} = Req3 = request(Scope, 3, C3, true),
   State0 = initial_state(Scope, Req1),
   State1 = elock_manager:add_request(Req2, State0),
@@ -1492,7 +1511,7 @@ handle_down_test(Config)->
   C4 = elock_test_utils:collector(),
   #request{ref = Ref1} = Req1 = request(Scope, 1, C1, true),
   #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, true),
-  Req3 = request(Scope, 3, C2, false),
+  #request{ref = Ref3, tag = Tag3} = Req3 = request(Scope, 3, C2, false),
   #request{ref = Ref4, tag = Tag4} = Req4 = request(Scope, 4, C4, false),
   State0 = initial_state(Scope, Req1),
   State1 = elock_manager:add_request(Req2, State0),
@@ -1505,6 +1524,8 @@ handle_down_test(Config)->
   ?assertEqual(lists:sort([{process, C1}, {process, C2}, {process, C4}]), monitors()),
 
   State4 = elock_manager:handle_down(C2, State3),
+  ?assertEqual([?reply(Tag3, #withdrawn{ref = Ref3})],
+    elock_test_utils:collected(C2, 1)),
 
   #state{clients = #clients{
     clients = #{ C4 := #client{monitor_ref = Mon4} },
@@ -1823,7 +1844,7 @@ postponed_asked_when_taken_test(Config)->
   Req1 = request(Scope, 1, C1, false),
   #request{ref = Ref2} = Req2 = request(Scope, 2, C2, false),
   #request{ref = Ref3, tag = Tag3} = Req3 = request(Scope, 3, C3, false,
-    #{proxy => P3}),
+    #{notify_queued => true, proxy => P3}),
   Queued = ?reply(Tag3, #queued{ ref = Ref3, manager = Self, node = node() }),
   State0 = initial_state(Scope, Req1),
 
@@ -1848,25 +1869,30 @@ postponed_asked_when_taken_test(Config)->
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  kill_proxy/1: a proxy other than the client is killed, the
-%%  client itself as the proxy is left alone, no proxy is fine
+%%  release_proxy/1: a proxy other than the client is killed, the
+%%  client itself receives its tagged withdrawal and stays alive; no proxy
+%%  sends nothing
 %%-----------------------------------------------------------------
-kill_proxy_test(_Config)->
+release_proxy_test(_Config)->
+  Ref = make_ref(),
+  Tag = make_ref(),
   Client = elock_test_utils:collector(),
   Proxy = elock_test_utils:collector(),
 
-  ?assertEqual(ok, elock_manager:kill_proxy(#req{ client = Client, proxy = Proxy })),
+  ?assertEqual(ok, elock_manager:release_proxy(#req{ client = Client, proxy = Proxy })),
   elock_test_utils:wait_dead(Proxy),
   ?assert(is_process_alive(Client)),
 
-  ?assertEqual(ok, elock_manager:kill_proxy(#req{ client = Client, proxy = Client })),
-  ?assertEqual(ok, elock_manager:kill_proxy(#req{ client = Client, proxy = undefined })),
+  ?assertEqual(ok, elock_manager:release_proxy(#req{ref = Ref, tag = Tag, client = Client, proxy = Client})),
+  ?assertEqual(ok, elock_manager:release_proxy(#req{ client = Client, proxy = undefined })),
   ?assert(is_process_alive(Client)),
+  ?assertEqual([?reply(Tag, #withdrawn{ref = Ref})],
+    elock_test_utils:collected(Client, 1)),
   ?NO_MESSAGE.
 
 %%-----------------------------------------------------------------
-%%  Only a proxy other than the client receives #queued{}, with the request
-%%  tag preserved, including an undefined tag.
+%%  The flag enables #queued{} for either kind of pid proxy, with the
+%%  request tag preserved, including an undefined tag.
 %%-----------------------------------------------------------------
 notify_queued_test(_Config)->
   Client = elock_test_utils:collector(),
@@ -1874,10 +1900,17 @@ notify_queued_test(_Config)->
   lists:foreach(fun(Tag)->
     Ref = make_ref(),
     Request = #request{ref = Ref, client = Client, tag = Tag},
-    _ = elock_manager:notify_queued(Request#request{proxy = Proxy}),
-    ?assertEqual([?reply(Tag, #queued{ref = Ref, manager = self(), node = node()})],
-      elock_test_utils:collected(Proxy, 1)),
-    _ = elock_manager:notify_queued(Request#request{proxy = Client}),
+    lists:foreach(fun(Pid)->
+      _ = elock_manager:notify_queued(Request#request{proxy = Pid,
+        notify_queued = true}),
+      ?assertEqual([?reply(Tag, #queued{ref = Ref, manager = self(), node = node()})],
+        elock_test_utils:collected(Pid, 1)),
+      _ = elock_manager:notify_queued(Request#request{proxy = Pid,
+        notify_queued = false}),
+      ?NO_MESSAGE
+    end, [Client, Proxy]),
+    _ = elock_manager:notify_queued(Request#request{proxy = undefined,
+      notify_queued = true}),
     ?NO_MESSAGE
   end, [make_ref(), undefined]).
 
@@ -2070,11 +2103,11 @@ handle_nodedown_test(Config)->
   P2 = elock_test_utils:collector(),
   P3 = elock_test_utils:collector(),
   #request{ref = Ref1, tag = Tag1} = Req1 =
-    request(Scope, 1, C1, true, #{proxy => P1}),
+    request(Scope, 1, C1, true, #{notify_queued => true, proxy => P1}),
   #request{ref = Ref2, tag = Tag2} = Req2 =
-    request(Scope, 2, C2, true, #{proxy => P2}),
+    request(Scope, 2, C2, true, #{notify_queued => true, proxy => P2}),
   #request{ref = Ref3, tag = Tag3} = Req3 =
-    request(Scope, 3, C3, false, #{proxy => P3}),
+    request(Scope, 3, C3, false, #{notify_queued => true, proxy => P3}),
   #request{ref = Ref4, tag = Tag4} = Req4 =
     request(Scope, 4, C4, false),
   State1 = elock_manager:add_request(Req1, empty_state(Scope)),
@@ -2202,7 +2235,7 @@ untagged_request_test(Config)->
   C2 = elock_test_utils:collector(),
   P2 = elock_test_utils:collector(),
   #request{ref = Ref1} = Req1 = request(Scope, 1, C1, false),
-  Tagged = request(Scope, 2, C2, false, #{proxy => P2}),
+  Tagged = request(Scope, 2, C2, false, #{notify_queued => true, proxy => P2}),
   #request{ref = Ref2} = Req2 = Tagged#request{tag = undefined},
   State0 = initial_state(Scope, Req1),
 
@@ -2235,7 +2268,7 @@ barging_queued_test(Config)->
   Req1 = request(Scope, 1, C1, true),
   #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, C2, true),
   #request{ref = Ref3, tag = Tag3} = Req3 =
-    request(Scope, 3, C1, false, #{proxy => Proxy}),
+    request(Scope, 3, C1, false, #{notify_queued => true, proxy => Proxy}),
   State0 = elock_manager:add_request(Req2, initial_state(Scope, Req1)),
   [?reply(Tag2, #locked{ref = Ref2})] = elock_test_utils:collected(C2, 1),
   State1 = elock_manager:enqueue_barging(Req3, State0),
@@ -2255,17 +2288,18 @@ barging_queued_test(Config)->
 %%  manager and the table is empty
 %%-----------------------------------------------------------------
 manager_lifecycle_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   C1 = elock_test_utils:client(),
   C2 = elock_test_utils:client(),
   #request{ref = Ref1} = Req1 = request(Scope, undefined, C1, false),
   #request{ref = Ref2} = Req2 = request(Scope, undefined, C2, false),
 
-  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1) end),
+  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1, OnQueued) end),
   ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 1}]),
   MonRef = erlang:monitor(process, Manager),
 
-  R2 = elock_test_utils:cast(C2, fun()-> elock_manager:lock(Req2) end),
+  R2 = elock_test_utils:cast(C2, fun()-> elock_manager:lock(Req2, OnQueued) end),
   ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 2}]),
   ?assertEqual(timeout, elock_test_utils:result(R2, ?QUIET)),
 
@@ -2289,11 +2323,12 @@ manager_lifecycle_test(Config)->
 %%  it normally
 %%-----------------------------------------------------------------
 manager_new_round_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   C1 = elock_test_utils:client(),
   #request{ref = Ref1} = Req1 = request(Scope, undefined, C1, false),
 
-  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1) end),
+  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1, OnQueued) end),
   ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 1}]),
   MonRef = erlang:monitor(process, Manager),
 
@@ -2319,21 +2354,21 @@ manager_new_round_test(Config)->
 %%  serving in order and ends normally
 %%-----------------------------------------------------------------
 manager_ignores_unexpected_message_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   C1 = elock_test_utils:client(),
   C2 = elock_test_utils:client(),
   #request{ref = Ref1} = Req1 = request(Scope, undefined, C1, false),
   Req2 = request(Scope, undefined, C2, false),
 
-  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1) end),
+  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1, OnQueued) end),
   ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 1}]),
   MonRef = erlang:monitor(process, Manager),
 
   Manager ! garbage,
   Manager ! #deadlock{ref = Ref1, winner = ?WINNER},
-  Manager ! #add_held_locks{ref = Ref1, held = #{}},
   Manager ! {unexpected, self(), make_ref()},
-  R2 = elock_test_utils:cast(C2, fun()-> elock_manager:lock(Req2) end),
+  R2 = elock_test_utils:cast(C2, fun()-> elock_manager:lock(Req2, OnQueued) end),
   ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 2}]),
   ?assertEqual(timeout, elock_test_utils:result(R2, ?QUIET)),
   ?assert(is_process_alive(Manager)),
@@ -2352,19 +2387,20 @@ manager_ignores_unexpected_message_test(Config)->
 %%  queued request withdrawn by the client is removed and its proxy killed.
 %%-----------------------------------------------------------------
 manager_tagged_replies_test(Config)->
+  OnQueued = unexpected_queued(self()),
   Scope = ?config(scope, Config),
   Self = self(),
   C1 = elock_test_utils:client(),
   P2 = elock_test_utils:collector(),
   #request{ref = Ref1} = Req1 = request(Scope, undefined, C1, false),
 
-  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1) end),
+  {ok, Manager} = elock_test_utils:call(C1, fun()-> elock_manager:lock(Req1, OnQueued) end),
   ?WAIT(elock_test_utils:locks(Scope) =:= [{?TERM, Manager, 1}]),
   MonRef = erlang:monitor(process, Manager),
 
   % A queued proxy is notified, then killed by withdrawal.
   ?assertEqual(2, ets:update_counter(Scope, ?TERM, {3, 1})),
-  #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, Self, false, #{proxy => P2}),
+  #request{ref = Ref2, tag = Tag2} = Req2 = request(Scope, 2, Self, false, #{notify_queued => true, proxy => P2}),
   Manager ! Req2,
   ?assertEqual([?reply(Tag2,
     #queued{ref = Ref2, manager = Manager, node = node()})],
@@ -2399,7 +2435,7 @@ manager_tagged_replies_test(Config)->
   elock_test_utils:stop(C1).
 
 % The request of Client. Without a ticket it is the request as
-% elock:lock/4 builds it: lock/1 takes the ticket and names the
+% elock:lock/4 builds it: lock/2 takes the ticket and names the
 % proxy and the tag. With a ticket it is the request as the manager
 % gets it: the proxy is the client as for a single node request
 % unless the options name another one, the tag is its own for every
@@ -2416,7 +2452,8 @@ request(Scope, undefined, Client, Shared, Options)->
     proxy = undefined,
     tag = undefined,
     shared = Shared,
-    timeout = maps:get(timeout, Options, undefined)
+    timeout = maps:get(timeout, Options, undefined),
+    notify_queued = maps:get(notify_queued, Options, false)
   };
 request(Scope, Ticket, Client, Shared, Options)->
   Request = request(Scope, undefined, Client, Shared, Options),
@@ -2522,3 +2559,102 @@ stand_in(Fun)->
     ?RECEIVE(go),
     exit({returned, Fun()})
   end).
+
+%% An unexpected callback is visible to the testcase, even from a proxy.
+unexpected_queued(Parent)->
+  fun(Queued, Tag)-> Parent ! {unexpected_queued, self(), Queued, Tag} end.
+
+%% A monitored graph stand-in exercises the direct waiter's nested receive.
+%% The unrelated DOWNs remain visible and one correlated reply is sufficient.
+direct_waiter_deadlock_test(Config)->
+  Scope = ?config(scope, Config),
+  Parent = self(),
+  true = ets:insert(Scope, {?TERM, Parent, 1}),
+  lists:foreach(fun(Kind)->
+    Client = elock_test_utils:client(),
+    #request{ref = Ref} = Request = request(Scope, undefined, Client, false,
+      #{notify_queued => true}),
+    OnQueued = fun(Queued, Attempt)->
+      Graphs = [spawn_monitor(fun()-> ?RECEIVE(stop) end) || _ <- lists:seq(1, 3)],
+      Parent ! {callback_graphs, self(), Queued, Attempt, Graphs}
+    end,
+    Pending = elock_test_utils:cast(Client, fun()-> elock_manager:lock(Request, OnQueued) end),
+    #request{ref = Ref, proxy = Client, tag = Tag} = ?RECEIVE(#request{}),
+    Queued = #queued{ref = Ref, manager = Parent, node = node()},
+    Client ! ?reply(Tag, Queued),
+    {callback_graphs, Client, Queued, Tag, [{Graph, _}, {ForeignGraph, ForeignMon}, {OtherGraph, OtherMon}]} =
+      ?RECEIVE({callback_graphs, Client, _, _, _}),
+    OtherTag = make_ref(),
+    ForeignReason = {OtherTag, #deadlock{ref = Ref, winner = ?WINNER}},
+    exit(ForeignGraph, ForeignReason),
+    ForeignDown = {'DOWN', ForeignMon, process, ForeignGraph, ForeignReason},
+    ?WAIT(case process_info(Client, messages) of
+      {messages, Messages}-> lists:member(ForeignDown, Messages)
+    end),
+    exit(OtherGraph, kill),
+    Foreign = [ForeignDown, {'DOWN', OtherMon, process, OtherGraph, killed}],
+    ?WAIT(process_info(Client, messages) =:= {messages, Foreign}),
+    ?assertEqual(timeout, elock_test_utils:result(Pending, ?QUIET)),
+    exit(Graph, {Tag, #deadlock{ref = Ref, winner = ?WINNER}}),
+    ?assertEqual(#unlock{ref = Ref}, ?RECEIVE(#unlock{})),
+    ?assertEqual(timeout, elock_test_utils:result(Pending, ?QUIET)),
+    Reply = case Kind of
+      withdrawn-> #withdrawn{ref = Ref};
+      locked-> #locked{ref = Ref};
+      timeout-> #timeout{ref = Ref}
+    end,
+    Client ! ?reply(Tag, Reply),
+    ?assertEqual({ok, {error, {deadlock, ?WINNER}}},
+      elock_test_utils:result(Pending, ?DEADLINE)),
+    % Only the util client's parent monitor remains, not the attempt monitor.
+    ?WAIT(monitors_by(Client) =:= 1),
+    ?assertEqual({messages, Foreign}, process_info(Client, messages)),
+    ?assertEqual(Foreign, elock_test_utils:call(Client, fun elock_test_utils:flush/0)),
+    ?assertEqual({messages, []}, process_info(Client, messages)),
+    ?NO_MESSAGE,
+    elock_test_utils:stop(Client)
+  end, [withdrawn, locked, timeout]).
+
+%% Withdrawing an exclusive head or a pending upgrade unblocks the shared
+%% follower. A timeout also dequeues, but sends only its timeout verdict.
+withdraw_direct_waiter_test(Config)->
+  Scope = ?config(scope, Config),
+  lists:foreach(fun({Mode, How})->
+    [C1, C2, C3] = [elock_test_utils:collector() || _ <- lists:seq(1, 3)],
+    Req1 = request(Scope, 1, C1, true),
+    Initial = initial_state(Scope, Req1),
+    {Base, WaitingClient} = case Mode of
+      queued-> {Initial, C2};
+      upgrade->
+        Req2 = request(Scope, 2, C2, true),
+        Shared = elock_manager:add_request(Req2, Initial),
+        ?assertEqual([?reply(Req2#request.tag, #locked{ref = Req2#request.ref})],
+          elock_test_utils:collected(C2, 1)),
+        {Shared, C1}
+    end,
+    #request{ref = Ref, tag = Tag} = Req = request(Scope, 3, WaitingClient, false),
+    Waiting = elock_manager:add_request(Req, Base),
+    case Mode of
+      queued-> ?assertEqual([{3, Ref}], gb_sets:to_list(Waiting#state.queue));
+      upgrade-> ?assertEqual(Req, Waiting#state.barging)
+    end,
+    #request{ref = NextRef, tag = NextTag} = Next = request(Scope, 4, C3, true),
+    Behind = elock_manager:add_request(Next, Waiting),
+    ?NO_MESSAGE,
+    {After, Reply} = case How of
+      unlock-> {elock_manager:handle_unlock(Ref, Behind), #withdrawn{ref = Ref}};
+      timeout-> {elock_manager:handle_timeout(Ref, Behind), #timeout{ref = Ref}}
+    end,
+    ?assertEqual([?reply(Tag, Reply)], elock_test_utils:collected(WaitingClient, 1)),
+    ?assert(is_process_alive(WaitingClient)),
+    ?assertEqual([?reply(NextTag, #locked{ref = NextRef})],
+      elock_test_utils:collected(C3, 1)),
+    ?assertEqual([], gb_sets:to_list(After#state.queue)),
+    ?assertEqual(undefined, After#state.barging),
+    ?assertNot(is_map_key(Ref, After#state.requests)),
+    ?assertEqual((Base#state.holders)#{NextRef => {true, C3}}, After#state.holders),
+    ?NO_MESSAGE,
+    [erlang:demonitor(Mon, [flush]) || #client{monitor_ref = Mon} <-
+      maps:values((After#state.clients)#clients.clients)],
+    [elock_test_utils:stop(C) || C <- [C1, C2, C3]]
+  end, [{queued, unlock}, {upgrade, unlock}, {queued, timeout}, {upgrade, timeout}]).

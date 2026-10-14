@@ -45,12 +45,6 @@
   tag
 }).
 
-% Client -> manager: the answer to #queued{} and every later grant
--record(add_held_locks,{
-  ref :: reference(),
-  held :: held_locks()
-}).
-
 % Walker -> graph helper: its exit reports the verdict to the client.
 % Manager -> proxy: the request has lost
 -record(deadlock,{

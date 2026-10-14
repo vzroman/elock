@@ -3,7 +3,8 @@
 %%  the client API with real clients and real managers: the modes,
 %%  the order of the queue, re-entrancy and upgrades, the timeouts,
 %%  the death of clients and of managers, unlock, the scope and
-%%  the mailbox of a waiting client.
+%%  the mailbox of a waiting client. Local requests wait directly; a
+%%  holding client starts its graph worker on the first queued notice.
 %%
 %%  The clients are elock_test_utils clients: every lock and unlock
 %%  of one logical client runs inside the same process, the lock
@@ -32,7 +33,7 @@
 
 %% Test cases
 -export([
-  holding_client_request_path_test/1,
+  request_path_test/1,
   exclusive_blocks_exclusive_test/1,
   shared_shares_test/1,
   exclusive_blocks_shared_test/1,
@@ -98,6 +99,7 @@
 -record(retry,{
   ref
 }).
+-record(withdrawn,{ref}).
 -define(reply(Tag, Message), {Tag, Message}).
 
 -define(SHARED, #{is_shared => true}).
@@ -124,7 +126,7 @@ all()->
 groups()->
   [
     {basic, [], [
-      holding_client_request_path_test,
+      request_path_test,
       exclusive_blocks_exclusive_test,
       shared_shares_test,
       exclusive_blocks_shared_test,
@@ -225,33 +227,30 @@ end_per_testcase(_TestCase, Config)->
 %%=================================================================
 %%  Basic
 %%=================================================================
-%% A held context has a local proxy and graph worker; a fresh one is direct.
-holding_client_request_path_test(Config)->
+%% Both local waiters are direct; only the holding waiter spawns a graph.
+request_path_test(Config)->
   Scope = ?config(scope, Config),
   Node = node(),
   [C1, C2, C3] = clients(3),
   {ok, Ref1} = elock_test_utils:lock(C1, Scope, t1, [Node]),
   {ok, Ref2} = elock_test_utils:lock(C2, Scope, t2, [Node]),
   Request = elock_test_utils:lock_queued(C1, Scope, t2, [Node], #{}),
-  [Worker] = processes_in({elock_manager, wait_verdict, 3}),
-  [Graph] = processes_in({elock_context, graph_loop, 1}),
-  ?assertNotEqual(C1, Worker),
-  ?assertEqual({monitored_by, []}, process_info(Worker, monitored_by)),
+  ?assertEqual([C1], processes_in({elock_manager, wait_verdict, 4})),
+  ?assertEqual([], processes_in({ecall_connection, call, 4})),
+  [Graph] = processes_in({elock_graph, graph_loop, 1}),
   ?assertEqual({monitors, [{process, C1}]}, process_info(Graph, monitors)),
-  ?assertEqual({current_function, {elock_context, wait_verdict, 2}},
-    process_info(C1, current_function)),
   ?assertMatch([#waiter{client = Graph}], elock_test_utils:graph_rows(Scope, t2)),
   ok = elock_test_utils:unlock(C2, Ref2),
   Ref3 = granted(Request),
-  elock_test_utils:wait_dead(Worker),
   elock_test_utils:wait_dead(Graph),
   ?WAIT(elock_test_utils:graph_rows(Scope, t2) =:= []),
   Manager = elock_test_utils:wait_manager(Scope, t2),
-  ?assertEqual(#{Node => #node{manager = Manager, holder = Worker}},
-    elock_test_utils:lock_nodes(C1, Ref3, {held_something, #{Node => Manager}})),
+  #context{ref2lock = Locks} = elock_test_utils:context(C1),
+  ?assertEqual(#{Node => #node{manager = Manager}}, (maps:get(Ref3, Locks))#lock.nodes),
   Fresh = elock_test_utils:lock_queued(C3, Scope, t1, [Node], #{}),
-  ?assertEqual([C3], processes_in({elock_manager, wait_verdict, 3})),
-  ?assertEqual([], processes_in({elock_context, graph_loop, 1})),
+  ?assertEqual([C3], processes_in({elock_manager, wait_verdict, 4})),
+  ?assertEqual([], processes_in({ecall_connection, call, 4})),
+  ?assertEqual([], processes_in({elock_graph, graph_loop, 1})),
   ?assertEqual([], elock_test_utils:graph_rows(Scope, t1)),
   ok = elock_test_utils:unlock(C1, Ref1),
   Ref4 = granted(Fresh),
@@ -517,8 +516,7 @@ reentrant_exclusive_test(Config)->
   Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => Lock, Ref2 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref2,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref1 => Lock, Ref2 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{ {Scope, t, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -531,8 +529,7 @@ reentrant_exclusive_test(Config)->
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref2 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref2,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref2 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{}
   }, elock_test_utils:context(C1)),
@@ -564,8 +561,7 @@ reentrant_shared_with_exclusive_waiter_test(Config)->
   Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{ {Scope, t, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -608,8 +604,7 @@ upgrade_test(Config)->
   Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{ {Scope, t, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -663,8 +658,7 @@ upgrade_conflict_test(Config)->
   Ref3 = granted(Up1),
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{ {Scope, t, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -726,8 +720,7 @@ exclusive_holder_requests_shared_test(Config)->
   Lock = #lock{ scope = Scope, term = t, nodes = #{ Node => #node{manager = Manager} } },
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref1 => Lock, Ref3 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{ {Scope, t, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -828,8 +821,7 @@ different_scopes_independent_test(Config)->
     birth = elock_test_utils:context_birth(C1),
     ref2lock = #{
       Ref1 => #lock{ scope = Scope1, term = t, nodes = #{ Node => #node{manager = M1} } },
-      Ref2 => #lock{ scope = Scope2, term = t, nodes = elock_test_utils:lock_nodes(C1, Ref2,
-        {held_something, #{Node => M2}}) }
+      Ref2 => #lock{ scope = Scope2, term = t, nodes = #{Node => #node{manager = M2}} }
     },
     locked = #{
       {Scope1, t, Node} => M1,
@@ -884,13 +876,10 @@ term_types_test(Config)->
   ?assertEqual(length(Terms), length(lists:usort(Managers))),
   ?assertEqual(length(Terms), length(elock_test_utils:locks(Scope))),
   [ ?assertEqual([{Term, Manager, 1}], ets:lookup(Scope, Term)) || {Term, Manager} <- lists:zip(Terms, Managers) ],
-  {_FirstTerm, FirstRef} = hd(Locks),
   Context = elock_test_utils:context(C1),
   #context{locked = Locked, counts = Counts} = Context,
   ExpectedRefs = maps:from_list([ {Ref, #lock{scope = Scope, term = Term,
-    nodes = elock_test_utils:lock_nodes(C1, Ref,
-      {case Ref of FirstRef-> held_nothing; _-> held_something end,
-        #{Node => Manager}})}}
+    nodes = #{Node => #node{manager = Manager}}}}
     || {{Term, Ref}, Manager} <- lists:zip(Locks, Managers) ]),
   ?assertEqual(#context{ref2lock = ExpectedRefs, locked = Locked, counts = #{},
     birth = elock_test_utils:context_birth(C1)}, Context),
@@ -1079,8 +1068,7 @@ timeout_upgrade_test(Config)->
   {ok, Ref4} = elock_test_utils:lock(C1, Scope, t, [Node], #{timeout => Timeout}),
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => Lock, Ref4 => Lock#lock{nodes = elock_test_utils:lock_nodes(C1, Ref4,
-        {held_something, #{Node => Manager}})} },
+    ref2lock = #{ Ref1 => Lock, Ref4 => Lock#lock{nodes = #{Node => #node{manager = Manager}}} },
     locked = #{ {Scope, t, Node} => Manager },
     counts = #{ {Scope, t, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -1509,12 +1497,9 @@ unlock_order_independent_test(Config)->
   L3 = #lock{ scope = Scope, term = t3, nodes = #{ Node => #node{manager = M3} } },
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => L1, Ref2 => L2#lock{nodes = elock_test_utils:lock_nodes(C1, Ref2,
-        {held_something, #{Node => M2}})},
-      Ref3 => L3#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => M3}})},
-      Ref4 => L1#lock{nodes = elock_test_utils:lock_nodes(C1, Ref4,
-        {held_something, #{Node => M1}})} },
+    ref2lock = #{ Ref1 => L1, Ref2 => L2#lock{nodes = #{Node => #node{manager = M2}}},
+      Ref3 => L3#lock{nodes = #{Node => #node{manager = M3}}},
+      Ref4 => L1#lock{nodes = #{Node => #node{manager = M1}}} },
     locked = #{ {Scope, t1, Node} => M1, {Scope, t2, Node} => M2, {Scope, t3, Node} => M3 },
     counts = #{ {Scope, t1, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -1522,10 +1507,8 @@ unlock_order_independent_test(Config)->
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref2)),
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref1 => L1, Ref3 => L3#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => M3}})},
-      Ref4 => L1#lock{nodes = elock_test_utils:lock_nodes(C1, Ref4,
-        {held_something, #{Node => M1}})} },
+    ref2lock = #{ Ref1 => L1, Ref3 => L3#lock{nodes = #{Node => #node{manager = M3}}},
+      Ref4 => L1#lock{nodes = #{Node => #node{manager = M1}}} },
     locked = #{ {Scope, t1, Node} => M1, {Scope, t3, Node} => M3 },
     counts = #{ {Scope, t1, Node} => 2 }
   }, elock_test_utils:context(C1)),
@@ -1534,10 +1517,8 @@ unlock_order_independent_test(Config)->
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref3 => L3#lock{nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => M3}})},
-      Ref4 => L1#lock{nodes = elock_test_utils:lock_nodes(C1, Ref4,
-        {held_something, #{Node => M1}})} },
+    ref2lock = #{ Ref3 => L3#lock{nodes = #{Node => #node{manager = M3}}},
+      Ref4 => L1#lock{nodes = #{Node => #node{manager = M1}}} },
     locked = #{ {Scope, t1, Node} => M1, {Scope, t3, Node} => M3 },
     counts = #{}
   }, elock_test_utils:context(C1)),
@@ -1546,8 +1527,7 @@ unlock_order_independent_test(Config)->
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref3)),
   ?assertEqual(#context{
     birth = elock_test_utils:context_birth(C1),
-    ref2lock = #{ Ref4 => L1#lock{nodes = elock_test_utils:lock_nodes(C1, Ref4,
-        {held_something, #{Node => M1}})} },
+    ref2lock = #{ Ref4 => L1#lock{nodes = #{Node => #node{manager = M1}}} },
     locked = #{ {Scope, t1, Node} => M1 },
     counts = #{}
   }, elock_test_utils:context(C1)),
@@ -1615,8 +1595,8 @@ scope_isolation_test(Config)->
   stop([C1, C2, C3, C4]).
 
 %%-----------------------------------------------------------------
-%%  The client holds t1 and asks through a worker. Foreign replies stay
-%%  in its mailbox while wait_verdict/2 consumes its own relayed #queued{}.
+%%  The client holds t1 and waits directly. Foreign replies stay
+%%  in its mailbox while wait_verdict/4 consumes its tagged #queued{}.
 %%  Timeout, grant and release preserve those unrelated messages exactly.
 %%-----------------------------------------------------------------
 waiting_client_mailbox_test(Config)->
@@ -1632,16 +1612,19 @@ waiting_client_mailbox_test(Config)->
     #locked{ref = Ref1},
     #timeout{ref = Ref1},
     #retry{ref = Ref1},
+    #withdrawn{ref = Ref1},
     #deadlock{ref = Ref1, winner = {Scope, t2, Node}},
     #queued{ref = Ref1, manager = M2, node = Node}
   ],
   Tag = make_ref(),
   Mailbox = Verdicts
     ++ [ ?reply(Tag, Verdict) || Verdict <- Verdicts ]
-    ++ [ {'DOWN', Tag, process, M2, normal} ],
+    ++ [ {'DOWN', Tag, process, M2, normal},
+      {'DOWN', make_ref(), process, M2,
+        {Tag, #deadlock{ref = Ref1, winner = {Scope, t2, Node}}}} ],
   [ C1 ! Message || Message <- Mailbox ],
 
-  % Holding t1 selects a worker; wait_verdict/2 consumes its relayed #queued{}.
+  % The holding client waits directly in elock_manager:wait_verdict/4.
   % The request runs out
   ?assertEqual({error, timeout}, elock_test_utils:lock(C1, Scope, t2, [Node], #{timeout => 100})),
   ?assertEqual({messages, Mailbox}, process_info(C1, messages)),
@@ -1651,7 +1634,7 @@ waiting_client_mailbox_test(Config)->
   R3 = elock_test_utils:lock_async(C1, Scope, t2, [Node], ?EXCLUSIVE),
   ?WAIT(elock_test_utils:published(Node, C1, Scope, t2)),
   ?WAIT(process_info(C1, current_function) =:=
-    {current_function, {elock_context, wait_verdict, 2}}),
+    {current_function, {elock_manager, wait_verdict, 4}}),
   still_waiting(R3),
   ?assertEqual({messages, Mailbox}, process_info(C1, messages)),
   ?assertEqual(ok, elock_test_utils:unlock(C2, Ref2)),
@@ -1661,8 +1644,7 @@ waiting_client_mailbox_test(Config)->
     birth = elock_test_utils:context_birth(C1),
     ref2lock = #{
       Ref1 => #lock{ scope = Scope, term = t1, nodes = #{ Node => #node{manager = M1} } },
-      Ref3 => #lock{ scope = Scope, term = t2, nodes = elock_test_utils:lock_nodes(C1, Ref3,
-        {held_something, #{Node => M2}}) }
+      Ref3 => #lock{ scope = Scope, term = t2, nodes = #{Node => #node{manager = M2}} }
     },
     locked = #{ {Scope, t1, Node} => M1, {Scope, t2, Node} => M2 },
     counts = #{}

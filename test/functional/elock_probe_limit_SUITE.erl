@@ -2,7 +2,7 @@
 %%=================================================================
 %%  Context lifetime and bounded deadlock walks. The graph fixtures
 %%  describe reachable waiter rows; the age test uses real managers
-%%  on two nodes and observes the client's graph publications.
+%%  on two nodes and observes publications by the elock_graph graph worker.
 %%=================================================================
 -module(elock_probe_limit_SUITE).
 

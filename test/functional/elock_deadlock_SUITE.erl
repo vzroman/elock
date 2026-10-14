@@ -1,6 +1,6 @@
 %%=================================================================
-%% Single-node deadlock scenarios: each client's graph worker publishes its
-%% request to the graph of the lock node, and the walk expands held keys.
+%% Single-node deadlock scenarios: the first #queued{} spawns the client's
+%% graph worker, which publishes its request to the graph of the lock node, and the walk expands held keys.
 %% Earlier context birth wins; the youngest request closing a sequential
 %% cycle loses. lock_queued waits for publication and a completed walk before
 %% issuing the next request. A loser releases its holds so winners can drain.
@@ -597,8 +597,7 @@ loser_keeps_other_locks_test(Config)->
       OtherRef => #lock{
         scope = Scope,
         term = OtherTerm,
-        nodes = elock_test_utils:lock_nodes(Loser, OtherRef,
-          {held_something, #{Node => OtherManager}})
+        nodes = #{Node => #node{manager = OtherManager}}
       }
     },
     locked = #{
@@ -952,8 +951,8 @@ ask(Client, Node, {Scope, Term, Options})->
   elock_test_utils:lock_queued(Client, Scope, Term, [Node], Options).
 
 %%-----------------------------------------------------------------
-%%  An upgrade already holds its term: the client waits in wait_verdict/2,
-%%  its proxy in elock_manager:wait_verdict/3. Await publication plus quiet
+%%  An upgrade already holds its term: the client waits directly in
+%%  elock_manager:wait_verdict/4. Await publication plus quiet
 %%  graph work, or a completed request if a second upgrade loses immediately.
 %%-----------------------------------------------------------------
 upgrade_queued(Client, Scope, Term, Node)->
@@ -962,7 +961,7 @@ upgrade_queued(Client, Scope, Term, Node)->
     not elock_test_utils:pending(R)
     orelse (
       process_info(Client, current_function) =:=
-        {current_function, {elock_context, wait_verdict, 2}}
+        {current_function, {elock_manager, wait_verdict, 4}}
       andalso elock_test_utils:published(Node, Client, Scope, Term)
       andalso elock_test_utils:quiet([Node]) =:= true
       andalso elock_test_utils:settled(Client, [Node]) =:= true

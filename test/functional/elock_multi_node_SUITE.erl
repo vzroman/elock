@@ -1,8 +1,10 @@
 %%=================================================================
 %% Functional tests across peer nodes: acquisitions, contention, deadlocks,
 %% failure cleanup and scope membership. Peers run the elock application.
-%% A proxy on each lock node waits in elock_manager:wait_verdict/3 and
+%% Remote and multi-node requests use a proxy on each lock node, waiting
+%% in elock_manager:wait_verdict/4, which
 %% relays #queued{} to elock_context:wait_verdict/2 on the client's node.
+%% A request for the client's own node alone waits directly, with any holds.
 %% The client's graph worker publishes holds to each queued node's graph;
 %% walkers expand held keys and hop between those graphs.
 %% lock_queued waits for tickets, publications and quiet graph work. Casts
@@ -79,6 +81,7 @@
   counts,
   birth
 }).
+-record(node,{manager, holder}).
 -record(lock,{
   scope,
   term,
@@ -96,6 +99,7 @@
 -record(retry,{
   ref
 }).
+-record(withdrawn,{ref}).
 -define(reply(Tag, Message), {Tag, Message}).
 
 -define(SHARED, #{is_shared => true}).
@@ -315,7 +319,7 @@ single_remote_node_lock_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C1, Ref,
-        {held_nothing, #{ N2 => Manager }})
+        #{ N2 => Manager })
     } },
     locked = #{ {Scope, t, N2} => Manager },
     counts = #{}
@@ -353,7 +357,7 @@ duplicate_nodes_collapse_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C1, Ref,
-        {held_nothing, #{ N2 => Manager }})
+        #{ N2 => Manager })
     } },
     locked = #{ {Scope, t, N2} => Manager },
     counts = #{}
@@ -389,7 +393,7 @@ multi_node_lock_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C1, Ref,
-        {held_nothing, #{ N1 => M1, N2 => M2, N3 => M3 }})
+        #{ N1 => M1, N2 => M2, N3 => M3 })
     } },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N2} => M2, {Scope, t, N3} => M3 },
     counts = #{}
@@ -424,10 +428,10 @@ context_spans_nodes_test(Config)->
         scope = Scope,
         term = t,
         nodes = elock_test_utils:lock_nodes(C1, RefT,
-          {held_nothing, #{ N1 => MT1, N2 => MT2 }})
+          #{ N1 => MT1, N2 => MT2 })
       },
       RefU => #lock{ scope = Scope, term = u, nodes = elock_test_utils:lock_nodes(C1, RefU,
-        {held_nothing, #{ N3 => MU3 }}) }
+        #{ N3 => MU3 }) }
     },
     locked = #{
       {Scope, t, N1} => MT1,
@@ -449,7 +453,7 @@ context_spans_nodes_test(Config)->
       scope = Scope,
       term = u,
       nodes = elock_test_utils:lock_nodes(C1, RefU,
-        {held_nothing, #{ N3 => MU3 }})
+        #{ N3 => MU3 })
     } },
     locked = #{ {Scope, u, N3} => MU3 },
     counts = #{}
@@ -486,7 +490,7 @@ shared_multi_node_test(Config)->
   [ begin
       Lock = #lock{ scope = Scope, term = t,
         nodes = elock_test_utils:lock_nodes(C, Ref,
-          {held_nothing, #{ N1 => M1, N2 => M2 }}) },
+          #{ N1 => M1, N2 => M2 }) },
       ?assertEqual(#context{
         birth = elock_test_utils:context_birth(C),
         ref2lock = #{ Ref => Lock },
@@ -510,7 +514,7 @@ shared_multi_node_test(Config)->
     birth = elock_test_utils:context_birth(C4),
     ref2lock = #{ Ref4 => #lock{scope = Scope, term = t,
       nodes = elock_test_utils:lock_nodes(C4, Ref4,
-        {held_nothing, #{ N1 => M1, N2 => M2 }})} },
+        #{ N1 => M1, N2 => M2 })} },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N2} => M2 },
     counts = #{}
   }, elock_test_utils:context(C4)),
@@ -555,7 +559,7 @@ multi_node_contention_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C2, Ref2,
-        {held_nothing, #{ N1 => M1, N2 => M2, N3 => M3 }})
+        #{ N1 => M1, N2 => M2, N3 => M3 })
     } },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N2} => M2, {Scope, t, N3} => M3 },
     counts = #{}
@@ -639,7 +643,7 @@ multi_node_partial_grant_then_wait_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C2, Ref2,
-        {held_nothing, #{ N1 => M1, N2 => M2, N3 => M3 }})
+        #{ N1 => M1, N2 => M2, N3 => M3 })
     } },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N2} => M2, {Scope, t, N3} => M3 },
     counts = #{}
@@ -747,6 +751,7 @@ waiting_client_mailbox_remote_test(Config)->
     #locked{ref = RefU},
     #timeout{ref = RefU},
     #retry{ref = RefU},
+    #withdrawn{ref = RefU},
     #deadlock{ref = RefU, winner = {Scope, t, N2}},
     #queued{ref = RefU, manager = MU, node = N2}
   ],
@@ -764,7 +769,7 @@ waiting_client_mailbox_remote_test(Config)->
     fun(LockNodes)->
       {ok, Ref2} = elock_test_utils:lock(C2, Scope, t, [N2]),
 
-      % Holding u selects workers; its graph worker publishes at queued nodes.
+      % A request naming a remote node runs through workers; its graph worker publishes at queued nodes.
       ?assertEqual({error, timeout}, elock_test_utils:lock(C1, Scope, t, LockNodes, #{timeout => 100})),
       ?assertEqual(Mailbox, mailbox(C1)),
 
@@ -785,10 +790,10 @@ waiting_client_mailbox_remote_test(Config)->
         ref2lock = #{
           RefU => #lock{ scope = Scope, term = u,
             nodes = elock_test_utils:lock_nodes(C1, RefU,
-              {held_nothing, #{ N1 => MU }}) },
+              #{ N1 => MU }) },
           Ref => #lock{ scope = Scope, term = t,
             nodes = elock_test_utils:lock_nodes(C1, Ref,
-              {held_nothing, Managers}) }
+              Managers) }
         },
         locked = maps:fold(
           fun(Node, Manager, Acc)-> Acc#{ {Scope, t, Node} => Manager } end,
@@ -839,7 +844,7 @@ reentry_across_nodes_test(Config)->
       ?WAIT(elock_test_utils:locks(N1, Scope) =:= [{t, M1, 2}]),
       ?assertEqual([{t, M2, 2}], elock_test_utils:locks(N2, Scope)),
       Lock1 = #lock{ scope = Scope, term = t, nodes = elock_test_utils:lock_nodes(C1, Ref1,
-        {held_nothing, #{ N1 => M1 }}) },
+        #{ N1 => M1 }) },
       ?assertEqual(#context{
         birth = elock_test_utils:context_birth(C1),
         ref2lock = #{ Ref1 => Lock1 },
@@ -853,7 +858,7 @@ reentry_across_nodes_test(Config)->
         scope = Scope,
         term = t,
         nodes = elock_test_utils:lock_nodes(C1, Ref3,
-          {held_nothing, #{ N1 => M1, N2 => M2 }})
+          #{ N1 => M1, N2 => M2 })
       },
       ?assertEqual(#context{
         birth = elock_test_utils:context_birth(C1),
@@ -1149,7 +1154,7 @@ deadlock_withdraws_queued_copy_test(Config)->
       scope = Scope,
       term = x,
       nodes = elock_test_utils:lock_nodes(C2, RefX,
-        {held_nothing, #{ N1 => MX }})
+        #{ N1 => MX })
     } },
     locked = #{ {Scope, x, N1} => MX },
     counts = #{}
@@ -1408,7 +1413,7 @@ manager_node_dies_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C1, Ref1,
-        {held_nothing, #{ N1 => M1, N4 => M4 }})
+        #{ N1 => M1, N4 => M4 })
     } },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N4} => M4 },
     counts = #{}
@@ -1529,10 +1534,10 @@ dead_client_leaves_no_workers_test(Config)->
 %%  every node of a multi node request: while the client on n1
 %%  waits for t on n2 there is one worker on n1 (waiting in
 %%  ecall_connection:call/4) and one proxy on n2 (waiting in
-%%  elock_manager:wait_verdict/3). A grant keeps one holder; a failure
+%%  elock_manager:wait_verdict/4). A grant keeps one holder; a failure
 %%  leaves neither. A dead waiter stays until granted, then releases.
-%%  If the client holds nothing, a request to its own node takes no
-%%  worker: the client is the one that waits for the verdict
+%%  A request to its own node alone takes no worker, whatever the client
+%%  holds: the client is the one that waits for the verdict
 %%-----------------------------------------------------------------
 single_remote_node_worker_test(Config)->
   Scope = ?config(scope, Config),
@@ -1583,7 +1588,7 @@ single_remote_node_worker_test(Config)->
   ?assertMatch([_Proxy], proxies(N2)),
   ?assertEqual([{t, M2, 4}], elock_test_utils:locks(N2, Scope)),
 
-  % the node of the client itself: no worker, the client is its own proxy
+  % The client's own node alone is direct, regardless of its held locks.
   R2 = elock_test_utils:lock_queued(N2, C2, Scope, t, [N2], ?EXCLUSIVE),
   still_waiting(R2),
   ?WAIT(lists:member(C2, proxies(N2))),
@@ -1595,6 +1600,24 @@ single_remote_node_worker_test(Config)->
   ?WAIT(none_left(workers(N1))),
   ?assertEqual([], proxies(N2)),
 
+  % C2 now holds t and asks its own node for u: still no call worker.
+  {ok, RefU} = elock_test_utils:lock(C1, Scope, u, [N2]),
+  Holding = elock_test_utils:lock_queued(N2, C2, Scope, u, [N2], ?EXCLUSIVE),
+  still_waiting(Holding),
+  ?assertEqual([], workers(N2)),
+  ?assertEqual([C2], proxies(N2)),
+  ?assertEqual({current_function, {elock_manager, wait_verdict, 4}},
+    rpc(N2, erlang, process_info, [C2, current_function])),
+  [#waiter{client = Graph}] = elock_test_utils:graph_rows(N2, Scope, u),
+  ?assert(monitors(Graph, C2)),
+  ok = elock_test_utils:unlock(C1, RefU),
+  Ref5 = granted(Holding),
+  M5 = elock_test_utils:wait_manager(N2, Scope, u),
+  ?assertEqual(#{N2 => #node{manager = M5}},
+    elock_test_utils:lock_nodes(C2, Ref5, #{N2 => M5})),
+  ?WAIT(not rpc(N2, erlang, is_process_alive, [Graph])),
+  ?WAIT(elock_test_utils:graph_rows(N2, Scope, u) =:= []),
+  ok = elock_test_utils:unlock(C2, Ref5),
   ?assertEqual(ok, elock_test_utils:unlock(C2, Ref4)),
   wait_idle(Nodes, Scope),
   stop([C1, C2]).
@@ -1669,7 +1692,7 @@ ready_nodes_after_restart_test(Config)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(C1, Ref,
-        {held_nothing, #{ N1 => M1, N2 => M2, New => MNew }})
+        #{ N1 => M1, N2 => M2, New => MNew })
     } },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N2} => M2, {Scope, t, New} => MNew },
     counts = #{}
@@ -1729,10 +1752,10 @@ monitors(Manager, Client)->
       false
   end.
 
-% The processes on the node waiting in elock_manager:wait_verdict/3: the
+% The processes on the node waiting in elock_manager:wait_verdict/4: the
 % proxies of the remote requests and the local clients that wait
 proxies(Node)->
-  rpc(Node, ?MODULE, processes_in, [{elock_manager, wait_verdict, 3}]).
+  rpc(Node, ?MODULE, processes_in, [{elock_manager, wait_verdict, 4}]).
 
 % The processes on the node waiting in ecall_connection:call/4: the
 % workers of the requests to a remote node or to several nodes, one
@@ -1780,7 +1803,7 @@ holds_both(Client, Ref, Scope, N1, N2)->
       scope = Scope,
       term = t,
       nodes = elock_test_utils:lock_nodes(Client, Ref,
-        {held_nothing, #{ N1 => M1, N2 => M2 }})
+        #{ N1 => M1, N2 => M2 })
     } },
     locked = #{ {Scope, t, N1} => M1, {Scope, t, N2} => M2 },
     counts = #{}

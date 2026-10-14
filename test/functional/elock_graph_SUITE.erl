@@ -5,7 +5,7 @@
 -include("elock_test.hrl").
 
 %% Common Test callbacks
--export([all/0, init_per_suite/1, end_per_suite/1,
+-export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
   init_per_testcase/2, end_per_testcase/2]).
 
 %% Test cases
@@ -13,14 +13,25 @@
   handle_remove_edges_test/1, walk_closer_loses_test/1,
   walk_origin_loses_test/1, walk_tie_test/1, walk_skips_origin_test/1,
   walk_chain_test/1, walk_hop_test/1, handle_nodedown_test/1,
-  drop_coin_test/1]).
+  drop_coin_test/1, graph_worker_publishes_on_start_test/1,
+  graph_worker_grant_test/1, graph_worker_grant_without_holds_test/1,
+  graph_worker_remove_test/1, graph_worker_deadlock_test/1,
+  graph_worker_client_down_test/1]).
+
+-define(WINNER, {winner_scope, winner_term, 'winner@node'}).
 
 %% Every case uses distinct keys and removes its fixture rows afterwards.
 all()->
   [graph_process_test, handle_add_edges_test, handle_remove_edges_test,
     walk_closer_loses_test, walk_origin_loses_test, walk_tie_test,
     walk_skips_origin_test, walk_chain_test, walk_hop_test,
-    handle_nodedown_test, drop_coin_test].
+    handle_nodedown_test, drop_coin_test, {group, graph_worker}].
+
+groups()->
+  [{graph_worker, [], [graph_worker_publishes_on_start_test,
+    graph_worker_grant_test, graph_worker_grant_without_holds_test,
+    graph_worker_remove_test, graph_worker_deadlock_test,
+    graph_worker_client_down_test]}].
 
 init_per_suite(Config)->
   {ok, _} = application:ensure_all_started(elock),
@@ -30,9 +41,11 @@ init_per_suite(Config)->
 end_per_suite(Config)->
   distributed_tests_utils:stop_nodes([?config(peer, Config)]).
 
-init_per_testcase(_Case, Config)-> Config.
+init_per_testcase(Case, Config)->
+  [{scope, Case} | Config].
 
 end_per_testcase(_Case, Config)->
+  elock_test_utils:stop_clients(),
   Result = ?safe(begin
     elock_test_utils:wait_graph_idle(node()),
     elock_test_utils:wait_graph_idle(?config(peer, Config))
@@ -84,7 +97,7 @@ handle_add_edges_test(_Config)->
     ?NO_MESSAGE,
     ?assertEqual([Expected], ets:lookup(elock_graph, Edge)),
     ets:insert(elock_graph, row(New, 1, #{Edge => self()})),
-    ok = elock_graph:handle_add_edges(Add#add_edges{
+    ok = elock_graph:handle_add_edges(Add#add_edges{client = Manager,
       holds = #{Old => self(), New => self()}}),
     verdict(Ref, New),
     ?NO_MESSAGE,
@@ -286,4 +299,160 @@ graph_fixture(Nodes, Fun)->
           || Row <- Rows -- Original ]
       end || {Node, Original} <- Before ]
     end
+  end.
+
+%%=================================================================
+%%  Graph workers
+%%=================================================================
+%% One row with all holds, idempotent repetition, and no row for empty holds.
+graph_worker_publishes_on_start_test(Config)->
+  Scope = ?config(scope, Config),
+  Key = {Scope, held, node()},
+  CloserClient = elock_test_utils:collector(),
+  Closer = #waiter{lock = Key, ref = make_ref(), birth = 2,
+    client = CloserClient, holds = #{{Scope, t, node()} => self()}},
+  ets:insert(elock_graph, Closer),
+  try
+    lists:foreach(fun(Holds)->
+      {Worker, Mon, Ref, _Tag} = graph_worker(Scope, self(), Holds),
+      Queued = #queued{ref = Ref, manager = self(), node = node()},
+      ?WAIT(process_info(Worker, current_function) =:=
+        {current_function, {elock_graph, graph_loop, 1}}),
+      case map_size(Holds) of
+        0->
+          ?WAIT(elock_test_utils:quiet([node()])),
+          ?assertEqual([], elock_test_utils:graph_rows(Scope, t));
+        _->
+          ?WAIT(elock_test_utils:graph_rows(Scope, t) =:=
+            [#waiter{lock = {Scope, t, node()}, ref = Ref, birth = 1,
+              client = Worker, holds = Holds}]),
+          ?assertEqual([#deadlock{ref = Closer#waiter.ref,
+            winner = {Scope, t, node()}}],
+            elock_test_utils:collected(CloserClient, 1))
+      end,
+      Worker ! Queued,
+      ?WAIT(elock_test_utils:quiet([node()])),
+      ExpectedRows = case map_size(Holds) of
+        0-> [];
+        _-> [#waiter{lock = {Scope, t, node()}, ref = Ref, birth = 1,
+          client = Worker, holds = Holds}]
+      end,
+      ?assertEqual(ExpectedRows, elock_test_utils:graph_rows(Scope, t)),
+      ?NO_MESSAGE,
+      Worker ! {remove, Ref},
+      ?RECEIVE({'DOWN', Mon, process, Worker, normal}),
+      ?WAIT(elock_test_utils:graph_rows(Scope, t) =:= [])
+    end, [#{}, #{Key => self()}])
+  after
+    ets:delete_object(elock_graph, Closer)
+  end.
+
+%% Grants propagate into queued rows; a local grant removes its waiting copy.
+graph_worker_grant_test(Config)->
+  Scope = ?config(scope, Config),
+  Other = ?config(peer, Config),
+  graph_fixture([node(), Other], fun()->
+    Holds = #{{Scope, held, node()} => self()},
+    {Worker, Mon, Ref, _Tag} = graph_worker(Scope, self(), Holds),
+    ?WAIT(length(elock_test_utils:graph_rows(Scope, t)) =:= 1),
+    % This copy is a sentinel: Other never queued in this worker. An
+    % unconditional removal cast would delete it, even though local holds grow.
+    Sentinel = #waiter{lock = {Scope, t, Other}, ref = Ref, birth = 1,
+      client = self(), holds = #{}},
+    true = rpc:call(Other, ets, insert, [elock_graph, Sentinel]),
+    Updated = Holds#{{Scope, t, Other} => self()},
+    Session = trace:session_create(?FUNCTION_NAME, self(), []),
+    try
+      1 = trace:function(Session, {elock_graph, remove_edges, 2}, true, [local]),
+      1 = trace:process(Session, Worker, true, [call]),
+      Worker ! {add, Ref, Other, self()},
+      ?WAIT(elock_test_utils:graph_rows(Scope, t) =:=
+        [#waiter{lock = {Scope, t, node()}, ref = Ref, birth = 1,
+          client = Worker, holds = Updated}]),
+      ?WAIT(elock_test_utils:quiet([node(), Other])),
+      % Observe dispatch locally: quiet cannot see a remote cast in flight.
+      ?assertEqual([], graph_removals(Session, Worker)),
+      ?assertEqual([Sentinel], rpc:call(Other, ets, lookup,
+        [elock_graph, Sentinel#waiter.lock])),
+      Worker ! {add, Ref, node(), self()},
+      ?WAIT(elock_test_utils:graph_rows(Scope, t) =:= []),
+      ?assertEqual([[node()]], graph_removals(Session, Worker))
+    after
+      trace:session_destroy(Session)
+    end,
+    Worker ! #queued{ref = Ref, manager = self(), node = node()},
+    ?WAIT(elock_test_utils:graph_rows(Scope, t) =:=
+      [#waiter{lock = {Scope, t, node()}, ref = Ref, birth = 1,
+        client = Worker, holds = Updated#{{Scope, t, node()} => self()}}]),
+    Worker ! {remove, Ref},
+    ?RECEIVE({'DOWN', Mon, process, Worker, normal}),
+    ?WAIT(elock_test_utils:graph_rows(Scope, t) =:= [])
+  end).
+
+%% The first grant starts publication when the context initially held nothing.
+graph_worker_grant_without_holds_test(Config)->
+  Scope = ?config(scope, Config),
+  Other = ?config(peer, Config),
+  {Worker, Mon, Ref, _Tag} = graph_worker(Scope, self(), #{}),
+  ?WAIT(process_info(Worker, current_function) =:=
+    {current_function, {elock_graph, graph_loop, 1}}),
+  ?WAIT(elock_test_utils:quiet([node()])),
+  ?assertEqual([], elock_test_utils:graph_rows(Scope, t)),
+  Worker ! {add, Ref, Other, self()},
+  ?WAIT(elock_test_utils:graph_rows(Scope, t) =:=
+    [#waiter{lock = {Scope, t, node()}, ref = Ref, birth = 1,
+      client = Worker, holds = #{{Scope, t, Other} => self()}}]),
+  Worker ! {remove, Ref},
+  ?RECEIVE({'DOWN', Mon, process, Worker, normal}),
+  ?WAIT(elock_test_utils:graph_rows(Scope, t) =:= []).
+
+graph_worker_remove_test(Config)-> graph_worker_stop(Config, remove).
+%% A deadlock record is preserved as the graph worker's exit reason.
+graph_worker_deadlock_test(Config)-> graph_worker_stop(Config, deadlock).
+%% The client monitor retires the same publication on process death.
+graph_worker_client_down_test(Config)-> graph_worker_stop(Config, client_down).
+
+graph_worker_stop(Config, How)->
+  Scope = ?config(scope, Config),
+  Client = elock_test_utils:client(),
+  {Worker, Mon, Ref, Tag} = graph_worker(Scope, Client,
+    #{{Scope, held, node()} => self()}),
+  ?WAIT(length(elock_test_utils:graph_rows(Scope, t)) =:= 1),
+  Reason = case How of
+    remove-> Worker ! {remove, Ref}, normal;
+    deadlock->
+      Verdict = #deadlock{ref = Ref, winner = ?WINNER},
+      Worker ! Verdict,
+      {Tag, Verdict};
+    client_down-> elock_test_utils:stop(Client), normal
+  end,
+  ?RECEIVE({'DOWN', Mon, process, Worker, Reason}),
+  ?WAIT(elock_test_utils:graph_rows(Scope, t) =:= []).
+
+graph_worker(Scope, Client, Holds)->
+  Ref = make_ref(),
+  Tag = make_ref(),
+  Manager = self(),
+  {Worker, Mon} = spawn_monitor(fun()->
+    elock_graph:init_graph(#queued{ref = Ref, manager = Manager, node = node()},
+      #graph{client = Client, scope = Scope, term = t,
+        nodes = [], holds = Holds, birth = 1, age = 1, ref = Ref, tag = Tag})
+  end),
+  {Worker, Mon, Ref, Tag}.
+
+%% Finish the worker's current update before the trace delivery barrier, so
+%% every dispatch caused by that update is in this testcase's mailbox.
+graph_removals(Session, Worker)->
+  ?WAIT(process_info(Worker, [current_function, message_queue_len]) =:=
+    [{current_function, {elock_graph, graph_loop, 1}}, {message_queue_len, 0}]),
+  Delivered = trace:delivered(Session, Worker),
+  ?RECEIVE({trace_delivered, Worker, Delivered}),
+  graph_removals(Worker).
+
+graph_removals(Worker)->
+  receive
+    {trace, Worker, call, {elock_graph, remove_edges, [Nodes, _Graph]}}->
+      [Nodes | graph_removals(Worker)]
+  after 0->
+    []
   end.

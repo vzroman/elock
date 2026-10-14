@@ -333,7 +333,8 @@ lock_async(Client, Scope, Term, Nodes, Options)->
 %%-----------------------------------------------------------------
 %%  Await the manager's ticket, publication by the client's graph worker,
 %%  and quiet workers and walkers. A held context is published through
-%%  manager -> proxy -> client -> graph worker -> graph node -> walker.
+%%  manager -> proxy (the local client itself, a worker's callee otherwise)
+%%  -> client -> graph worker -> the lock node's table -> walker.
 %%  The result may arrive at any phase, in which case there is no queue
 %%  left to await. Collect the result with result/2.
 %%-----------------------------------------------------------------
@@ -466,8 +467,8 @@ elock_process(Pid)->
   case process_info(Pid, current_function) of
     {current_function, MFA}->
       lists:member(MFA, [{elock_manager, loop, 1},
-        {elock_manager, wait_verdict, 3}, {elock_context, wait_verdict, 2},
-        {elock_context, wait_unlock, 2}, {elock_context, graph_loop, 1},
+        {elock_manager, wait_verdict, 4}, {elock_context, wait_verdict, 2},
+        {elock_context, wait_unlock, 2}, {elock_graph, graph_loop, 1},
         {elock_graph, loop, 0}]) orelse graph_process(Pid);
     undefined-> false
   end.
@@ -538,23 +539,23 @@ context_birth(Client)->
       Birth
   end.
 
-%% Expected nodes, with the pre-request context mode chosen by the caller.
+%% Expected holders depend on the requested nodes, regardless of existing holds.
 %% Holder pids are observed but their location, lifetime and monitors checked.
-lock_nodes(Client, Ref, {Mode, Managers})->
+lock_nodes(Client, Ref, Managers)->
   #context{ref2lock = Ref2Lock} = context(Client),
   #lock{nodes = Nodes} = maps:get(Ref, Ref2Lock),
   maps:map(fun(Node, Manager)->
     #node{holder = Holder} = maps:get(Node, Nodes),
-    case {Node =:= node(Client), map_size(Managers), Mode} of
-      {true, 1, held_nothing}->
+    case {Node =:= node(Client), map_size(Managers)} of
+      {true, 1}->
         ?assertEqual(undefined, Holder),
         ?WAIT(monitors(Manager, Client));
-      {true, _Count, _Mode}->
+      {true, _Count}->
         ?assert(is_pid(Holder)),
         ?assertEqual(node(Client), node(Holder)),
         ?WAIT(not rpc(node(Client), erlang, is_process_alive, [Holder])),
         ?WAIT(monitors(Manager, Client));
-      {false, _Count, _Mode}->
+      {false, _Count}->
         ?assert(is_pid(Holder)),
         ?assertEqual(node(Client), node(Holder)),
         ?WAIT(monitors(Holder, Client))
@@ -594,7 +595,9 @@ wait_graph_idle(Node)->
 %% Remote entry point for active graph work, excluding the table owner.
 graph_walkers()->
   [ Pid || Pid <- processes(), Pid =/= whereis(elock_graph),
-    graph_process(Pid) ].
+    graph_process(Pid),
+    process_info(Pid, current_function) =/=
+      {current_function, {elock_graph, graph_loop, 1}} ].
 
 %% NEW_PID_EXT with a bounded fake node name for state-only remote clients.
 remote_pid(Node, ID)->

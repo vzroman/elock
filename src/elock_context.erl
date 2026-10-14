@@ -299,11 +299,11 @@ run_request(
     } = Request
 ) when Node =:= node() ->
   OnQueued =
-    fun(#queued{manager = Manager} = Queued, OnDeadlock)->
+    fun(#queued{manager = Manager} = Queued, Tag)->
       #waiting{
         graph = Graph,
         graph_monitor = GraphMon
-      } = spawn_graph(Ref, Queued, OnDeadlock, #waiting{
+      } = spawn_graph(Ref, Queued, Tag, #waiting{
         ref = Ref,
         scope = Scope,
         term = Term,
@@ -424,8 +424,7 @@ wait_verdict(
           Waiting =
             case Graph of
               undefined->
-                OnDeadlock = fun(Deadlock)->exit(Deadlock) end,
-                spawn_graph(Ref, QueuedMessage, OnDeadlock, Waiting0);
+                spawn_graph(Ref, QueuedMessage, Ref, Waiting0);
               _->
                 Graph ! QueuedMessage,
                 Waiting0
@@ -436,7 +435,7 @@ wait_verdict(
         false->
           wait_verdict(Ref, Waiting0)
       end;
-    {'DOWN', GraphMon, process, Graph, #deadlock{ref = Ref, winner = Winner}}->
+    {'DOWN', GraphMon, process, Graph, {Ref, #deadlock{winner = Winner}}}->
       cancel(Ref, Waiting0),
       {error, {deadlock, Winner}}
 
@@ -559,7 +558,7 @@ kill_holder(Holder)-> exit(Holder, kill).
 spawn_graph(
     Ref,
     QueuedMessage,
-    OnDeadlock,
+    Tag,
     #waiting{
       scope = Scope,
       term = Term,
@@ -587,7 +586,7 @@ spawn_graph(
       birth = Birth,
       age = Age,
       ref = Ref,
-      on_deadlock = OnDeadlock
+      tag = Tag
     })
   end),
   Waiting#waiting{

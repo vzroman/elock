@@ -127,9 +127,7 @@ wait_verdict(
     ?reply(MonitorRef, #locked{})->
       {ok, Manager};
     ?reply(MonitorRef, #queued{ref = Ref} = Queued)->
-      OnDeadlock =
-        fun(Deadlock)-> exit({MonitorRef, Deadlock}) end,
-      OnQueued(Queued, OnDeadlock),
+      OnQueued(Queued, MonitorRef),
       wait_verdict(MonitorRef, Manager, OnQueued, Request);
     ?reply(MonitorRef, #deadlock{winner = Winner})->
       {error, {deadlock, Winner}};

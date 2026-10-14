@@ -42,7 +42,7 @@
   birth :: integer(),             % priority fixed for the life of the context
   age :: non_neg_integer(),       % context age in ms, fixed at lock entry
   ref :: reference(),
-  on_deadlock
+  tag
 }).
 
 % Client -> manager: the answer to #queued{} and every later grant

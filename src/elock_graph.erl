@@ -171,14 +171,14 @@ graph_loop(#graph{
   term = Term,
   nodes = Nodes0,
   holds = Holds0,
-  on_deadlock = OnDeadlock
+  tag = Tag
 } = Graph)->
   receive
     #queued{ref = Ref, node = Node}->
       graph_loop(queued(Node, Graph));
     #deadlock{ ref = Ref } = DeadLock->
       remove_edges(Nodes0, Graph),
-      OnDeadlock(DeadLock);
+      exit({Tag,DeadLock});
     {remove, Ref}->
       remove_edges(Nodes0, Graph);
     {add, Ref, Node, Manager}->

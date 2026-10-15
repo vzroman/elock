@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ['27', '28', '29']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: '3.27.1'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            _build/default/*_plt
+            ~/.cache/rebar3
+          key: plt-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('rebar.config') }}
+      - run: rebar3 compile
+      - run: rebar3 xref
+      - run: rebar3 dialyzer
+        if: matrix.otp == '29'
+      - run: epmd -daemon
+      - run: rebar3 ct --cover --spec test/functional/test.spec
+      - run: rebar3 covertool generate
+        if: matrix.otp == '29'
+      - uses: codecov/codecov-action@v7
+        if: matrix.otp == '29'
+        with:
+          use_oidc: true
+          files: _build/test/covertool/elock.covertool.xml

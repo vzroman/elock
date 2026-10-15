@@ -5,11 +5,81 @@
 %%-------------------------------------------------------------------------------
 %% Types
 %%-------------------------------------------------------------------------------
--define(lock(T),{lock,T}).
--define(queue(R,Q),{queue,R,Q}).
+-type lock_key() :: {atom(), term(), node()}.
+-type held_locks() :: #{lock_key() => pid()}.
 
--define(holder(H,T),{holder,H,T}).
--define(wait(T),{wait,T}).
+-record(request,{
+  % The ticket must stay first: postponed requests are sorted by it.
+  ticket :: pos_integer() | undefined,
+  ref :: reference(),
+  scope :: atom(),
+  term :: term(),
+  client :: pid(),
+  proxy :: pid() | undefined,     % the client or a worker waiting for the verdict
+  tag :: reference() | undefined, % the proxy's monitor, tags replies to the proxy
+  shared :: boolean(),
+  timeout :: pos_integer() | undefined,
+  notify_queued                   % #queued{} is wanted: nodes to withdraw from or holds to publish
+}).
+
+-record(unlock,{
+  ref :: reference()
+}).
+
+% Manager -> proxy -> client: the request has joined the wait queue
+-record(queued,{
+  ref :: reference(),
+  manager :: pid(),
+  node :: node()
+}).
+
+% The state of the graph worker (see elock_context)
+-record(graph,{
+  client :: pid(),                % the requesting process, monitored
+  scope :: atom(),
+  term :: term(),
+  nodes :: ordsets:ordset(node()), % only the nodes that reported #queued{}
+  holds :: held_locks(),          % the context and the grants so far
+  birth :: integer(),             % priority fixed for the life of the context
+  age :: non_neg_integer(),       % context age in ms, fixed at lock entry
+  ref :: reference(),
+  tag                             % of the verdict exit: Ref, or the manager monitor of a direct request
+}).
+
+% Walker -> graph worker, which exits with it to the proxy.
+% Manager -> proxy: the request has lost
+-record(deadlock,{
+  ref :: reference(),
+  winner :: lock_key() | probe_limit % the winning wait lock, or the walk limit
+}).
+
+% Client graph worker -> update call on the waiting node: new holds
+-record(add_edges,{
+  lock :: lock_key(),           % the manager's lock
+  ref :: reference(),
+  birth :: non_neg_integer(),   % priority fixed for the life of the context
+  age :: non_neg_integer(),     % context age in ms, fixed at lock entry
+  client :: pid(),              % the graph worker, receives the verdicts
+  holds :: held_locks()         % the context's holds or a later grant
+}).
+
+% Client graph worker -> removal cast on the waiting node: stopped waiting
+-record(remove_edges,{
+  lock :: lock_key(),
+  ref :: reference()
+}).
+
+% Walker -> probe cast on another node: expand these locks there.
+% expand and visited are set for the hop, a launch walks without them
+-record(deadlock_probe,{
+  ref :: reference(),           % the origin request
+  edge :: lock_key(),           % the lock the origin waits for
+  client :: pid(),              % the origin's graph worker, receives the verdicts
+  birth :: non_neg_integer(),   % the origin context's fixed priority
+  limit :: pos_integer(),       % maximum visited keys, fixed for this launch
+  expand :: [lock_key()] | undefined, % the locks to expand on the receiving node
+  visited :: #{lock_key() => true} | undefined % the locks this branch has expanded or scheduled
+}).
 
 %%-------------------------------------------------------------------------------
 %% LOGGING

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="350" viewBox="0 0 760 350" font-family='system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif' role="img" aria-label="Keys locked per second for the four designs, elock against mnesia, on a log scale with the demand of 200,000 per second marked: design 1 95.6k against 21.7k, design 2 307k against 15.8k, design 3 88.3k against 79.7k, design 4 5.57M against 211k">
+<rect width="760" height="350" fill="#fcfcfb"/>
+<text x="24" y="30" font-size="16" fill="#0b0b0b" text-anchor="start" font-weight="600">Keys locked per second: four designs, two engines, the same two nodes</text>
+<text x="24" y="48" font-size="12" fill="#52514e" text-anchor="start">Log scale. The vertical line is the production demand, 200,000 keys per second</text>
+<circle cx="31" cy="72" r="4.5" fill="#2a78d6"/>
+<text x="42" y="76" font-size="12" fill="#52514e" text-anchor="start">elock</text>
+<circle cx="111" cy="72" r="4.5" fill="#eb6834"/>
+<text x="122" y="76" font-size="12" fill="#52514e" text-anchor="start">mnesia</text>
+<line x1="196.0" y1="72.0" x2="214.0" y2="72.0" stroke="#898781" stroke-width="1.5"/>
+<text x="220" y="76" font-size="12" fill="#52514e" text-anchor="start">demand</text>
+<line x1="300.0" y1="100.0" x2="300.0" y2="310.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="300.0" y="326" font-size="11" fill="#898781" text-anchor="middle" font-variant-numeric="tabular-nums">10k</text>
+<line x1="440.0" y1="100.0" x2="440.0" y2="310.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="440.0" y="326" font-size="11" fill="#898781" text-anchor="middle" font-variant-numeric="tabular-nums">100k</text>
+<line x1="580.0" y1="100.0" x2="580.0" y2="310.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="580.0" y="326" font-size="11" fill="#898781" text-anchor="middle" font-variant-numeric="tabular-nums">1M</text>
+<line x1="720.0" y1="100.0" x2="720.0" y2="310.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="720.0" y="326" font-size="11" fill="#898781" text-anchor="middle" font-variant-numeric="tabular-nums">10M</text>
+<line x1="300.0" y1="310.0" x2="720.0" y2="310.0" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="482.1" y1="92.0" x2="482.1" y2="310.0" stroke="#898781" stroke-width="1.5"/>
+<text x="482.1" y="86" font-size="11" fill="#898781" text-anchor="middle">demand 200k</text>
+<text x="285" y="134" font-size="12" fill="#0b0b0b" text-anchor="end"><tspan font-weight="600">1</tspan>&#160;&#160;one exclusive lock on both nodes</text>
+<line x1="347.0" y1="130.0" x2="437.3" y2="130.0" stroke="#c3c2b7" stroke-width="1"/>
+<circle cx="347.0" cy="130" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="437.3" cy="130" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="447.3" y="134" font-size="11" fill="#52514e" text-anchor="start" font-variant-numeric="tabular-nums">95.6k</text>
+<text x="337.0" y="134" font-size="11" fill="#52514e" text-anchor="end" font-variant-numeric="tabular-nums">21.7k</text>
+<text x="285" y="184" font-size="12" fill="#0b0b0b" text-anchor="end"><tspan font-weight="600">2</tspan>&#160;&#160;the same, ten times the clients</text>
+<line x1="327.8" y1="180.0" x2="508.3" y2="180.0" stroke="#c3c2b7" stroke-width="1"/>
+<circle cx="327.8" cy="180" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="508.3" cy="180" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="518.3" y="184" font-size="11" fill="#52514e" text-anchor="start" font-variant-numeric="tabular-nums">307k</text>
+<text x="317.8" y="184" font-size="11" fill="#52514e" text-anchor="end" font-variant-numeric="tabular-nums">15.8k</text>
+<text x="285" y="234" font-size="12" fill="#0b0b0b" text-anchor="end"><tspan font-weight="600">3</tspan>&#160;&#160;ten exclusive, both nodes, random order</text>
+<line x1="426.2" y1="230.0" x2="432.4" y2="230.0" stroke="#c3c2b7" stroke-width="1"/>
+<circle cx="426.2" cy="230" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="432.4" cy="230" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="442.4" y="234" font-size="11" fill="#52514e" text-anchor="start" font-variant-numeric="tabular-nums">88.3k</text>
+<text x="416.2" y="234" font-size="11" fill="#52514e" text-anchor="end" font-variant-numeric="tabular-nums">79.7k</text>
+<text x="285" y="284" font-size="12" fill="#0b0b0b" text-anchor="end"><tspan font-weight="600">4</tspan>&#160;&#160;ten shared local locks, no conflicts</text>
+<line x1="485.3" y1="280.0" x2="684.5" y2="280.0" stroke="#c3c2b7" stroke-width="1"/>
+<circle cx="485.3" cy="280" r="5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="684.5" cy="280" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="694.5" y="284" font-size="11" fill="#52514e" text-anchor="start" font-variant-numeric="tabular-nums">5.57M</text>
+<text x="475.3" y="284" font-size="11" fill="#52514e" text-anchor="end" font-variant-numeric="tabular-nums">211k</text>
+</svg>

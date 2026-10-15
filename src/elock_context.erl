@@ -261,9 +261,7 @@ init_context(Now)->
 
 -spec held_locks(context()) -> held_locks().
 held_locks(#context{locked = Locked})->
-  Locked;
-held_locks(_NoContext)->
-  #{}.
+  Locked.
 
 
 %%=================================================================

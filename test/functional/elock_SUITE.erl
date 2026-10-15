@@ -563,8 +563,6 @@ multi_scope_context_test(Config)->
     {Scope2, t, Node} => M2
   }, elock_context:held_locks(Context)),
   ?assertEqual(2, map_size(elock_context:held_locks(Context))),
-  ?assertEqual(#{}, elock_context:held_locks(undefined)),
-  ?assertEqual(0, map_size(elock_context:held_locks(undefined))),
 
   ?assertEqual(ok, elock_test_utils:unlock(C1, Ref1)),
   ?assertEqual(#{ {Scope2, t, Node} => M2 }, elock_context:held_locks(elock_test_utils:context(C1))),

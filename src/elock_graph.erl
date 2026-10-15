@@ -118,7 +118,7 @@ loop()->
 -spec handle_nodedown(node()) -> ok.
 handle_nodedown(Node)->
   ets:select_delete(?MODULE, [{
-    #waiter{client = '$1', _ = '_'},
+    waiter_pattern([{#waiter.client, '$1'}]),
     [{'=:=', {node, '$1'}, Node}],
     [true]
   }]),
@@ -204,17 +204,17 @@ add_edges(
       ref = Ref
     }
 ) when map_size(Holds) > 0->
-  AddEdges = #add_edges{
-    ref = Ref,
-    birth = Birth,
-    age = Age,
-    client = self(),
-    holds = Holds
-  },
   lists:foreach(
     fun(Node)->
       ecall:call(Node, ?MODULE, handle_add_edges, [
-        AddEdges#add_edges{ lock = {Scope, Term, Node} }
+        #add_edges{
+          lock = {Scope, Term, Node},
+          ref = Ref,
+          birth = Birth,
+          age = Age,
+          client = self(),
+          holds = Holds
+        }
       ])
     end,
     Nodes
@@ -231,11 +231,10 @@ remove_edges(Nodes, #graph{
   term = Term,
   ref = Ref
 })->
-  RemoveEdges = #remove_edges{ref = Ref},
   lists:foreach(
     fun(Node)->
       ecall:cast(Node, ?MODULE, handle_remove_edges, [
-        RemoveEdges#remove_edges{ lock = {Scope, Term, Node} }
+        #remove_edges{ lock = {Scope, Term, Node}, ref = Ref }
       ])
     end,
     Nodes
@@ -258,7 +257,7 @@ handle_add_edges(#add_edges{
   client = Client,
   holds = Holds
 })->
-  case ets:match_object(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}) of
+  case ets:match_object(?MODULE, waiter_pattern([{#waiter.lock, Lock}, {#waiter.ref, Ref}])) of
     []->
       Row = #waiter{
         lock = Lock,
@@ -311,7 +310,7 @@ handle_remove_edges(#remove_edges{
   lock = Lock,
   ref = Ref
 })->
-  ets:match_delete(?MODULE, #waiter{lock = Lock, ref = Ref, _ = '_'}),
+  ets:match_delete(?MODULE, waiter_pattern([{#waiter.lock, Lock}, {#waiter.ref, Ref}])),
   ok.
 
 %%=================================================================
@@ -542,3 +541,14 @@ forward_probe(Probe, Hops)->
     Hops
   ).
 
+%%=================================================================
+%%  Utilities
+%%=================================================================
+%%-----------------------------------------------------------------
+%%  A #waiter{} match pattern as a tuple: the given fields by their
+%%  index, '_' elsewhere. Written as a record, '_' in the typed
+%%  fields is a type violation for dialyzer
+%%-----------------------------------------------------------------
+-spec waiter_pattern([{pos_integer(), term()}]) -> tuple().
+waiter_pattern(Fields)->
+  erlang:make_tuple(record_info(size, waiter), '_', [{1, waiter} | Fields]).

@@ -1,5 +1,5 @@
 {application, elock,
- [{description, "erlang library for distributed term locks"},
+ [{description, "scalable distributed locks with deadlock detection"},
   {vsn, git},
   {registered, [elock_graph]},
   {mod, {elock_app, []}},

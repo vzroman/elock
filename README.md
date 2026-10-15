@@ -47,7 +47,7 @@ Ticket 1 means the row was free: the caller holds the lock the moment the counte
 
 **Locks die with their holder.** A local holder is monitored by its manager, a remote one by its worker, and every node drops the locks of the clients of a node that has gone down. A process that crashes while holding locks leaves no lock behind.
 
-The figure above is the happy path. How it was measured, how mnesia and global did on the same workloads, and the four designs the production system went through on the way to it, are in [the article](docs/article.md).
+The figure above is the happy path. How it was measured, how mnesia and global did on the same workloads, and the four designs the production system went through on the way to it, are in [the article](https://github.com/vzroman/elock/blob/main/docs/article.md).
 
 ## Installation and startup
 

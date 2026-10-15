@@ -1,5 +1,7 @@
 # elock: scalable distributed locks with deadlock detection
 
+[![CI](https://github.com/vzroman/elock/actions/workflows/ci.yml/badge.svg)](https://github.com/vzroman/elock/actions/workflows/ci.yml) [![Hex.pm](https://img.shields.io/hexpm/v/elock.svg)](https://hex.pm/packages/elock) [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/elock/) [![codecov](https://codecov.io/gh/vzroman/elock/branch/main/graph/badge.svg)](https://codecov.io/gh/vzroman/elock)
+
 *Locks are cheap, waiting for them is not. Take the waiting out and your only limit is your cores. [elock](https://github.com/vzroman/elock) is a lock library for Erlang: locks on any term, exclusive or shared, on one node or on several at once, with deadlocks detected across nodes, and a happy path that waits for nobody.*
 
 ![Locks per second on two nodes, 10,000 clients per node, ten shared local locks per transaction with no contention: elock 5.57 million per second with the schedulers 99.8 percent busy, mnesia 211 thousand per second at 11 percent busy.](docs/figures/happy-path.svg)

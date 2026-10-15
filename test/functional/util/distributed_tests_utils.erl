@@ -95,6 +95,7 @@ start_node(Config)->
 stop_node(Node)->
   Peer = take_node(Node),
   Survivors = nodes(),
+  ok = flush_cover(Node),
   stop_peer(Peer),
   wait_gone(Node, Survivors),
   ok.
@@ -195,11 +196,52 @@ start_peer(#{name := Name} = Config, Cookie)->
   }),
   pong = net_adm:ping(Node),
   add_node(Node, Peer),
+  ok = start_cover(Node),
   ok = rpc(Node, code, ensure_modules_loaded, [maps:get(modules, state())]),
   Node.
 
 node_name(Name)->
   "elock_" ++ atom_to_list(Name) ++ "_" ++ os:getpid() ++ "_" ++ unique_suffix().
+
+%%-----------------------------------------------------------------
+%%  Under cover (rebar3 ct --cover, cover_enabled) the controller
+%%  runs cover-compiled elock modules while a peer would load the
+%%  plain beams of the build. A fun made on the controller, such as
+%%  the OnQueued callback a lock request ships to its lock node, is
+%%  then a badfun on the peer: the module hash in the fun does not
+%%  match. cover:start/1 loads the cover-compiled modules on the
+%%  peer, so every node runs the same versions, and the counts of
+%%  the peer join the report when it is flushed before a graceful
+%%  stop. A killed node takes its counts with it. A node restarted
+%%  under the same name is one cover already knows: cover:start/1
+%%  reports it as not started and cover reloads its modules on the
+%%  node by itself on nodeup, hence the wait for the versions
+%%-----------------------------------------------------------------
+start_cover(Node)->
+  case cover_running() of
+    true->
+      {ok, _Started} = cover:start([Node]),
+      Modules = cover:modules(),
+      wait_until(fun()-> cover_loaded(Node, Modules) end);
+    false->
+      ok
+  end.
+
+cover_loaded(Node, Modules)->
+  lists:all(fun(Module)->
+    rpc(Node, Module, module_info, [md5]) =:= Module:module_info(md5)
+  end, Modules).
+
+flush_cover(Node)->
+  case cover_running() of
+    true->
+      try cover:flush([Node]) catch _:_-> ok end;
+    false->
+      ok
+  end.
+
+cover_running()->
+  whereis(cover_server) =/= undefined.
 
 %%-----------------------------------------------------------------
 %%  Every node connects to every other node and sees it connected

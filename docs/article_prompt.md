@@ -37,3 +37,29 @@ Single-node evidence for chains. The traced single-node runs from October 6 put 
 No need to mention, it will overload the article
 
 Prepare the article draft in docs/article.html. With numbers and diagrams. Take a look at /home/roman/PROJECTS/SOURCES/ecall/docs/article.md
+
+------------------------------------------------------------
+the lede should be much shorter. `waiting is the main problem. Exclude it and your only limit is your cores` is a good starting point. What we need to add is 
+* that we succeeded to came to 5.5m figure with elock for our prodcution system.   
+* elock is a lock library for Erlang: locks on any term, exclusive or shared, on one node or on several at once, with deadlocks detected across nodes, and a happy path that waits for nobody.
+
+`The happy path waits for nobody`  paragraph is not needed. lede's wording is enough.
+
+`Distributed locks` paragraph.
+figures/distributed.svg should be a bar chart
+mnesia's main limits: single per node locker, ditribution queue, wire latency
+elocks main limit: wire latency
+
+`elock at 10,000 clients per node delivers 95,000 locks per second with the nodes three quarters idle. Nothing is computing: 20,000 clients are each waiting for their own round trip, and the throughput is the number of waiters divided by the wait, 20,000 over 0.208 s is 96,000 per second, the measured figure to within half a percent. The channel is nowhere near saturated in bytes; the wait is queueing, a request taking its turn in the distribution queue behind thousands of others, on both legs` is too complicted. Remove or reword it and make much shorter
+
+`A cross-node lock is a request and a grant on each leg of the link, and the caller waits for the slowest node while holding what the faster ones have granted` remove it
+
+`Waiting is a design decision` remove this paragraph. Just finish the previous one with elock can help remove waiting at all or significantly reduce it, but finally it depends on your system's design. And `The rest of this article is how we came to 5.5m figure in our production system`
+
+`The system and its demand` -> Our production system and its demand
+We need more details about our architecture and it's specifics here. Take them from https://erlangforums.com/t/ecall-batched-pooled-send-cast-call-over-erlang-distribution-scales-past-the-single-output-queue-per-node-pair/5940/9 my latest post.
+`The demand:` is not correct. overall pool of realtime objects is 5m with 10k actors over them, each writes about 10 objects per second, so overall throughput is 200k/s
+
+Design 1-4 should be our story (see docs/narrative.md). Don't juts refer to numbers from the previous paragraphs, give them (a reader should not jump back)
+
+`What it costs` paragraph is not needed.

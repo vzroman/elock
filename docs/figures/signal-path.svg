@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="390" viewBox="0 0 760 390" font-family='system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif' role="img" aria-label="A PLC connection reads three device addresses and writes tag1, tag2 and tag3. An IoT connection reads three addresses and writes tag4, tag5 and tag6. A calculation or user script subscribes to tag2, tag3 and tag4 and writes tag7, tag8 and tag9. The archive and the alarm service subscribe to tag9. Many more connections and calculations exist. Below them, occasional writers, user sessions, state estimation, the grid graph and AI agents, read any tag and write any tag, rarely">
+<rect width="760" height="390" fill="#fcfcfb"/>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0b0b0b"/></marker>
+<marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+</defs>
+<text x="24" y="30" font-size="16" fill="#0b0b0b" text-anchor="start" font-weight="600">Signal propagation: each heavy writer owns its tags, occasional writers touch any</text>
+<text x="24" y="66" font-size="11" fill="#898781" text-anchor="start">device</text>
+<text x="120" y="66" font-size="11" fill="#898781" text-anchor="start">connection</text>
+<text x="300" y="66" font-size="11" fill="#898781" text-anchor="start">tags</text>
+<text x="390" y="66" font-size="11" fill="#898781" text-anchor="start">calculation</text>
+<text x="594" y="66" font-size="11" fill="#898781" text-anchor="start">tags</text>
+<text x="666" y="66" font-size="11" fill="#898781" text-anchor="start">consumers</text>
+
+<!-- PLC group -->
+<text x="24" y="96" font-size="11" fill="#52514e" text-anchor="start">address 1</text>
+<text x="24" y="122" font-size="11" fill="#52514e" text-anchor="start">address 2</text>
+<text x="24" y="148" font-size="11" fill="#52514e" text-anchor="start">address 3</text>
+<line x1="84" y1="92" x2="118" y2="92" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="84" y1="118" x2="118" y2="118" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="84" y1="144" x2="118" y2="144" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="101" y="86" font-size="11" fill="#52514e" text-anchor="middle">reads</text>
+<rect x="120" y="96" width="140" height="44" rx="4" fill="#fcfcfb" stroke="#0b0b0b" stroke-width="1.2"/>
+<text x="190" y="114" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">PLC connection</text>
+<text x="190" y="130" font-size="11" fill="#52514e" text-anchor="middle">heavy writer</text>
+<line x1="260" y1="92" x2="298" y2="92" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="260" y1="118" x2="298" y2="118" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="260" y1="144" x2="298" y2="144" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="279" y="86" font-size="11" fill="#52514e" text-anchor="middle">writes</text>
+<rect x="300" y="81" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="322" y="96" font-size="11" fill="#0b0b0b" text-anchor="middle">tag1</text>
+<rect x="300" y="107" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="322" y="122" font-size="11" fill="#0b0b0b" text-anchor="middle">tag2</text>
+<rect x="300" y="133" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="322" y="148" font-size="11" fill="#0b0b0b" text-anchor="middle">tag3</text>
+
+<!-- IoT group -->
+<text x="24" y="214" font-size="11" fill="#52514e" text-anchor="start">address 1</text>
+<text x="24" y="240" font-size="11" fill="#52514e" text-anchor="start">address 2</text>
+<text x="24" y="266" font-size="11" fill="#52514e" text-anchor="start">address 3</text>
+<line x1="84" y1="210" x2="118" y2="210" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="84" y1="236" x2="118" y2="236" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="84" y1="262" x2="118" y2="262" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="101" y="204" font-size="11" fill="#52514e" text-anchor="middle">reads</text>
+<rect x="120" y="214" width="140" height="44" rx="4" fill="#fcfcfb" stroke="#0b0b0b" stroke-width="1.2"/>
+<text x="190" y="232" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">IoT connection</text>
+<text x="190" y="248" font-size="11" fill="#52514e" text-anchor="middle">heavy writer</text>
+<line x1="260" y1="210" x2="298" y2="210" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="260" y1="236" x2="298" y2="236" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="260" y1="262" x2="298" y2="262" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="279" y="204" font-size="11" fill="#52514e" text-anchor="middle">writes</text>
+<rect x="300" y="199" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="322" y="214" font-size="11" fill="#0b0b0b" text-anchor="middle">tag4</text>
+<rect x="300" y="225" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="322" y="240" font-size="11" fill="#0b0b0b" text-anchor="middle">tag5</text>
+<rect x="300" y="251" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="322" y="266" font-size="11" fill="#0b0b0b" text-anchor="middle">tag6</text>
+<text x="120" y="284" font-size="11" fill="#52514e" text-anchor="start">many more connections</text>
+
+<!-- calculation -->
+<line x1="344" y1="118" x2="388" y2="156" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="344" y1="144" x2="388" y2="164" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="344" y1="210" x2="388" y2="172" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="352" y="222" font-size="11" fill="#52514e" text-anchor="start">subscribes</text>
+<rect x="390" y="142" width="176" height="44" rx="4" fill="#fcfcfb" stroke="#0b0b0b" stroke-width="1.2"/>
+<text x="478" y="160" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">calculation or user script</text>
+<text x="478" y="176" font-size="11" fill="#52514e" text-anchor="middle">heavy writer</text>
+<text x="390" y="204" font-size="11" fill="#52514e" text-anchor="start">many more calculations</text>
+<line x1="566" y1="150" x2="592" y2="138" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="566" y1="164" x2="592" y2="164" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="566" y1="178" x2="592" y2="190" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="590" y="130" font-size="11" fill="#52514e" text-anchor="end">writes</text>
+<rect x="594" y="127" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="616" y="142" font-size="11" fill="#0b0b0b" text-anchor="middle">tag7</text>
+<rect x="594" y="153" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="616" y="168" font-size="11" fill="#0b0b0b" text-anchor="middle">tag8</text>
+<rect x="594" y="179" width="44" height="22" rx="3" fill="#e1e0d9"/>
+<text x="616" y="194" font-size="11" fill="#0b0b0b" text-anchor="middle">tag9</text>
+
+<!-- consumers -->
+<line x1="638" y1="190" x2="664" y2="166" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="638" y1="190" x2="664" y2="210" stroke="#0b0b0b" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="666" y="146" width="74" height="36" rx="4" fill="#fcfcfb" stroke="#c3c2b7" stroke-width="1.2"/>
+<text x="703" y="168" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">archive</text>
+<rect x="666" y="194" width="74" height="36" rx="4" fill="#fcfcfb" stroke="#c3c2b7" stroke-width="1.2"/>
+<text x="703" y="216" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">alarm</text>
+<text x="652" y="246" font-size="11" fill="#52514e" text-anchor="middle">subscribe</text>
+
+<!-- occasional writers -->
+<rect x="120" y="318" width="518" height="44" rx="4" fill="#fcfcfb" stroke="#eb6834" stroke-width="1.2"/>
+<text x="379" y="336" font-size="12" fill="#0b0b0b" text-anchor="middle" font-weight="600">user session, state estimation, grid graph, AI agent, ...</text>
+<text x="379" y="352" font-size="11" fill="#52514e" text-anchor="middle">occasional writers: subscribe to any tag, write to any tag, rarely</text>
+<line x1="322" y1="316" x2="322" y2="278" stroke="#eb6834" stroke-width="1.5" stroke-dasharray="4 3" marker-start="url(#arrow-accent)" marker-end="url(#arrow-accent)"/>
+<line x1="616" y1="316" x2="616" y2="206" stroke="#eb6834" stroke-width="1.5" stroke-dasharray="4 3" marker-start="url(#arrow-accent)" marker-end="url(#arrow-accent)"/>
+<text x="330" y="302" font-size="11" fill="#52514e" text-anchor="start">any tag</text>
+<text x="624" y="302" font-size="11" fill="#52514e" text-anchor="start">any tag</text>
+</svg>

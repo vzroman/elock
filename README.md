@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/vzroman/elock/actions/workflows/ci.yml/badge.svg)](https://github.com/vzroman/elock/actions/workflows/ci.yml) [![Hex.pm](https://img.shields.io/hexpm/v/elock.svg)](https://hex.pm/packages/elock) [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/elock/) [![codecov](https://codecov.io/gh/vzroman/elock/branch/main/graph/badge.svg)](https://codecov.io/gh/vzroman/elock)
 
-*Locks are cheap, waiting for them is not. Take the waiting out and your only limit is your cores. [elock](https://github.com/vzroman/elock) is a lock library for Erlang: locks on any term, exclusive or shared, on one node or on several at once, with deadlocks detected across nodes, and a happy path that waits for nobody.*
+*[elock](https://github.com/vzroman/elock) is a lock library for Erlang: locks on any term, exclusive or shared, on one node or on several at once, with deadlocks detected across nodes, and a happy path that waits for nobody.*
 
-![Locks per second on two nodes, 10,000 clients per node, ten shared local locks per transaction with no contention: elock 5.57 million per second with the schedulers 99.8 percent busy, mnesia 211 thousand per second at 11 percent busy.](docs/figures/happy-path.svg)
+![Locks per second on two nodes, 10,000 clients per node, ten shared local locks per transaction with no contention: elock 5.57 million per second, mnesia 211 thousand per second.](docs/figures/happy-path.svg)
 
 Requires Erlang/OTP 27 or later. The cross-node traffic rides [ecall](https://github.com/vzroman/ecall), which rebar3 fetches as a dependency.
 
@@ -20,7 +20,7 @@ Requires Erlang/OTP 27 or later. The cross-node traffic rides [ecall](https://gi
 
 The library is small, and the part that decides the numbers is smaller.
 
-**A lock is an ETS row, and a ticket is the only synchronization.** A scope is a public ETS table. A lock on a term is a row in it: the term, the pid of its manager and a counter. To ask for the lock, the caller increments the counter (the monitor and the retry of the real code are left out):
+**A lock is an ETS row, and a ticket is the only synchronization.** A scope is a public ETS table. A lock on a term is a row in it: the term, the pid of its manager and a counter. To ask for the lock, the caller increments the counter:
 
 ```erlang
 lock(#request{scope = Scope, term = Term} = Request, OnQueued) ->
@@ -37,13 +37,13 @@ lock(#request{scope = Scope, term = Term} = Request, OnQueued) ->
   end.
 ```
 
-Ticket 1 means the row was free: the caller holds the lock the moment the counter returns and spawns a manager for the term. Any later ticket means somebody holds it: the caller sends its request to the manager and waits for a verdict, `locked`, `timeout` or `deadlock`. The uncontended path is one atomic counter update in the caller, about 17 µs of scheduler time, and it is why both nodes were at 99.8 percent in the figure above: every core was taking locks, because nothing stood in the way.
+Ticket 1 means the row was free: the caller holds the lock the moment the counter returns and spawns a manager for the term. Any later ticket means somebody holds it: the caller sends its request to the manager and waits for a verdict, `locked`, `timeout` or `deadlock`. The uncontended path is one atomic counter update in the caller, about 17 µs of scheduler time.
 
 **A manager per locked term, for as long as it is locked.** The manager keeps the queue in ticket order and grants in that order. A shared request joins the shared holders at once only while nobody is waiting, so a stream of readers cannot starve a writer. When the last holder leaves and nobody waits, the manager deletes the row and exits. Contention on a hot term is one process on one scheduler; two hot terms are two processes on two schedulers.
 
-**A request for several nodes is one worker per node, over ecall.** The caller spawns a worker per node, and each worker asks its node through `ecall`, the batched transport that takes the distribution queue out of the way. All nodes are asked at once; the request holds the nodes that have granted it while it waits for the rest, and if any node fails the granted ones are released, so the result is all or nothing. After a remote grant the worker stays alive on the caller's node as the holder of that lock: it monitors the caller and sends the release when the caller exits.
+**A request for several nodes is one worker per node.** The caller spawns a worker per node, and each worker asks its node. All nodes are asked at once; the request holds the nodes that have granted it while it waits for the rest, and if any node fails the granted ones are released, so the result is all or nothing. After a remote grant the worker stays alive on the caller's node as the holder of that lock: it monitors the caller and sends the release when the caller exits.
 
-**Deadlock detection is off the happy path.** Only a request that has to wait while its process already holds something can deadlock, and only such a request pays for detection. It gets a graph worker, spawned when the manager reports it queued and never before. The worker publishes the process's holds into a wait-for graph that every node keeps in a public ETS table, and every new edge starts a walk from it, expanding locks on their own node and hopping to the other nodes with one cast per node. A walk that comes back to its origin has found a cycle, and the request of the younger context loses: it gets `{error, {deadlock, Lock}}`, keeps what it holds, and the caller decides, typically release and repeat. A walk has a limit on the locks it visits, past which the origin loses with `probe_limit` rather than let the walk become the cost.
+**Deadlock detection.** Only a request that has to wait while its process already holds something can deadlock, and only such a request pays for detection. It gets a graph worker, spawned when the manager reports it queued. The worker publishes the process's holds into a wait-for graph that every node keeps in a public ETS table, and every new edge starts a walk from it, expanding locks on their own node and hopping to the other nodes with one cast per node. A walk that comes back to its origin has found a cycle, and the request of the younger context loses: it gets `{error, {deadlock, Lock}}`, keeps what it holds, and the caller decides, typically release and repeat. A walk has a limit on the locks it visits, past which the origin loses with `probe_limit` rather than let the walk become the cost.
 
 **Locks die with their holder.** A local holder is monitored by its manager, a remote one by its worker, and every node drops the locks of the clients of a node that has gone down. A process that crashes while holding locks leaves no lock behind.
 
@@ -104,8 +104,6 @@ case elock:lock(my_locks, {account, 42}, Nodes, Options) of
     {error, Reason}
 end.
 ```
-
-elock has no application environment parameters. The transport is configured through ecall's `pool_size` and `batch_size`, see [its configuration](https://github.com/vzroman/ecall#configuration).
 
 ## Scopes and nodes
 
